@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>自适应阅读器 · 改写稿</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/reader.css">
+</head>
+
+<body data-drawer="collapsed" data-mode="unknown" data-current-paragraph="">
+
+  <header class="topbar">
+    <div class="topbar__brand">自适应阅读器</div>
+    <div class="topbar__meta">
+      <span class="badge" data-role="source-id">材料：—</span>
+      <span class="badge badge--mode" data-role="mode-badge">加载中</span>
+      <span class="badge" data-role="progress">第 — / — 段</span>
+    </div>
+  </header>
+
+  <!-- 全页级降级提示（模型不可用 / 段数对不上 / 概念清单缺失 等）都落在这里，不允许静默 -->
+  <div class="banners" data-role="banners" aria-live="polite"></div>
+
+  <div class="reader" data-role="reader">
+    <main class="main" data-role="main">
+      <article class="article" id="rewritten" data-role="rewritten" aria-label="改写稿主栏"></article>
+      <div class="end-sentinel" data-role="end-sentinel" aria-hidden="true"></div>
+      <p class="article__end" data-role="end-mark">— 改写稿结束 —</p>
+    </main>
+  </div>
+
+  <!-- 原文抽屉：右侧窄边，默认折叠；点开滑出并跟随当前段 -->
+  <aside class="drawer" data-role="drawer" data-state="collapsed" aria-label="原文抽屉">
+    <button class="drawer__rail" type="button" data-role="drawer-toggle" aria-expanded="false"
+      aria-controls="drawer-body" title="展开/收起原文">
+      <span class="drawer__rail-chevron" aria-hidden="true">‹</span>
+      <span class="drawer__rail-text">原文</span>
+    </button>
+    <div class="drawer__body" id="drawer-body" data-role="drawer-body">
+      <div class="drawer__head">
+        <span class="drawer__title">原文（底本）</span>
+        <span class="drawer__current" data-role="drawer-current">当前段 —</span>
+      </div>
+      <div class="drawer__list" data-role="drawer-list"></div>
+      <div class="drawer__empty" data-role="drawer-empty" hidden></div>
+    </div>
+  </aside>
+
+  <!-- 讲解卡片层与压缩提示 -->
+  <div class="card-layer" data-role="card-layer"></div>
+  <div class="compression" data-role="compression" data-state="hidden" hidden></div>
+
+  <script>
+    // 就绪标志：无头验证只依赖它，不靠 sleep。
+    // 这段必须在模块之前同步执行，好让 ES 模块加载失败时也留下可读的 errors（而不是让测试干等超时）。
+    globalThis.__arDebug = {
+      ready: false,
+      jsLoaded: false,
+      mode: null,
+      sourceId: null,
+      docUrl: null,
+      errors: [],
+      fatal: null,
+      paragraphs: [],
+      rewrittenParagraphs: [],
+      unrewritten: [],
+      changes: {},
+      concepts: {},
+      drawerOpen: false,
+      currentParagraph: null,
+      cardOpen: false,
+      cards: [],
+      cardCloses: [],
+      lastCard: null,
+      compression: null,
+      degradations: [],
+    };
+    globalThis.addEventListener('error', function (e) {
+      globalThis.__arDebug.errors.push({
+        kind: 'window-error',
+        message: String((e && e.message) || e),
+      });
+    });
+    globalThis.addEventListener('unhandledrejection', function (e) {
+      var r = e && e.reason;
+      globalThis.__arDebug.errors.push({
+        kind: 'unhandled-rejection',
+        message: String((r && r.message) || r),
+      });
+    });
+  </script>
+  <script type="module" src="js/main.js"></script>
+</body>
+
+</html>

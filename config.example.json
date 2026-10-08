@@ -1,0 +1,9 @@
+{
+  "base_url": "https://api.commandcode.ai/provider/v1",
+  "model": "deepseek/deepseek-v4.1-flash",
+  "temperature": 0.6,
+  "timeout_s": 90,
+  "max_retries": 1,
+  "max_tokens": null,
+  "api_key": ""
+}

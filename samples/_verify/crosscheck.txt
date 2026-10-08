@@ -1,0 +1,61 @@
+启动内核：msedge(channel) 154.0.4258.53
+折叠态截图：C:\Users\MLTZ\Desktop\code\working\adaptive-reader\samples\_verify\reader-fixture-collapsed.png
+展开态截图：C:\Users\MLTZ\Desktop\code\working\adaptive-reader\samples\_verify\reader-fixture.png
+{
+  "paragraph": "p005",
+  "changes.json": {
+    "action": "expand",
+    "why.note": "开篇直接进入论证，先补一句论证起点与本节目标，否则读者不知道「拆商品」是要回答什么",
+    "why.profile": [
+      "c01:unknown"
+    ],
+    "deferred": false
+  },
+  "页面悬停": {
+    "marker_action": "expand",
+    "tip_action": "动作：展开",
+    "tip_note": "开篇直接进入论证，先补一句论证起点与本节目标，否则读者不知道「拆商品」是要回答什么",
+    "tip_profile": "依据画像：c01:unknown",
+    "tip_deferred": null
+  },
+  "一致": true
+}
+{
+  "paragraph": "p008",
+  "changes.json": {
+    "action": "compress",
+    "why.note": "洛克与巴尔本的长注压缩为一句，保留「使用价值不是悬空的」「交换价值的物质承担者」两个要点",
+    "why.profile": [
+      "c02:partial",
+      "c03:unknown"
+    ],
+    "deferred": true
+  },
+  "页面悬停": {
+    "marker_action": "compress",
+    "tip_action": "动作：压缩",
+    "tip_note": "洛克与巴尔本的长注压缩为一句，保留「使用价值不是悬空的」「交换价值的物质承担者」两个要点",
+    "tip_profile": "依据画像：c02:partial、c03:unknown",
+    "tip_deferred": "（本骨架未实现该动作，按「保持」处理）"
+  },
+  "一致": true
+}
+{
+  "paragraph": "p024",
+  "changes.json": {
+    "action": "compress",
+    "why.note": "五位决定因素与四组例证保留，杰科布那句疑问删去",
+    "why.profile": [
+      "c08:unknown"
+    ],
+    "deferred": true
+  },
+  "页面悬停": {
+    "marker_action": "compress",
+    "tip_action": "动作：压缩",
+    "tip_note": "五位决定因素与四组例证保留，杰科布那句疑问删去",
+    "tip_profile": "依据画像：c08:unknown",
+    "tip_deferred": "（本骨架未实现该动作，按「保持」处理）"
+  },
+  "一致": true
+}
