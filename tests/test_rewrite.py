@@ -16,14 +16,19 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from ar.errors import EXIT_MODEL, EXIT_NOT_IMPLEMENTED, EXIT_OK, EXIT_USAGE, EXIT_VALIDATION
 from ar.fidelity import extract_books, extract_numbers, extract_quotes, split_rewritten_blocks
 from ar.ingest import ingest
+from ar.prompts import build_rewrite_messages
 from ar.rewrite import (
     DEFAULT_MODE,
     IMPLEMENTED_ACTIONS,
@@ -265,7 +270,8 @@ def test_plan_decisions_covers_every_paragraph(fake_chat_client) -> None:
         assert isinstance(decision.why.get("note"), str) and decision.why["note"]
         assert 0.0 <= decision.confidence <= 1.0
     assert meta["model"] == "fake-model"
-    assert meta["prompt_version"] == "rewrite-v1"
+    # rewrite-v2（2026-10-08）：段号与本批正文挪到 user 末尾（前缀缓存），提示词变了 → 版本号跟着升
+    assert meta["prompt_version"] == "rewrite-v2"
     assert meta["request_count"] >= 1
     # 模型给的 compress / illustrate 一律落成 keep + deferred，并在 degraded 里点名
     deferred = [d.paragraph for d in decisions if d.deferred]
@@ -372,6 +378,224 @@ def test_plan_decisions_flags_truncated_expand(fake_chat_client) -> None:
     assert any("p005" in item and "截断" in item for item in degraded), degraded
 
 
+# ------------------------------------------------- 提示词前缀缓存（rewrite-v2） --
+#: 固定块（画像 / 概念清单）在真实材料上的尺寸量级：capital-v1-ch01 实测 73 + 647 字符
+REALISTIC_PROFILE_BLOCK = "读者 local-default 自报概念状态：" + "；".join(f"c{i:02d}=unknown" for i in range(1, 7))
+REALISTIC_CONCEPT_BLOCK = "概" * 647
+
+
+def _rewrite_user_contents(
+    paragraphs: list[dict[str, Any]], chunk: list[dict[str, Any]], start: int, end: int, **blocks: str
+) -> tuple[str, str]:
+    """取两个批次的 (system, user) 正文，供前缀比较。"""
+    messages = build_rewrite_messages(
+        "fake-doc", chunk, start=start, end=end, total=len(paragraphs), **blocks  # type: ignore[arg-type]
+    )
+    return messages[0]["content"], messages[1]["content"]
+
+
+def test_rewrite_template_puts_every_varying_part_at_the_end_of_the_user_message() -> None:
+    """段号 + 本批正文必须在 user **末尾**：批间逐字相同的前缀才够长（前缀缓存的前提）。
+
+    这条守住 rewrite-v2 的重排：一旦有人把正文挪回固定块中间，共享前缀会从 ~1800 字符
+    掉回 ~770 字符，缓存命中率立刻塌掉。
+    """
+    doc = build_doc(FAKE_SOURCE)
+    paragraphs = doc["paragraphs"]
+    blocks = {"profile_block": "读者 tester 自报概念状态：c01=unknown", "concept_block": "c01 假概念（难度 3）"}
+    system_a, user_a = _rewrite_user_contents(paragraphs, paragraphs[:3], 1, 3, **blocks)
+    system_b, user_b = _rewrite_user_contents(paragraphs, paragraphs[3:], 4, len(paragraphs), **blocks)
+
+    # ① 会变的部分在末尾：正文块收尾，段号落在 JSON 示例与规则之后
+    assert user_a.rstrip().endswith(f"[p003] {paragraphs[2]['text']}")
+    assert user_a.index("本次给你第 1–3 段") > user_a.index("只输出 JSON")
+    assert user_a.index("本次给你第 1–3 段") > user_a.index("7. 不要写")
+    assert user_b.index("本次给你第 4–7 段") > user_b.index("只输出 JSON")
+
+    # ② 两个批次的**首个差异点必须正好落在段号那一位**上：此前全部逐字相同
+    first_diff = next(index for index, (left, right) in enumerate(zip(user_a, user_b)) if left != right)
+    assert user_a[first_diff] == "1" and user_b[first_diff] == "4"
+    assert user_a[first_diff - len("本次给你第 "):first_diff] == "本次给你第 "
+    header_at = user_a.index("原文段落（每段以 [段 id] 开头")
+    assert first_diff > header_at, "连段号前的固定标题行都该落在共享前缀里"
+    assert first_diff >= 1000, f"共享前缀只有 {first_diff} 字符：变化的内容又被挪到前面了"
+    assert system_a == system_b, "system 提示词必须逐字相同"
+
+    # ③ 真实材料尺寸的固定块下，共享前缀量级（capital-v1-ch01 实测 1805 字符）
+    real_blocks = {"profile_block": REALISTIC_PROFILE_BLOCK, "concept_block": REALISTIC_CONCEPT_BLOCK}
+    real_a = _rewrite_user_contents(paragraphs, paragraphs[:3], 1, 3, **real_blocks)[1]
+    real_b = _rewrite_user_contents(paragraphs, paragraphs[3:], 4, len(paragraphs), **real_blocks)[1]
+    realistic_prefix = next(
+        (index for index, (left, right) in enumerate(zip(real_a, real_b)) if left != right),
+        min(len(real_a), len(real_b)),
+    )
+    assert realistic_prefix >= 1700, f"实际材料尺寸下共享前缀只有 {realistic_prefix} 字符（目标 ~1805）"
+
+    # ④ 固定块里不许有时间戳 / 随机量（否则每轮都建新缓存）。规则与措辞本身不许被这次重排改动。
+    assert "generated_at" not in real_a
+    assert not re.search(r"\d{4}-\d{2}-\d{2}T", real_a)
+    assert "compress / illustrate 本期不实现，不要输出。" in real_a
+    assert "7. 不要写「改写说明」「导读」之类的额外段落；只输出 JSON。" in real_a
+
+
+@dataclass
+class _RecordingReply:
+    """替身回复：``ar.rewrite`` 只读 text / model / usage 三个字段。"""
+
+    text: str
+    model: str = "fake-model"
+    usage: dict[str, Any] | None = None
+
+
+@dataclass
+class _RecordingClient:
+    """记录每次调用的「开始 / 结束」与并发峰值，用来验证预热是**串行**的。"""
+
+    handler: Any
+    delay: float = 0.02
+    events: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    max_active: int = 0
+    _active: int = 0
+    _lock: Any = field(default_factory=threading.Lock)
+
+    def chat(self, messages: Any, **kwargs: Any) -> _RecordingReply:
+        ids = tuple(PROMPT_PARAGRAPH_RE.findall(messages[-1]["content"]))
+        with self._lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+            self.events.append(("start", ids))
+        try:
+            time.sleep(self.delay)
+            return _RecordingReply(text=self.handler(list(ids)))
+        finally:
+            with self._lock:
+                self.events.append(("end", ids))
+                self._active -= 1
+
+
+def _keep_decisions(ids: list[str], *, note: str = "假依据") -> str:
+    return json.dumps(
+        {
+            "decisions": [
+                {"paragraph": pid, "action": "keep", "why": {"profile": [], "note": note}, "confidence": 0.8}
+                for pid in ids
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_first_batch_warms_the_prefix_serially_before_the_rest_go_parallel() -> None:
+    """先串行跑第 1 批（建前缀缓存），再并发跑其余批次（并发上限仍是 4）。"""
+    doc = build_doc(FAKE_SOURCE)
+    client = _RecordingClient(handler=lambda ids: _keep_decisions(ids))
+    decisions, _degraded, meta = planDecisions(
+        doc, None, {"reader": "tester"}, client, source_id="fake-doc", max_chars_per_batch=1
+    )
+
+    assert meta["request_count"] == len(doc["paragraphs"]) == 7, "每段一批，才看得出顺序与并发"
+    starts = [event for event in client.events if event[0] == "start"]
+    assert "p001" in starts[0][1], "第 1 批（含 p001）必须最先发——预热批按段序取第一批"
+
+    first_end = client.events.index(("end", starts[0][1]))
+    later_start = min(index for index, event in enumerate(client.events) if event[0] == "start" and index > 0)
+    assert first_end < later_start, "第 1 批必须**跑完**再发其余批次（否则 6 批同时首发，谁都吃不到新缓存）"
+    assert 2 <= client.max_active <= 4, f"其余批次应当并发（≤4），实测峰值 {client.max_active}"
+    assert [decision.paragraph for decision in decisions] == [p["id"] for p in doc["paragraphs"]]
+
+
+def test_warmup_batch_failure_degrades_visibly_without_blocking_the_rest() -> None:
+    """预热批失败按既有降级路径处理：只影响它自己那几段，其余批次照跑。"""
+    doc = build_doc(FAKE_SOURCE)
+
+    def handler(ids: list[str]) -> str:
+        if "p001" in ids:
+            raise RuntimeError("网关不可用")
+        return _keep_decisions(ids)
+
+    client = _RecordingClient(handler=handler, delay=0.0)
+    decisions, degraded, meta = planDecisions(
+        doc, None, {"reader": "tester"}, client, source_id="fake-doc", max_chars_per_batch=1
+    )
+
+    assert meta["model_errors"] and meta["model_errors"][0]["batch"] == "第 1–1 段"
+    assert meta["model_errors"][0]["paragraphs"] == ["p001"]
+    assert meta["rewrite_incomplete"] is True
+    assert any("模型调用失败" in item for item in degraded)
+    # 只有第 1 批那 1 段被迫 keep（confidence 0），其余 6 段是模型给的决策
+    assert [d.confidence for d in decisions] == [0.0, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
+
+
+def test_batch_usage_records_cached_tokens_per_request_and_sums_them() -> None:
+    """逐批缓存命中量：嵌套字段与扁平字段都认；没上报的批次不写这个键。"""
+    doc = build_doc(FAKE_SOURCE)
+    usages: dict[str, dict[str, Any] | None] = {
+        "p001": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                 "prompt_tokens_details": {"cached_tokens": 0}},
+        "p002": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                 "prompt_tokens_details": {"cached_tokens": 640}},
+        "p003": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                 "prompt_cache_hit_tokens": 512},
+        # p004 起：网关没回 usage（既没有 prompt_tokens 也没有 cached_tokens）
+    }
+
+    class _UsageClient:
+        def chat(self, messages: Any, **kwargs: Any) -> _RecordingReply:
+            ids = PROMPT_PARAGRAPH_RE.findall(messages[-1]["content"])
+            return _RecordingReply(text=_keep_decisions(ids), usage=usages.get(ids[0]))
+
+    _decisions, _degraded, meta = planDecisions(
+        doc, None, {"reader": "tester"}, _UsageClient(), source_id="fake-doc", max_chars_per_batch=1
+    )
+
+    usage = meta["usage"]
+    assert usage["requests"] == 7
+    assert usage["prompt_tokens"] == 300 and usage["completion_tokens"] == 30 and usage["total_tokens"] == 330
+    assert usage["cached_tokens"] == 0 + 640 + 512, "嵌套 + 扁平两种字段都要累加"
+
+    by_batch = {item["batch"]: item for item in meta["batch_usage"]}
+    assert by_batch["第 1–1 段"]["cached_tokens"] == 0
+    assert by_batch["第 2–2 段"]["cached_tokens"] == 640
+    assert by_batch["第 3–3 段"]["cached_tokens"] == 512
+    assert "cached_tokens" not in by_batch["第 4–4 段"], "没上报就不写这个键（0 与没上报分得开）"
+
+
+def test_usage_cached_tokens_is_null_when_gateway_reports_nothing(fake_chat_client) -> None:
+    """网关一个字段都没回时：``cached_tokens`` 是 null，不是编造出来的 0。"""
+    doc = build_doc(FAKE_SOURCE)
+    client = fake_chat_client(handler=fake_handler_for(doc))
+    _decisions, _degraded, meta = planDecisions(doc, None, {"reader": "tester"}, client, source_id="fake-doc")
+    assert meta["usage"]["cached_tokens"] is None
+
+
+def test_run_rewrite_writes_cached_tokens_into_both_artifacts(
+    dirs: SimpleNamespace, fake_chat_client
+) -> None:
+    """产物里能直接看到缓存命中量：decisions.json 与 changes.json 的 meta.usage.cached_tokens。"""
+    from ar.jsonio import read_json
+
+    doc = write_fake_doc(dirs)
+    client = fake_chat_client(
+        handler=fake_handler_for(doc),
+        usage={
+            "prompt_tokens": 50,
+            "completion_tokens": 5,
+            "total_tokens": 55,
+            "prompt_tokens_details": {"cached_tokens": 40},
+        },
+    )
+    outcome = fake_run(dirs, client)
+
+    decisions_payload = read_json(outcome.decisions_path)
+    changes_payload = read_json(outcome.changes_path)
+    for payload in (decisions_payload, changes_payload):
+        assert payload["meta"]["usage"]["cached_tokens"] == 40
+        assert payload["meta"]["usage"]["prompt_tokens"] == 50
+        assert payload["meta"]["batch_usage"][0]["cached_tokens"] == 40
+    # 命令行上也要看得见（人读的一行账）
+    assert "前缀缓存命中 40" in outcome.usage_note
+
+
 # ------------------------------------------------------------------ run_rewrite --
 def test_run_rewrite_writes_three_artifacts(dirs: SimpleNamespace, fake_chat_client) -> None:
     from ar.jsonio import read_json
@@ -394,7 +618,8 @@ def test_run_rewrite_writes_three_artifacts(dirs: SimpleNamespace, fake_chat_cli
         ref.endswith("（无画像）") for d in decisions_payload["decisions"] for ref in d["why"]["profile"]
     )
     assert decisions_payload["meta"]["model"] == "fake-model"
-    assert decisions_payload["meta"]["prompt_version"] == "rewrite-v1"
+    # rewrite-v2（2026-10-08）：同上，提示词重排后版本号升到 v2
+    assert decisions_payload["meta"]["prompt_version"] == "rewrite-v2"
 
     changes_payload = read_json(outcome.changes_path)
     # rewrite 阶段事实锚比对**还没跑**：checked 必须是 false、counts 留空（由 `ar check` 写入）

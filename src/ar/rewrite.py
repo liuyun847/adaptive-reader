@@ -23,6 +23,11 @@
 5. ``fidelity.checked`` 只在 ``ar check`` 通过后为 ``true``：``rewrite`` 阶段写 ``false``
    （逐段事实锚比对还没跑），避免只看 rewrite 产物的人误读成「已查过、干净」。
 6. **0 比对项 = 检查器空跑 = 失败**：事实锚比对一项都没比（空文档）时不许报通过。
+7. **前缀缓存（prompt caching）**：提示词里会变的部分全部排在 user 末尾（见 ``ar.prompts``
+   的「前缀缓存纪律」），且**先串行跑第 1 批预热前缀、再并发其余批次**
+   （``_plan_batches_warmup``）——6 批同时首发谁都吃不到刚建好的缓存。
+   命中量逐批记在 ``meta.batch_usage[].cached_tokens``、合计记在 ``meta.usage.cached_tokens``
+   （网关没上报该字段时为 ``null``，不编造成 0）。
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from .errors import InputError, NotImplementedYet
 from .fidelity import facts_of, split_rewritten_blocks
 from .ingest import text_hash
 from .jsonio import now_iso, read_json, read_json_if_exists, write_json, write_text
+from .model import cached_tokens_of
 from .paths import doc_dir
 from .prompts import REWRITE_ACTIONS, REWRITE_PROMPT_VERSION, build_rewrite_messages
 
@@ -490,13 +496,37 @@ def _plan_batches_parallel(
     paragraphs: list[dict[str, Any]],
     context: dict[str, Any],
 ) -> list[BatchPlan]:
-    """并发发完全部请求（各批互相独立，结果按下标对回原序）。"""
+    """并发发完这些请求（各批互相独立，结果按下标对回原序），并发上限 4。"""
     cores = max(1, min(len(ranges), 4))
     with concurrent.futures.ThreadPoolExecutor(max_workers=cores) as pool:
         futures = [
             pool.submit(_plan_one_batch, client, batch_ranges, paragraphs, context) for batch_ranges in ranges
         ]
         return [future.result() for future in futures]
+
+
+def _plan_batches_warmup(
+    client: ChatClient,
+    ranges: list[list[int]],
+    paragraphs: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[BatchPlan]:
+    """**先串行跑第 1 批，再并发跑其余批次**（顺序 = 段序，结果按下标对回）。
+
+    为什么：提示词前缀缓存（prompt caching）按「从头逐字相同的部分」命中，而缓存构建要几秒。
+    6 批同时首发时谁都吃不到刚建好的缓存（全部按未命中计费）；先让第 1 批把固定前缀
+    （画像 + 概念清单 + JSON 示例 + 规则，约 2007 字符）在模型侧建起来，后面的批次才可能命中。
+
+    第 1 批失败**不影响**其余批次：``_plan_one_batch`` 把调用失败变成带 ``error`` 的可见降级
+    （该批段落按 keep 处理并进 ``meta.model_errors``），其余批次照常发。
+    """
+    if not ranges:
+        return []
+    first = _plan_one_batch(client, ranges[0], paragraphs, context)
+    rest = ranges[1:]
+    if not rest:
+        return [first]
+    return [first, *_plan_batches_parallel(client, rest, paragraphs, context)]
 
 
 def _plan_batches_serial(
@@ -525,6 +555,10 @@ def planDecisions(
     模型名 / 提示词版本，供回归基线与 token 结算，另有 ``model_errors``（批次失败：
     批次名 / 受影响段 id / 错误）、``unplanned_paragraphs``（模型没给决策的段）与
     ``rewrite_incomplete``——这三样是「有段落没被改写」的机器可读证据（CLI 据此以退出码 6 结束）。
+
+    ``usage`` 的 3 个旧字段（``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``）口径不变，
+    追加 ``cached_tokens``（前缀缓存命中的 prompt token 合计，网关没上报时为 ``null``）；
+    ``meta.batch_usage`` 给逐批明细，用来判断预热是否真的生效。
     """
     paragraphs = [p for p in (source_doc.get("paragraphs") or []) if isinstance(p, dict) and p.get("id")]
     if not paragraphs:
@@ -542,7 +576,8 @@ def planDecisions(
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        plans = _plan_batches_parallel(client, ranges, paragraphs, context)
+        # 先串行第 1 批做前缀预热，再并发其余批次（见 ``_plan_batches_warmup``）
+        plans = _plan_batches_warmup(client, ranges, paragraphs, context)
     else:  # pragma: no cover - 已有事件循环时（HTTP 层内）退回串行，避免嵌套
         plans = _plan_batches_serial(client, ranges, paragraphs, context)
 
@@ -553,6 +588,9 @@ def planDecisions(
     usage: dict[str, Any] = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     model: str | None = None
     usage_fields = ("prompt_tokens", "completion_tokens", "total_tokens")
+    cached_total = 0
+    cached_reported = False
+    batch_usage: list[dict[str, Any]] = []
     for plan in plans:
         decisions.extend(item.decision for item in plan.items)
         degraded.extend(plan.degraded)
@@ -563,6 +601,22 @@ def planDecisions(
             value = plan.usage.get(field_name)
             if isinstance(value, int):
                 usage[field_name] += value
+        # 前缀缓存命中量：网关可能在 prompt_tokens_details.cached_tokens 或扁平字段里回
+        # （见 ``model.cached_tokens_of``）；没上报就是 None，不许编造成 0。
+        cached = cached_tokens_of(plan.usage)
+        if cached is not None:
+            cached_reported = True
+            cached_total += cached
+        batch_entry: dict[str, Any] = {"batch": plan.batch_label, "paragraph_count": len(plan.paragraphs)}
+        for field_name in usage_fields:
+            value = plan.usage.get(field_name)
+            if isinstance(value, int):
+                batch_entry[field_name] = value
+        if cached is not None:
+            batch_entry["cached_tokens"] = cached
+        if plan.error:
+            batch_entry["failed"] = True
+        batch_usage.append(batch_entry)
         if plan.error:
             # 结构化的失败证据：哪一批、哪几段、什么错（只进产物，不进提示词）。
             # error 里不再重复批次名——批次名单独放在 batch 字段里。
@@ -571,6 +625,8 @@ def planDecisions(
             model_errors.append(
                 {"batch": plan.batch_label, "paragraphs": list(plan.paragraphs), "error": error}
             )
+    # 至少有一批上报过缓存命中时才写这个字段（null 与 0 分得开：null = 网关没上报）
+    usage["cached_tokens"] = cached_total if cached_reported else None
 
     if model_errors or unplanned:
         # 事实锚只能证明「没改坏」，不能区分「忠实改写」与「一个字没改」：
@@ -587,6 +643,9 @@ def planDecisions(
         "request_count": len(ranges),
         "batch_count": len(ranges),
         "usage": usage,
+        # 逐批的 token 与缓存命中（证明「预热到底有没有生效」的原始证据：第 1 批通常 0 命中，
+        # 后面几批才有）。字段名与 ``usage`` 的 3 个旧字段一致，便于对照。
+        "batch_usage": batch_usage,
         "model_errors": model_errors,
         "unplanned_paragraphs": unplanned,
         "rewrite_incomplete": bool(model_errors or unplanned),
@@ -667,11 +726,20 @@ def _load_meta(data_dir: Path | str, source_id: str) -> dict[str, Any]:
 
 
 def _usage_summary(usage: dict[str, Any]) -> str:
-    return (
+    """人读的一行 token 账（含前缀缓存命中量；网关没上报就写「未上报」，不编造 0）。"""
+    line = (
         f"请求 {usage.get('requests', 0)} 次；"
         f"tokens：prompt {usage.get('prompt_tokens', 0)} / completion {usage.get('completion_tokens', 0)} / "
         f"合计 {usage.get('total_tokens', 0)}"
     )
+    cached = usage.get("cached_tokens")
+    if isinstance(cached, int):
+        prompt = int(usage.get("prompt_tokens") or 0)
+        ratio = f"，占 prompt 的 {cached / prompt:.0%}" if prompt else ""
+        line += f"；前缀缓存命中 {cached}{ratio}"
+    else:
+        line += "；前缀缓存命中：网关未上报"
+    return line
 
 
 @dataclass
@@ -963,6 +1031,7 @@ def run_rewrite(
         counts[decision.action] = counts.get(decision.action, 0) + 1
     deferred_count = sum(1 for decision in decisions if decision.deferred)
     usage = dict(plan_meta.get("usage") or {})
+    batch_usage = [dict(item) for item in (plan_meta.get("batch_usage") or []) if isinstance(item, dict)]
     model_errors = [
         dict(item) for item in (plan_meta.get("model_errors") or []) if isinstance(item, dict)
     ]
@@ -1006,6 +1075,7 @@ def run_rewrite(
             "profile_note": profile_note,
             "request_count": outcome.request_count,
             "usage": usage,
+            "batch_usage": batch_usage,
             "model_errors": model_errors,
             "unplanned_paragraphs": unplanned,
             "rewrite_incomplete": outcome.incomplete,
@@ -1028,6 +1098,7 @@ def run_rewrite(
             "profile_used": profile_used,
             "profile_note": profile_note,
             "usage": usage,
+            "batch_usage": batch_usage,
             "model_errors": model_errors,
             "unplanned_paragraphs": unplanned,
             "rewrite_incomplete": outcome.incomplete,

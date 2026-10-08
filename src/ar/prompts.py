@@ -2,6 +2,16 @@
 
 **回归基线**（DESIGN §7）：产物元数据里记录 ``model`` 与提示词版本，
 同一输入两次生成的差异才是可度量的。改提示词时必须同时升版本号。
+
+**前缀缓存纪律**（2026-10-08）：网关按「提示词从头开始逐字相同的部分」算缓存命中，
+而同一轮里的多次请求（逐批改写 / 同一材料的重跑）只有**会变的那一小块**不同。
+所以两份模板都按同一条规矩排：固定块（画像 / 概念清单 / JSON 示例 / 规则）逐字稳定、排在**前面**，
+会变的内容（本批段号与原文段落、材料正文）一律排在 user 消息的**末尾**。
+- ``REWRITE_USER_TEMPLATE``：批间共享前缀 972 → 2007 字符（同一份材料 + 同一份概念清单下实测；
+  清单换一版绝对值跟着变）；
+- ``CONCEPTS_USER_TEMPLATE``：跨材料共享前缀 152 → 878 字符。
+模板里没有任何时间戳 / 随机量（``generated_at`` 只进产物，不进提示词）。
+改模板时**不要**把会变的内容挪回前面，否则缓存命中率会掉回去。
 """
 
 from __future__ import annotations
@@ -28,11 +38,15 @@ __all__ = [
     "build_rewrite_messages",
 ]
 
-CONCEPTS_PROMPT_VERSION = "concepts-v1"
+# concepts-v2（2026-10-08）：规则尾移到「材料正文」之前——正文块挪到 user 末尾后，
+# 跨材料逐字相同的前缀从 152 字符涨到 878 字符（提示词前缀缓存）。语义没变，但提示词变了，版本号跟着升。
+CONCEPTS_PROMPT_VERSION = "concepts-v2"
 # explain-v2（2026-10-08）：新增「选中片段」作用域（selection / selection_from），
 # 讲解对象可能只是段里的一小段文字而不是整段——提示词语义变了，版本号必须跟着升。
 EXPLAIN_PROMPT_VERSION = "explain-v2"
-REWRITE_PROMPT_VERSION = "rewrite-v1"
+# rewrite-v2（2026-10-08）：段号与本批正文挪到 user 末尾（规则、措辞逐字不变），
+# 批间共享前缀 972 → ~2007 字符（提示词前缀缓存）；重排会改变模型输出，属提示词变更，版本号必须跟着升。
+REWRITE_PROMPT_VERSION = "rewrite-v2"
 
 CONCEPTS_SYSTEM_PROMPT = (
     "你是中文材料的概念分析器。你读一份材料，列出读者理解它需要掌握的概念（尤其是容易卡住的地方）、"
@@ -40,11 +54,8 @@ CONCEPTS_SYSTEM_PROMPT = (
     "不要在 JSON 前后加任何文字。"
 )
 
-CONCEPTS_USER_TEMPLATE = """材料（每段前面是段落 id，引用时必须原样使用这些 id）：
-
-{paragraph_block}
-
-请输出这样的 JSON：
+#: 固定块在前、**材料正文在最后**（前缀缓存：跨材料逐字相同的前缀 ~1000 字符）。
+CONCEPTS_USER_TEMPLATE = """请输出这样的 JSON：
 {{"concepts":[{{"id":"c01","name":"概念名","surface":["原文里的原词"],"prereq":[],"difficulty_hint":3,"paragraphs":["p001"],"domain":"领域","concept_key":"english_key"}}],"illustration_candidates":[{{"paragraph":"p001","kind":"流程","why":"为什么图比文字省力"}}]}}
 
 规则：
@@ -57,7 +68,11 @@ CONCEPTS_USER_TEMPLATE = """材料（每段前面是段落 id，引用时必须�
    二期用于跨材料合并，同一概念在不同材料里必须一致。
 7. illustration_candidates 只在「图比文字省力」时给：kind 只能是 流程 / 结构 / 对比 / 数量 之一，
    why 用一句话说明为什么图更好。宁可少给。
-8. 拿不准的概念不要列：宁少勿滥。"""
+8. 拿不准的概念不要列：宁少勿滥。
+
+材料（每段前面是段落 id，引用时必须原样使用这些 id）：
+
+{paragraph_block}"""
 
 EXPLAIN_SYSTEM_PROMPT = (
     "你是中文阅读助手。读者正在读一段材料，点开了这一段。请针对这一段给出他需要的那一种讲解。"
@@ -82,7 +97,7 @@ SELECTION_SOURCE_LABELS: dict[str, str] = {"rewritten": "改写稿", "source": "
 
 
 def build_concepts_messages(meta: dict[str, Any]) -> list[dict[str, str]]:
-    """把段落表拼成提示词（段落 id 在前，供模型引用）。"""
+    """把段落表拼成提示词（**正文块在最后**，段 id 供模型引用；规则与 JSON 示例在前做缓存前缀）。"""
     lines = [f"[{p.get('id')}] {p.get('text', '')}" for p in (meta.get("paragraphs") or [])]
     return [
         {"role": "system", "content": CONCEPTS_SYSTEM_PROMPT},
@@ -102,16 +117,15 @@ REWRITE_SYSTEM_PROMPT = (
     "只输出一个 JSON 对象：不要解释、不要 Markdown 代码围栏、不要在 JSON 前后加任何文字。"
 )
 
+#: 固定块在前、**本批段号与原文正文在最后**（前缀缓存：批间逐字相同的前缀 ~2007 字符）。
+#: 规则与措辞与 rewrite-v1 逐字一致，只是把会变的部分挪到了末尾。
 REWRITE_USER_TEMPLATE = """读者画像：
 {profile_block}
 
 概念清单：
 {concept_block}
 
-材料：《{source_id}》，共 {total} 段，本次给你第 {start}–{end} 段。
-
-原文段落（每段以 [段 id] 开头，引用时必须原样使用这些 id）：
-{paragraph_block}
+材料：《{source_id}》，共 {total} 段。
 
 请输出这样的 JSON：
 {{"decisions":[{{"paragraph":"p001","action":"keep","why":{{"profile":[],"note":"一句话说明为什么这样处理"}},"confidence":0.9,"rewrite":""}},{{"paragraph":"p002","action":"expand","why":{{"profile":["c07:unknown"],"note":"必须先讲清前置的 c06，否则读者不知道价值从哪来"}},"confidence":0.8,"rewrite":"改写后的完整段落"}}]}}
@@ -130,7 +144,13 @@ REWRITE_USER_TEMPLATE = """读者画像：
    keep 的段落请**原样**输出，不要顺手改标点、加空格或整理格式。
 5. 读者已知（known）的概念不要再解释；依据必须来自上面给的概念清单与读者画像，不要凭空推断读者水平。
 6. confidence 是你对「这条决策合适」的把握（0–1 的小数）。
-7. 不要写「改写说明」「导读」之类的额外段落；只输出 JSON。"""
+7. 不要写「改写说明」「导读」之类的额外段落；只输出 JSON。
+
+原文段落（每段以 [段 id] 开头，引用时必须原样使用这些 id）：
+
+本次给你第 {start}–{end} 段。
+
+{paragraph_block}"""
 
 
 def _format_paragraph_block(paragraphs: list[dict[str, Any]]) -> str:
@@ -151,6 +171,8 @@ def build_rewrite_messages(
     """一段提示词吃一批段落（省 token：25 段合并进 4 次请求，见 W3 轮次说明）。
 
     ``start`` / ``end`` 是这批段落在全篇里的序号（1 起，含两端），只用于让模型知道自己看的是哪一段。
+    **段号与本批正文排在 user 消息末尾**：批间逐字相同的前缀因此 ~2007 字符（前缀缓存），
+    改布局前先读模块文档的「前缀缓存纪律」。
     """
     return [
         {"role": "system", "content": REWRITE_SYSTEM_PROMPT},

@@ -21,10 +21,42 @@ from httpx_sse import aconnect_sse
 from .config import Config, redact
 from .errors import ModelUnavailable
 
-__all__ = ["ModelReply", "ModelClient", "ModelNotConfigured", "ModelCallFailed", "extract_content"]
+__all__ = [
+    "ModelReply",
+    "ModelClient",
+    "ModelNotConfigured",
+    "ModelCallFailed",
+    "extract_content",
+    "cached_tokens_of",
+]
 
 _UNSET: Any = object()
 _REJECTION_MARKERS = ("stream_options", "include_usage")
+
+
+def cached_tokens_of(usage: Any) -> int | None:
+    """从一次调用的 ``usage`` 里取「缓存命中的 prompt token 数」；**取不到返回 ``None``**。
+
+    网关字段形态不止一种，按优先级取第一个能用的：
+
+    1. OpenAI 风格 ``usage.prompt_tokens_details.cached_tokens``（本机网关实测回的就是它）；
+    2. 扁平字段 ``usage.prompt_cache_hit_tokens``（DeepSeek 原生字段名）；
+    3. 扁平字段 ``usage.cached_tokens``。
+
+    ``None`` 与 ``0`` 必须分得开：``None`` = 这次没上报（不能编造成 0），``0`` = 上报了但没命中。
+    """
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details")
+    value = details.get("cached_tokens") if isinstance(details, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool):
+        value = None
+        for key in ("prompt_cache_hit_tokens", "cached_tokens"):
+            candidate = usage.get(key)
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                value = candidate
+                break
+    return value
 
 
 class ModelNotConfigured(ModelUnavailable):

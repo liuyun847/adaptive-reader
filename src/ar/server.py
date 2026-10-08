@@ -8,7 +8,7 @@
 ``GET  /api/profile``         ``{ profile, degraded }``（默认读者 local-default）
 ``POST /api/profile/rating``  ``{ concept_id, state, note? }`` → 更新画像并写回 YAML
 ``POST /api/explain``         ``{ source_id, paragraph, kind, selection?, selection_from? }``
-                              → ``{ text, degraded, scope?, cached?, selection_truncated? }``
+                              → ``{ text, degraded, scope?, cached?, selection_truncated?, usage? }``
 ``GET  /api/health``          ``{ ok, model_configured, ... }``
 ===========================  ==================================================
 
@@ -22,8 +22,10 @@
   让前端能直接把这段说明渲染进卡片。
 - ``/api/explain`` 的追加字段分两类：**请求侧**的 ``scope``（``paragraph`` / ``selection``）与
   ``selection_truncated``（选中片段超 600 字符被截断）每次响应都给；**产出侧**的 ``cached``
-  （进程内缓存命中，见 ``ar.cache``）只在成功响应里出现。旧键（``text`` / ``degraded`` /
-  ``model`` / ``prompt_version`` / 失败时的 ``reason``）逐字不变、枚举不变。
+  （进程内缓存命中，见 ``ar.cache``）与 ``usage``（本次模型调用的原始 token 账，含前缀缓存命中
+  ``prompt_tokens_details.cached_tokens``；没调模型 / 缓存命中时是 ``{}``）只在成功响应里出现。
+  旧键（``text`` / ``degraded`` / ``model`` / ``prompt_version`` / 失败时的 ``reason``）逐字不变、
+  枚举不变。
 """
 
 from __future__ import annotations
@@ -256,6 +258,9 @@ def build_app(
             # 下面几个描述的是**这次产出了什么**：失败/降级时一律不出现
             payload["model"] = outcome.model
             payload["prompt_version"] = outcome.prompt_version
+            # 原始 usage（含 prompt_tokens_details.cached_tokens 这类前缀缓存字段）；
+            # 缓存命中（cached: true）或网关没回 usage 时是空对象 {}
+            payload["usage"] = outcome.usage
             if outcome.cached:
                 payload["cached"] = True
         return _json(payload)

@@ -119,6 +119,31 @@ def test_normalize_filters_bad_refs_and_records_repairs() -> None:
 
 
 # -------------------------------------------------------------------- 校验 --
+def test_concepts_template_keeps_the_material_at_the_end_for_prefix_cache() -> None:
+    """concepts-v2：JSON 示例与规则在前、**材料正文在末尾**——跨材料共享前缀 ~1000 字符。
+
+    这条守住重排：材料正文一旦挪回固定块中间，共享前缀会从 ~878 掉回 152 字符
+    （只有 system 与标题行），跨材料重跑就再也吃不到前缀缓存。
+    """
+    from ar.prompts import build_concepts_messages
+
+    first = build_concepts_messages({"paragraphs": [{"id": "p001", "text": "甲材料的正文。"}]})
+    second = build_concepts_messages({"paragraphs": [{"id": "p001", "text": "乙材料的正文，完全不同。"}]})
+    user_a, user_b = first[1]["content"], second[1]["content"]
+
+    assert user_a.endswith("[p001] 甲材料的正文。")
+    assert user_a.index("8. 拿不准的概念不要列") < user_a.index("[p001]"), "规则必须在正文之前"
+    assert first[0]["content"] == second[0]["content"], "system 提示词两材料必须逐字相同"
+
+    shared = next(
+        (index for index, (left, right) in enumerate(zip(user_a, user_b)) if left != right),
+        min(len(user_a), len(user_b)),
+    )
+    # 整条提示词的共享前缀 = system + user 里逐字相同的那一段（实测 ~885 字符）
+    total_prefix = len(first[0]["content"]) + shared
+    assert total_prefix >= 850, f"跨材料共享前缀只有 {total_prefix} 字符（目标 ~885）"
+
+
 def test_validate_accepts_good_inventory() -> None:
     assert validate_inventory(json.loads(GOOD_JSON), _meta()) == []
 
@@ -164,7 +189,8 @@ def test_run_analyze_writes_contract_file_and_passes_check(dirs: SimpleNamespace
     assert result.concept_count == 2 and result.illustration_count == 1
     meta = payload["meta"]
     assert meta["model"] == "fake-model"
-    assert meta["prompt_version"] == "concepts-v1"
+    # concepts-v2（2026-10-08）：规则尾提到材料正文之前（正文块挪到 user 末尾，前缀缓存）→ 版本号跟着升
+    assert meta["prompt_version"] == "concepts-v2"
     assert meta["source_id"] == "sample" and meta["paragraph_count"] == 6
     assert meta["repairs"] == [] and meta["generated_at"]
     for concept in payload["concepts"]:
@@ -224,7 +250,8 @@ def test_cli_analyze_end_to_end_with_fake_model(
     code, output = run_cli("--data-dir", str(dirs.data), "analyze", "sample")
     assert code == EXIT_OK, output
     assert "概念 2 条" in output
-    assert "concepts-v1" in output
+    # concepts-v2（2026-10-08）：提示词重排（规则尾前移）后版本号升到 v2
+    assert "concepts-v2" in output
 
     code, output = run_cli("--data-dir", str(dirs.data), "analyze", "sample", "--check-only")
     assert code == EXIT_OK, output

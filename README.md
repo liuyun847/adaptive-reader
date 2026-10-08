@@ -3,7 +3,8 @@
 给一段材料，先摸清读者知道什么，再把材料改写成更贴合他的版本；读的时候原文收在右侧抽屉，
 遇到不懂的点标记弹讲解卡片。设计见 [DESIGN.md](DESIGN.md)，实施契约见 [PLAN-skeleton.md](PLAN-skeleton.md)。
 
-**当前状态（W3，2026-10-05）：五个子命令全部可用，端到端一条命令链跑通并已真机验收**
+**当前状态（2026-10-08）：五个子命令全部可用，端到端一条命令链跑通并已真机验收；
+本轮补了「提示词前缀缓存」的模板重排 + 首发预热、缓存用量入产物与 `/api/explain` 响应**
 
 | 已实现 | 尚未实现（接口留位） |
 |---|---|
@@ -14,11 +15,12 @@
 | 最小画像（`profiles/local-default/profile.yaml`，自评写回 + 手写 `overrides`） | 跨材料概念复用（一期按单篇独立） |
 | 模型客户端（OpenAI 兼容流式，密钥不落盘、报错脱敏） | 前端 `web/` 由另一路（W2）负责，本文档不覆盖它的实现 |
 
-真机验收（2026-10-05，模型 `deepseek/deepseek-v4.1-flash`）：
-`data/capital-v1-ch01/` 是**真实产物**（25 段 / 12 概念 / 展开 8 段 + 保持 17 段，34 个数字 + 11 条引文 +
+真机验收（模型 `deepseek/deepseek-v4.1-flash`）：
+`data/capital-v1-ch01/` 是**真实产物**（25 段 / 10 概念 / 展开 7 段 + 保持 18 段，34 个数字 + 11 条引文 +
 13 个书名号全部与原文一致），`uv run ar check capital-v1-ch01` 退出码 0；
 真服务页面（`?source=capital-v1-ch01` + 本机 Edge）与 `/api/explain` 三种 kind 均实测通过，
-截图在 `data/capital-v1-ch01/_verify/`。
+截图在 `data/capital-v1-ch01/_verify/`（页面联调是 2026-10-05 那次；产物是 2026-10-08 重跑的，
+见 §2.1.1，段号与锚点没变，页面照旧可读）。
 
 ## 1. 环境与安装
 
@@ -65,7 +67,7 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 `capital-v1-ch01` 与前端夹具 `samples/capital-v1-ch01/doc.json` 用同一个 source_id，
 两种模式（`?source=` / `?fixture=`）指向同一份材料、同一组段号。
 
-## 2.1 端到端实跑记录（2026-10-05 真机）
+## 2.1 端到端实跑记录（2026-10-05 首跑 / 2026-10-08 重跑）
 
 五步都在 `adaptive-reader/` 下执行，注意 `AR_API_KEY` 只在运行时注入（见 §5）：
 
@@ -77,10 +79,37 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 | 4 | `uv run ar check capital-v1-ch01` | `逐段比对 25 段——数字 34 项 / 引号引文 11 项 / 书名号《》13 项，全部与原文一致；没有段缺失`，**退出码 0** | 结果写回 `changes.json` 的 `fidelity` |
 | 5 | `uv run ar serve --port 8765` | 页面 `?source=capital-v1-ch01`：主栏 25 段真实改写稿、抽屉跟随当前段、无 JS 报错、无降级横幅 | 截图 `data/capital-v1-ch01/_verify/*.png` |
 
-**token 结算**：`analyze` 1 次请求；`rewrite` 6 次请求（25 段合并、并发发 4–6 批）；
+**token 结算（首跑）**：`analyze` 1 次请求；`rewrite` 6 次请求（25 段合并、并发发 4–6 批）；
 `/api/explain` 真机每次 1 次请求。合计真机调用 **10 次**（analyze 1 + rewrite 6 + explain 3）。
 
 `_verify/serve.log` 是那一次真服务运行的 uvicorn 日志（HTTP 请求行，不含密钥与正文）。
+
+### 2.1.1 2026-10-08 重跑：提示词重排 + 首发预热 + 缓存用量入产物
+
+改了三处（`rewrite-v2` / `concepts-v2`，见 §3 与 §8 第 14 条）：把**会变的内容**（本批段号 + 正文）
+挪到 user 消息末尾（批间共享前缀 972 → **2007 字符**，同一份材料同一份概念清单下实测；概念清单换一版
+绝对值会跟着变——重跑后的 10 概念清单下是 874 → 1909）、`rewrite` **先串行跑第 1 批预热再并发其余批次**、
+产物里记 `meta.usage.cached_tokens` 与逐批 `meta.batch_usage[]`。授权重跑，实测：
+
+| 轮次（`ar rewrite capital-v1-ch01 --reader local-default`） | prompt | completion | total | **cached_tokens** | 墙钟 |
+|---|---|---|---|---|---|
+| 备份产物（2026-10-05，`rewrite-v1`；字段当时被汇总逻辑丢掉） | 9885 | 25402 | 35287 | 未记录 | 未记录 |
+| 重跑 A（`rewrite-v2`，**冷**：这些提示词从没发过） | 9489 | 40563 | 50052 | **0** | 151.6 s |
+| 重跑 C（`rewrite-v2`，**热**：与重跑 A 逐字相同） | 9489 | 19133 | 28622 | **9088（96%）** | 63.2 s |
+
+- 重跑 C 的 `data/capital-v1-ch01/decisions.json` / `changes.json` 里直接看得到
+  `meta.usage.cached_tokens: 9088`，逐批明细 `meta.batch_usage[]` 里 6 批各命中 1408–1664；
+  `uv run ar check capital-v1-ch01` **退出码 0**（25 段，数字 34 / 引文 11 / 书名号 13 全部一致）。
+- **「重排 + 预热」本身在冷跑上没有省到钱**：网关只在「逐字相同的前缀 ≥ 约 2048 token（或差异落在
+  最后一个块内）」时才算命中，而这批提示词的固定前缀约 1040 token（1909 字符），批间差异约 500 token
+  ⇒ 6 批全部未命中。省下来的是**重跑**：同一提示词再发一次，prompt 侧命中 96%（≈9000 token），
+  墙钟 151.6 → 63.2 s。门槛的实测依据见 §8 第 14 条。
+- `analyze`（`concepts-v2`，材料正文挪到末尾）：`prompt 3510 / completion 3975 / 合计 7485`，
+  `cached 0`，28.2 s，概念 10 条 / 配图候选 4 条。
+- 中间还有一次重跑 B（同 A，热）：cached 9088、completion 22892、87 s；但它有 2 段把 `[p024] ` 这类
+  **段 id 标记写进了正文**，被事实锚判为「多出数字 024/025」⇒ `ar check` 退出码 4。
+  **没有放宽校验**：丢掉这次产物、重跑 C 得到干净输出（产物目录现在放的是重跑 C）。
+
 
 ## 3. 产物与数据模型
 
@@ -92,16 +121,24 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 | `data/<id>/source.meta.json` | `source_id` / `ingest{kind,path,hash,at}` / `paragraphs[{id,index,text,text_hash}]` |
 | `data/<id>/concepts.json` | `concepts[{id,name,surface,prereq,difficulty_hint,paragraphs,domain,concept_key}]` + `illustration_candidates[{paragraph,kind,why}]` + `meta` |
 | `data/<id>/concepts.raw.txt` | 只在抽取失败时出现：模型原始输出（排查用） |
-| `data/<id>/decisions.json` | `decisions[{paragraph,action,why{profile,note},confidence}]`（**每段一条**）+ `meta{action_counts,deferred_count,profile_used,request_count,usage,degraded,…}` |
+| `data/<id>/decisions.json` | `decisions[{paragraph,action,why{profile,note},confidence}]`（**每段一条**）+ `meta{action_counts,deferred_count,profile_used,request_count,usage,batch_usage,degraded,…}` |
 | `data/<id>/rewritten.md` | 改写稿（段序与源一致、段间空行分隔、段首不写 id）；未实现的动作按保持处理，即该段是原文 |
 | `data/<id>/changes.json` | `changes[{paragraph,action,why,confidence,facts{numbers,quotes},deferred?}]` + `fidelity{checked,mismatches,counts,…}` + `meta{…,model_errors,unplanned_paragraphs,rewrite_incomplete}` |
 | `data/<id>/_verify/` | 真服务联调的截图与 uvicorn 日志（人工验收材料，不是程序产物） |
 | `profiles/<reader>/profile.yaml` | 读者画像（`concepts` / `preferences` / `overrides`） |
 
 `concepts.json` / `decisions.json` / `changes.json` 的 `meta` 是回归基线（DESIGN §7）：
-`model`、`prompt_version`（`concepts-v1` / `rewrite-v1` / `explain-v2`）、`generated_at`，
+`model`、`prompt_version`（`concepts-v2` / `rewrite-v2` / `explain-v2`）、`generated_at`，
 另有 `usage`（token）与 `degraded`（本次所有可见降级）。
 **任何元数据里都不含密钥值。**
+
+`rewrite` 的 `meta.usage` 里，`requests` / `prompt_tokens` / `completion_tokens` / `total_tokens`
+四个字段口径不变，**追加** `cached_tokens`：模型侧上报的**前缀缓存命中** prompt token 合计，
+取 `prompt_tokens_details.cached_tokens` 或扁平字段 `prompt_cache_hit_tokens`（取到哪个算哪个，
+见 `src/ar/model.py::cached_tokens_of`）；网关一个都没上报时写 `null`——**`null` 与 `0` 分得开**
+（`null` = 没上报，不许编造成 0）。另有 `meta.batch_usage[]`（每批一条：`batch` / `paragraph_count` /
+`prompt_tokens` / `completion_tokens` / `total_tokens` / `cached_tokens?` / `failed?`），
+用来判断「预热到底有没有生效」：第 1 批通常是未命中，后面几批才有命中。
 
 模块分工（`src/ar/`）：
 
@@ -150,7 +187,9 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 ### 逐段决策与改写（M3）
 
 - `src/ar/rewrite.py::planDecisions()`：把 25 段按 `--max-chars-per-batch`（默认 1100 字符）
-  合并成 4–6 批**并发**发请求（省 token），返回的 `decisions` 仍然**每段一条**。
+  合并成 4–6 批，**先串行跑第 1 批（预热提示词前缀）、再并发跑其余批次（上限 4）**，返回的
+  `decisions` 仍然**每段一条**。第 1 批失败按既有降级路径处理（该批退回原文并记
+  `meta.model_errors`），不影响其余批次；逐批 token 与缓存命中记在 `meta.batch_usage[]`。
 - **只实现 `expand` / `keep`**：模型若给出枚举内的 `compress` / `illustrate`，一律按 `keep` 处理、
   原文照旧，并在 `changes.json` 该段标 `"deferred": true`、在 `meta.degraded` 里点名
   （页面会显示「本骨架未实现该动作，按保持处理」）。
@@ -217,7 +256,7 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 | `GET /api/doc/<source_id>` | `{ meta, rewritten, changes, concepts, degraded }`；产物缺失的字段是 `null`，原因写在 `degraded` 里 |
 | `GET /api/profile` | `{ profile, degraded }`（默认读者 `local-default`） |
 | `POST /api/profile/rating` | `{ concept_id, state, note? }`（`state ∈ known/partial/unknown`）→ 写回 `profile.yaml`，返回 `{ ok, profile }` |
-| `POST /api/explain` | `{ source_id, paragraph, kind, selection?, selection_from? }`（`kind ∈ explain/simpler/detail`；`selection_from ∈ rewritten/source`，默认 `rewritten`）→ `{ text, degraded, scope, cached?, selection_truncated?, model?, prompt_version? }` |
+| `POST /api/explain` | `{ source_id, paragraph, kind, selection?, selection_from? }`（`kind ∈ explain/simpler/detail`；`selection_from ∈ rewritten/source`，默认 `rewritten`）→ `{ text, degraded, scope, cached?, selection_truncated?, usage?, model?, prompt_version? }` |
 | `GET /api/health` | `{ ok, model_configured, model, api_key_origin, web_static }` |
 
 另外挂了一个**只读**的 `/samples/`（指向项目根的 `samples/`）：契约没要求，
@@ -238,11 +277,13 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
     超出截断到 600 并在响应里追加 `selection_truncated: true`（**降级必须可见，不许静默截断**）；
   - `selection` 非空 → 讲解对象是**那段片段**，`paragraph` 继续提供上下文（邻段、画像），
     响应里 `scope` 记为 `"selection"`；`selection` **不引入任何新锚点或哈希**。
-- `scope` / `cached` / `selection_truncated` 是**追加**字段：`scope`（`paragraph` / `selection`）与
+- `scope` / `cached` / `selection_truncated` / `usage` 是**追加**字段：`scope`（`paragraph` / `selection`）与
   `selection_truncated` 描述**这次请求要什么**，每次响应都给（前端靠 `scope` 确认「确实按片段讲的」）；
-  `cached`（缓存命中）与 `model` / `prompt_version` 描述**这次产出了什么**，只在成功响应
-  （`degraded: false`）里出现。降级响应因此是 `{ text, degraded, reason, scope }`——旧键一个不少、
-  `reason` 枚举不变。
+  `cached`（缓存命中）、`usage`（这次模型调用的**原始 token 账**，含前缀缓存命中
+  `prompt_tokens_details.cached_tokens`；缓存命中或网关没回 usage 时是 `{}`）与 `model` /
+  `prompt_version` 描述**这次产出了什么**，只在成功响应（`degraded: false`）里出现。
+  降级响应因此是 `{ text, degraded, reason, scope }`——旧键一个不少、`reason` 枚举不变。
+  `usage` 里不含密钥、不含正文（网关原样回什么就透传什么，不做改名或裁剪；网络错误日志照旧过 `redact()`）。
 - **`scope` 的口径例外**：`p404 + selection` 这类「段号不存在」的请求在**段号校验**阶段就走掉了
   （`src/ar/explain.py` 里 `find_paragraph` 早于 `prepare_selection`），所以响应里的 `scope`
   是默认的 `"paragraph"`、也不会出现 `selection_truncated`——**不是请求里带 `selection` 就一定回
@@ -304,7 +345,7 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 ## 7. 测试
 
 ```powershell
-uv run pytest tests -q            # 后端用例（167 passed）：默认不收集 tests/web（前端用例单独跑）
+uv run pytest tests -q            # 后端用例（188 passed）：默认不收集 tests/web（前端用例单独跑）
 python -m pytest tests/web -q     # 前端无头用例（45 passed + 1 skipped，W2 提供，需要本机 Edge）
 ```
 
@@ -331,7 +372,14 @@ python -m pytest tests/web -q     # 前端无头用例（45 passed + 1 skipped�
 `tests/test_explain_scope.py` 守**选中片段作用域与讲解缓存**（2026-10-08）：
 `selection` 缺失时与旧版逐字一致、非空时片段确实进了发往模型的 messages、规范化口径与锚点一致、
 超 600 字符截断并上报 `selection_truncated`、缓存命中不再调模型、画像文件一变即失效、
-失败与降级不进缓存、LRU 容量/淘汰/线程安全、三条既有降级路径的响应键集不变。
+失败与降级不进缓存、LRU 容量/淘汰/线程安全、三条既有降级路径的响应键集不变；
+成功响应追加的 `usage`（原样透传 `prompt_tokens_details.cached_tokens`）与缓存命中时的空 `usage`。
+
+`tests/test_rewrite.py` / `tests/test_analyze.py` / `tests/test_model.py` 守**前缀缓存那一组改动**
+（2026-10-08）：rewrite 模板里「段号 + 本批正文在 user 末尾」（按字符位置 + 批间共享前缀长度断言）、
+concepts 模板里「材料正文在末尾」、**第 1 批串行跑完才发其余批次**（假模型记录调用顺序与并发峰值）
++ 预热批失败不拖累其余批次、`usage.cached_tokens` 的嵌套 / 扁平字段累加与逐批明细、
+`cached_tokens_of()` 的字段解析（含 `null` 与 `0` 分得开）。
 
 `tests/test_no_silent_degradation.py` 专门守**静默降级与检查器空跑**（2026-10-05 对抗性复核
 实测出的五处缺陷，每处至少一条负向对照）：删 / 清空 `changes.json` 后 `check` 必须非零退出、
@@ -360,8 +408,9 @@ python -m pytest tests/web -q     # 前端无头用例（45 passed + 1 skipped�
    决策只能依据概念清单的难度提示（产物里已显式标注）。要让改写「因人而异」，
    得先写 `concepts` 自评或用页面的自评勾选（`POST /api/profile/rating`）攒出画像。
 7. **单读者**：画像格式按「任何读者都能用」设计，但当前只服务 `local-default` 一个人。
-8. **token 成本随材料线性增长**：25 段约 4.5 万 token（analyze + rewrite）；
-   读中按需展开（讲解卡片）是另一笔按次付费的账，目前每次 12–46 秒。
+8. **token 成本随材料线性增长**：25 段约 3.6 万 token（analyze 7,485 + 改写 28,622，2026-10-08 热缓存那轮）；
+   冷跑（提示词第一次发）同规模约 5.8 万 token；读中按需展开（讲解卡片）是另一笔按次付费的账，
+   目前每次 12–46 秒。
 9. `data/` 与 `profiles/` 的**运行产物不进版本库**；若将来把本项目纳入 git，请自行
    `.gitignore` 掉 `data/`、`config.local.json` 与 `profiles/` 的实际取值。
 10. **退出码 6 只说明「有段落没被改写」，不含「改写质量」**：模型整批失败 → 整篇保持原文
@@ -378,3 +427,17 @@ python -m pytest tests/web -q     # 前端无头用例（45 passed + 1 skipped�
     纸白 / 暖黄 + 浅灰、深色 + 深墨）。这类组合不拦（用户有权这么选），但设置面板里会显示实测对比度
     告警（阈值 AA 4.5:1）；「浮在内容之上的面」（顶栏 / 徽标 / 抽屉 / 卡片 / 浮条 / 设置面板）按**背景档**
     配对底色与文字，与文字颜色档无关，所以面板里的正文类文字在任何组合下都 ≥ 4.5:1。
+14. **前缀缓存（prompt caching）要看网关的门槛，不是「排好序就一定命中」**（2026-10-08 实测本机网关）：
+    提示词里会变的内容排在末尾（`ar.prompts` 的「前缀缓存纪律」）只是**必要条件**——网关按「从头逐字相同的
+    token 前缀」给折扣，本机网关的实测口径是**共享前缀 ≥ 约 2048 token 才算命中**（命中量向下取整到 64 的
+    整数倍）；共享前缀更短时，只有「差异落在最后一个块内」（尾巴 ≤ 约 64 token）才算命中。所以：
+    - `rewrite` 的固定前缀约 1040 token（1909 字符）、批间差异约 500 token ⇒ **同一轮里 6 批互不命中**
+      （重跑 A 实测 `cached_tokens: 0`），预热串行化本身也救不了（这是网关门槛，不是调用顺序问题）；
+    - **重跑**（同一材料、同一提示词逐字相同）命中 96%（重跑 C 实测 `cached_tokens: 9088` / prompt 9489），
+      墙钟 151.6 → 63.2 s；
+    - 想让**同一轮内**也命中，得把固定前缀做到 ≥ 约 2048 token（≈ 3750 字符）——本骨架没做，因为那要往
+      提示词里塞进约 1800 字符的静态内容，冷跑时这笔钱要先付出去（属于成本取舍，不是实现缺陷）。
+    实测口径（2026-10-08，同一网关 `deepseek/deepseek-v4.1-flash`，用 `max_tokens=1` 的探针请求量的）：
+    共享 2100 token + 1400 token 尾 → 命中 2048；共享 1800 + 1400 尾 → 0；共享 500 + 20 尾 → 命中 512；
+    共享 500 + 200 尾 → 0。命中量、逐批命中量都记在产物里（`meta.usage.cached_tokens` /
+    `meta.batch_usage[]`），`/api/explain` 的成功响应里也有 `usage` 字段——**别只看网关账单猜**。

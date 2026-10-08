@@ -190,3 +190,33 @@ def test_timeout_is_reported_as_failure() -> None:
 
     with pytest.raises(ModelCallFailed, match="模型调用失败"):
         call(make_client(handler))
+
+
+# ------------------------------------------------------ 前缀缓存用量字段解析 --
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        # OpenAI 风格（本机网关实测回的就是它）
+        ({"prompt_tokens_details": {"cached_tokens": 3456}}, 3456),
+        # 扁平字段（DeepSeek 原生字段名）
+        ({"prompt_cache_hit_tokens": 512}, 512),
+        ({"cached_tokens": 7}, 7),
+        # 嵌套优先：两个都在时听嵌套的
+        ({"prompt_tokens_details": {"cached_tokens": 3}, "prompt_cache_hit_tokens": 99}, 3),
+        # 上报了但没命中：0 与「没上报」必须分得开
+        ({"prompt_tokens_details": {"cached_tokens": 0}}, 0),
+        # 没上报 / 形态不对 → None（不许编造成 0）
+        ({}, None),
+        ({"prompt_tokens_details": {}}, None),
+        ({"prompt_tokens_details": {"cached_tokens": None}}, None),
+        ({"prompt_tokens_details": {"cached_tokens": "3456"}}, None),
+        ({"prompt_tokens_details": {"cached_tokens": True}}, None),
+        ({"prompt_cache_hit_tokens": 3.5}, None),
+        (None, None),
+        ("usage", None),
+    ],
+)
+def test_cached_tokens_of_reads_both_gateway_shapes(usage: Any, expected: int | None) -> None:
+    from ar.model import cached_tokens_of
+
+    assert cached_tokens_of(usage) == expected

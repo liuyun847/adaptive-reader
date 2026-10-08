@@ -9,7 +9,8 @@
 3. **缓存**：同键第二次调用不再碰模型且 ``cached: true``；换 kind / 换片段 / 换材料不串味；
    画像文件一变即失效；失败与降级一律不进缓存；LRU 容量与线程安全；
 4. **向后兼容**：旧请求体（没有 selection）正常；三条既有降级路径（``paragraph_not_found`` /
-   ``model_not_configured`` / ``model_error``）的原因枚举不变、旧键一个不少（只多一个请求侧的 ``scope``）。
+   ``model_not_configured`` / ``model_error``）的原因枚举不变、旧键一个不少（只多一个请求侧的 ``scope``）；
+   成功响应另追加 ``usage``（本次调用的原始 token 账，含 ``prompt_tokens_details.cached_tokens``）。
 
 所有模型调用都注入假客户端（``fake_client``），不发真实网络请求。
 """
@@ -81,14 +82,55 @@ def test_selection_absent_keeps_legacy_shape_and_paragraph_scope(
 
     assert payload["degraded"] is False
     assert payload["scope"] == "paragraph"
-    # 成功响应 = 旧四键 + 追加的 scope（reason / cached / selection_truncated 都不该出现）
-    assert set(payload) == {"text", "degraded", "model", "prompt_version", "scope"}
+    # 成功响应 = 旧四键 + 追加的 scope 与 usage（reason / cached / selection_truncated 都不该出现）。
+    # usage（2026-10-08）是**追加**字段：原有键逐字不变，这里把键集写全（不是放宽，是加了一项）。
+    assert set(payload) == {"text", "degraded", "model", "prompt_version", "scope", "usage"}
     assert "cached" not in payload and "selection_truncated" not in payload
 
     assert len(fake.calls) == 1
     sent = fake.calls[0][1]["content"]
     assert "这一段原文" in sent and "第一段：带" in sent
     assert "选中的片段" not in sent  # 没选片段就不该出现选片段式版式
+
+
+def test_explain_success_response_exposes_usage_with_cached_tokens(
+    ingested: SimpleNamespace, fake_client
+) -> None:
+    """``usage`` 是**追加**字段：原样透传这次调用的 token 账（含前缀缓存命中量）。
+
+    讲解每次都要真金白银，命中量必须看得见；缓存命中时这次没调模型，``usage`` 是空对象
+    （不把上一次的账再报一遍）。
+    """
+
+    class _UsageClient:
+        configured = True
+
+        def __init__(self, usage: dict) -> None:
+            self.usage = usage
+            self.calls: list[list[dict[str, str]]] = []
+
+        async def achat(self, messages, **kwargs):  # noqa: ANN001, ANN003
+            self.calls.append(list(messages))
+            return SimpleNamespace(text="按画像讲解。", model="fake-model", usage=self.usage)
+
+    usage = {
+        "prompt_tokens": 1200,
+        "completion_tokens": 300,
+        "total_tokens": 1500,
+        "prompt_tokens_details": {"cached_tokens": 1024},
+    }
+    fake = _UsageClient(usage)
+    client = make_client(ingested, api_key=FAKE_KEY, client_factory=lambda: fake)
+
+    payload = client.post("/api/explain", json=explain_body()).json()
+    assert payload["usage"] == usage, "usage 原样透传，不改名、不裁剪"
+    assert payload["usage"]["prompt_tokens_details"]["cached_tokens"] == 1024
+    # 旧键一个不少（usage 只是追加）
+    assert {"text", "degraded", "model", "prompt_version", "scope"} <= set(payload)
+
+    second = client.post("/api/explain", json=explain_body()).json()
+    assert second["cached"] is True and second["usage"] == {}, "缓存命中没调模型：usage 不该凭空冒出来"
+    assert len(fake.calls) == 1
 
 
 def test_selection_scope_puts_fragment_in_messages_and_keeps_context(

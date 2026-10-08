@@ -11,12 +11,16 @@
 一律返回 ``degraded: true`` + 一段人话说明，绝不留空白、绝不假装成功。
 
 **缓存**（``ar.cache``）：只缓存成功结果；键与失效策略见 ``ar.cache`` 模块文档。
+
+**token 账**：成功调用时把原始 ``usage`` 原样带进 ``ExplainOutcome.usage``，HTTP 层以追加字段
+``usage`` 暴露（含前缀缓存命中 ``prompt_tokens_details.cached_tokens``）——讲解每次都要真金白银，
+命中量必须看得见。``usage`` 里不含密钥、不含正文。
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +88,12 @@ def prepare_selection(raw: Any, *, limit: int = SELECTION_MAX_CHARS) -> Prepared
 
 @dataclass
 class ExplainOutcome:
-    """一次讲解请求的结果；``degraded=True`` 时 ``text`` 是说明文本，不是模型产出。"""
+    """一次讲解请求的结果；``degraded=True`` 时 ``text`` 是说明文本，不是模型产出。
+
+    ``usage`` 是这次调用的原始 usage（``{}`` = 没调模型 / 缓存命中 / 网关没回），
+    里面含 ``prompt_tokens_details.cached_tokens`` 这类前缀缓存字段——原样带给 HTTP 层，
+    不在这里改名或裁剪（口径见 ``ar.model.cached_tokens_of``）。
+    """
 
     text: str
     degraded: bool
@@ -94,6 +103,7 @@ class ExplainOutcome:
     scope: str = SCOPE_PARAGRAPH
     cached: bool = False
     selection_truncated: bool = False
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 def find_paragraph(meta: dict[str, Any], paragraph_id: str) -> dict[str, Any] | None:
@@ -221,6 +231,7 @@ async def aexplain(
             selection_truncated=prepared.truncated,
         )
     text = (getattr(reply, "text", "") or "").strip()
+    usage = getattr(reply, "usage", None)
     if not text:
         return ExplainOutcome(
             text="模型返回了空内容，未生成讲解。",
@@ -235,6 +246,7 @@ async def aexplain(
         model=getattr(reply, "model", None),
         scope=prepared.scope,
         selection_truncated=prepared.truncated,
+        usage=dict(usage) if isinstance(usage, dict) else {},
     )
     if cache is not None and key is not None:
         # 只缓存成功结果：上面每条降级路径都在 return 里走掉了，进不到这里来
