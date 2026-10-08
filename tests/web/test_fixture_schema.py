@@ -123,8 +123,27 @@ def test_concepts_reference_existing_paragraphs(doc):
 def test_explain_fixture_is_a_response_body(explain):
     assert explain["degraded"] is False
     assert isinstance(explain["text"], str) and len(explain["text"]) > 40
-    # 夹具只有一份讲解，用 paragraph 字段说明它对应哪一段（前端会据此显示提示）
+    # 夹具只有一份讲解，用 paragraph / kind 说明它对应哪一段、哪种 kind
+    # （这两个键是**夹具专用**的信息性字段，后端 /api/explain 不返回；前端会据此显示提示）
     assert explain["paragraph"] == "p022"
+    assert explain["kind"] == "simpler"
+
+
+def test_explain_fixture_matches_the_real_response_shape(explain):
+    """夹具必须长成**真实响应**的样子（口径以后端 `server.post_explain` 为准）。
+
+    2026-10-08 复核修的两处：
+      - `selection_from` 是**请求**字段，不属于响应（曾经被写进夹具，还被当契约断言）；
+      - `cached` / `selection_truncated` **为真才出现**，后端从不返回 `false` 版本。
+    另外 `scope` 每次响应都给（片段 / 整段作用域），这里也得在。
+    """
+    assert explain["scope"] in {"selection", "paragraph"}
+    assert "selection_from" not in explain, "selection_from 是请求字段，不该出现在响应夹具里"
+    assert "cached" not in explain, "cached=false 不是后端会返回的形状（为真才出现）"
+    assert "selection_truncated" not in explain, "同上：selection_truncated 只在被截断时出现"
+    # 夹具是手造样例，不冒充模型产出：体现「这次产出了什么」的键一个都没有
+    assert "model" not in explain and "prompt_version" not in explain
+    assert "reason" not in explain, "reason 只在降级响应里出现"
 
 
 def test_fixture_is_declared_handmade():

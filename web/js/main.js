@@ -5,16 +5,36 @@
  *   - 主栏是唯一常驻内容；抽屉默认折叠；讲解只出卡片，不改动正文；
  *   - 任何降级（模型不可用、请求失败、段数对不上、没有概念清单）都必须在页面上留下可见文字，
  *     同时在 globalThis.__arDebug 里留下可断言的状态标志。无头验证只等 __arDebug.ready，不 sleep。
+ *
+ * 2026-10-08 这批改造（四件事，都在这一个文件里接线）：
+ *   ① 讲解粒度从「整段」下探到「选中的文本片段」：选中文字 → 浮条 → 卡片标明片段与所属段；
+ *   ② 阅读显示设置（背景 / 文字颜色 / 字号），渲染前应用、落 localStorage；
+ *   ③ 读完提示从底部浮窗改成正文末尾的流内块；
+ *   ④ 会话内讲解缓存 + 在飞去重 + 请求序号（堵住重复付费与迟到响应覆盖）。
+ *
+ * 同日复核后的三处补丁（也在这个文件里）：
+ *   - 显示设置改完就量一次正文栏对比度，读不清时在设置面板里出可见告警（手动组合不拦，但要说）；
+ *   - 会话缓存键补上画像指纹（每次讲解前刷一次 `GET /api/profile` 的摘要，画像一变键就变）；
+ *   - 卡片状态区挪到底部固定区（view.js），长答案下也看得见。
  */
 
 import {
-  DataError, loadDoc, readContext, requestExplain,
+  DataError, loadDoc, loadProfileSignal, readContext, requestExplain,
 } from './api.js';
+import { createExplainCache } from './cache.js';
+import {
+  addBanner, buildCard, buildParagraphBlock, buildSelectBar, buildSourceParagraph, fillCard,
+  layoutCard, layoutCardFixed, repositionCard, setCardAnswer, setCardMeta, setCardStatus,
+  setExplainButtonsDisabled, setSelectBarInfo,
+} from './view.js';
 import { asArray, splitRewritten } from './schema.js';
 import {
-  addBanner, buildCard, buildParagraphBlock, buildSourceParagraph, fillCard,
-  layoutCard, setCardAnswer, setCardStatus, setExplainButtonsDisabled,
-} from './view.js';
+  cacheKey, describeSelection, findSelectionScope, normalizeSelection, selectionRect, toolbarPosition,
+} from './selection.js';
+import {
+  MIN_CONTRAST, bootstrapSettings, buildSettingsPanel, measureInkContrast, resetSettings,
+  setSettingsPanelOpen, syncSettingsPanel, updateSettings,
+} from './settings.js';
 
 const D = globalThis.__arDebug;
 D.jsLoaded = true;
@@ -32,6 +52,9 @@ const dom = {
   drawerEmpty: document.querySelector('[data-role="drawer-empty"]'),
   cardLayer: document.querySelector('[data-role="card-layer"]'),
   compression: document.querySelector('[data-role="compression"]'),
+  selectBar: document.querySelector('[data-role="select-bar"]'),
+  settingsToggle: document.querySelector('[data-role="settings-toggle"]'),
+  settingsPanel: document.querySelector('[data-role="settings-panel"]'),
   sourceBadge: document.querySelector('[data-role="source-id"]'),
   modeBadge: document.querySelector('[data-role="mode-badge"]'),
   progress: document.querySelector('[data-role="progress"]'),
@@ -47,6 +70,17 @@ const state = {
   card: null,
   current: null,
   readComplete: false,
+  settings: null,           // { bg, ink, size, inkExplicit }
+  settingsCtx: null,        // updateSettings/resetSettings 要的上下文（root + storage）
+  settingsPanelOpen: false,
+  inkContrast: null,        // 正文栏当前的实测对比度（量不出来为 null）
+  profileSignal: '',        // 会话缓存键的画像指纹（夹具模式 / 拿不到时为空串）
+  profileSignalNoted: false,
+  selection: null,          // 最近一次选区的描述（浮条展示中的那一份）
+  cache: createExplainCache(),
+  inflight: new Map(),      // tokenKey -> seq（同一张卡片同时在飞的请求）
+  seq: 0,
+  pending: null,            // 当前卡片请求的 token，用来丢弃迟到的响应
 };
 
 function degrade(kind, message) {
@@ -195,6 +229,11 @@ function computeCompression(paragraphs) {
   };
 }
 
+/**
+ * 读完（滚到底）才显示正文末尾的压缩块。
+ * 它是**流内块**（`[data-role="compression"]`，在 — 改写稿结束 — 之后），不是浮窗；
+ * 语义与调试面沿用旧口径：初始 hidden，读完才显示，`data-state` + `__arDebug.compression.shown/text`。
+ */
 function markReadComplete() {
   if (state.readComplete) return;
   state.readComplete = true;
@@ -251,7 +290,69 @@ function setDrawer(open) {
   dom.drawer.dataset.state = open ? 'open' : 'collapsed';
   dom.drawerToggle.setAttribute('aria-expanded', String(open));
   D.drawerOpen = open;
+  hideSelectBar();
   if (open) scrollDrawerToCurrent();
+}
+
+/* --------------------------------------------------- 阅读显示设置（②） */
+
+/**
+ * 量一次正文栏的实测对比度，写进设置面板的告警与 `__arDebug`。
+ * 背景 × 文字颜色是两个独立档位，能组合出「深色背景 + 深墨文字」这种读不清的正文——
+ * 不拦用户，但必须在设置面板里说出来（`syncSettingsPanel` 负责显示）。
+ */
+function syncDisplaySettings() {
+  const ratio = measureInkContrast();
+  state.inkContrast = ratio;
+  D.inkContrast = ratio;                                   // 数值，量不出来是 null
+  D.inkContrastLow = typeof ratio === 'number' && ratio < MIN_CONTRAST;
+  syncSettingsPanel(dom.settingsPanel, state.settings, ratio);
+}
+
+function mountSettings() {
+  const panel = buildSettingsPanel();
+  if (dom.settingsPanel) dom.settingsPanel.replaceWith(panel);
+  dom.settingsPanel = panel;
+
+  state.settingsCtx = { root: document.body, storage: globalThis.localStorage || null, settings: state.settings };
+
+  dom.settingsToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleSettingsPanel();
+  });
+  panel.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const role = event.target.dataset ? event.target.dataset.role : null;
+    if (role === 'settings-close') { setSettingsPanelOpen_(false); return; }
+    if (role === 'settings-reset') {
+      state.settings = resetSettings(state.settingsCtx);
+      state.settingsCtx.settings = state.settings;
+      D.settings = { ...state.settings };
+      syncDisplaySettings();
+      return;
+    }
+    const input = event.target.closest ? event.target.closest('input[data-setting]') : null;
+    if (!input) return;
+    const patch = { [input.dataset.setting]: input.value };
+    if (input.dataset.setting === 'ink') patch.inkExplicit = true;
+    state.settings = updateSettings(state.settingsCtx, patch);
+    state.settingsCtx.settings = state.settings;
+    D.settings = { ...state.settings };
+    syncDisplaySettings();
+  });
+  panel.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') setSettingsPanelOpen_(false);
+  });
+}
+
+function setSettingsPanelOpen_(open) {
+  state.settingsPanelOpen = Boolean(open);
+  D.settingsPanelOpen = state.settingsPanelOpen;
+  setSettingsPanelOpen(dom.settingsPanel, dom.settingsToggle, state.settingsPanelOpen);
+}
+
+function toggleSettingsPanel() {
+  setSettingsPanelOpen_(!state.settingsPanelOpen);
 }
 
 /* ------------------------------------------------------------ 讲解卡片 */
@@ -265,26 +366,59 @@ function ensureCard() {
     state.card.querySelectorAll('[data-role="explain"]').forEach((btn) => {
       btn.addEventListener('click', () => {
         const pid = btn.dataset.paragraph || state.card.dataset.paragraph;
-        requestCardExplain(pid, btn.dataset.kind);
+        requestCardExplain(pid, btn.dataset.kind, cardSelectionContext(state.card));
       });
     });
+    // 答案把卡片撑高后要重新夹回视口（不然底部按钮会被顶到视口外）
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(() => {
+        if (!state.card || !D.cardOpen) return;
+        const anchor = state.card.dataset.cardScope === 'selection'
+          ? null
+          : dom.article.querySelector(`#blk-${state.card.dataset.paragraph} [data-role="marker"]`);
+        repositionCard(state.card, anchor);
+      });
+      observer.observe(state.card);
+      state.cardObserver = observer;
+    }
   }
   return state.card;
 }
 
-function openCard(paragraphId, anchor) {
+/** 卡片当前的片段上下文（整段卡片返回 null）。 */
+function cardSelectionContext(card) {
+  const text = card.dataset.selection;
+  if (!text) return null;
+  const preview = card.querySelector('[data-role="card-selection-preview"]');
+  return {
+    text,
+    from: card.dataset.selectionFrom === 'source' ? 'source' : 'rewritten',
+    preview: preview ? preview.textContent : text,
+    previewTruncated: Boolean(preview && preview.dataset.truncated === 'true'),
+  };
+}
+
+/**
+ * 打开卡片。`selection`（可选）来自选片浮条：
+ * { text, preview, previewTruncated, paragraphs, chars, from }
+ */
+function openCard(paragraphId, anchor, selection = null) {
   const card = ensureCard();
   fillCard(card, {
     paragraphId,
     change: state.changes.get(paragraphId) || null,
     conceptsById: D.concepts,
+    selection,
   });
   card.dataset.cardState = 'open';
-  layoutCard(card, anchor);
+  if (selection) layoutCardFixed(card);
+  else layoutCard(card, anchor);
   D.cardOpen = true;
   D.lastCard = {
     paragraph: paragraphId,
     action: (state.changes.get(paragraphId) || {}).action || null,
+    scope: selection ? 'selection' : 'paragraph',
+    selection: selection ? selection.text : null,
     state: 'idle',
     text: '',
     at: Date.now(),
@@ -296,64 +430,339 @@ function closeCard(reason) {
   state.card.dataset.cardState = 'closed';
   state.card.hidden = true;
   D.cardOpen = false;
+  state.pending = null;
   D.cardCloses = (D.cardCloses || []).concat([{ reason, at: Date.now() }]);
   if (D.lastCard) D.lastCard.closed = true;
 }
 
-async function requestCardExplain(paragraphId, kind) {
+/** 讲解缓存的可断言快照（无头验证与排查都用它）。 */
+function cacheSnapshot() {
+  return { size: state.cache.size(), inflight: state.cache.inflightSize(), keys: state.cache.keys() };
+}
+
+/**
+ * 刷一次画像指纹（会话缓存键的第五段）。
+ *
+ * 为什么要有：后端缓存键含 `profile.yaml` 的 `(字节数, mtime_ns)`，画像一变旧条目就失效；
+ * 前端会话缓存若不带等价信号，「会话内改了画像（自评写回 / 手改 overrides）」后仍会命中旧答案。
+ * 取数只用现有能力（`GET /api/profile` 的内容摘要），不请新接口。
+ *
+ * 失败处理（不静默）：**保留上一次的信号**（清空会让键漂移、白白多花一次模型调用），
+ * 并留一条降级横幅说明「本次会话的缓存不会随画像变化失效」。
+ */
+async function refreshProfileSignal() {
+  if (!state.ctx || state.ctx.mode !== 'api') {
+    D.profileSignal = state.profileSignal;
+    return state.profileSignal;
+  }
+  try {
+    state.profileSignal = await loadProfileSignal(state.ctx);
+    D.profileSignal = state.profileSignal;
+  } catch (err) {
+    if (!state.profileSignalNoted) {
+      state.profileSignalNoted = true;
+      degrade('profile-signal',
+        `拿不到读者画像指纹（/api/profile 失败：${err.message}）：`
+        + '本次会话的讲解缓存不随画像变化失效（画像改过之后可能命中旧答案）。');
+    }
+    D.profileSignal = state.profileSignal;
+  }
+  return state.profileSignal;
+}
+
+/**
+ * 现场生成讲解（慢入口）。
+ *
+ * 会话缓存 + 在飞去重 + 请求序号三件事都在这里：
+ *   - 命中缓存：直接渲染，标「本次会话已生成」，不发请求；
+ *   - 同一 key 已在飞：复用同一个 Promise（`D.explainDeduped` 计数，测试据此断言没重复发请求）；
+ *   - 迟到的响应：token 与当前卡片不符就只写进缓存，不动卡片（`D.lastCard.stale = true`）。
+ *
+ * 缓存键在**取过画像指纹之后**才定：画像在会话内变了，键就变，旧答案不会被命中。
+ */
+async function requestCardExplain(paragraphId, kind, selection = null) {
   const card = state.card;
   if (!card) return;
+  const selectionText = selection ? normalizeSelection(selection.text) : '';
+  const selectionFrom = selection && selection.from === 'source' ? 'source' : 'rewritten';
+
   setExplainButtonsDisabled(card, true);
   setCardAnswer(card, '');
-  setCardStatus(card, 'loading', `正在生成讲解（${kind}）…`);
-  D.lastCard = { paragraph: paragraphId, kind, state: 'loading', text: '', at: Date.now() };
+  setCardMeta(card, '');
+  setCardStatus(card, 'loading', selectionText
+    ? `正在按选中片段生成讲解（${kind}）…`
+    : `正在生成讲解（${kind}）…`);
 
-  try {
-    const { payload, url, mode } = await requestExplain(state.ctx, { paragraph: paragraphId, kind });
-    const text = typeof payload.text === 'string' ? payload.text.trim() : '';
-    const fixtureMismatch = mode === 'fixture'
-      && typeof payload.paragraph === 'string'
-      && payload.paragraph !== paragraphId;
-    const note = fixtureMismatch
-      ? `（夹具模式：这份 explain.json 是 ${payload.paragraph} 的样例讲解，不是本段自己的）\n`
-      : '';
+  const profileSignal = await refreshProfileSignal();
+  const key = cacheKey(D.sourceId, paragraphId, kind, selectionText, profileSignal);
 
-    if (payload.degraded === true) {
-      const copy = text || '模型不可用：本次讲解没有生成。该段原文可在右侧「原文」抽屉里对照。';
-      setCardStatus(card, 'degraded', `${note}降级显示：${copy}`);
-      D.lastCard = { paragraph: paragraphId, kind, state: 'degraded', text: copy, url, at: Date.now() };
-      degrade('explain-degraded', `讲解降级（${paragraphId}）：${copy}`);
-    } else if (!text) {
-      const copy = '模型返回了空内容：本次讲解没有生成。该段原文可在右侧「原文」抽屉里对照。';
-      setCardStatus(card, 'degraded', `${note}降级显示：${copy}`);
-      D.lastCard = { paragraph: paragraphId, kind, state: 'degraded', text: copy, url, at: Date.now() };
-      degrade('explain-empty', `讲解为空（${paragraphId}）：${copy}`);
+  const baseRecord = {
+    paragraph: paragraphId,
+    kind,
+    scope: selectionText ? 'selection' : 'paragraph',
+    selection: selectionText || null,
+    selectionFrom: selectionText ? selectionFrom : null,
+    state: 'loading',
+    text: '',
+    at: Date.now(),
+  };
+  D.lastCard = { ...baseRecord };
+  state.seq += 1;
+  const token = { key, seq: state.seq };
+  state.pending = token;
+  D.pendingExplain = { key, seq: token.seq };
+
+  const outcome = await state.cache.request(
+    { sourceId: D.sourceId, paragraph: paragraphId, kind, selection: selectionText },
+    {
+      cacheKey,
+      run: () => requestExplain(state.ctx, {
+        paragraph: paragraphId, kind, selection: selectionText, selectionFrom,
+      }),
+    },
+  );
+  D.explainCache = cacheSnapshot();
+
+  const commit = (result, fromCache) => {
+    const done = renderExplainResult(card, {
+      paragraphId, kind, selectionText, selectionFrom, token, result, fromCache,
+    });
+    const summary = { ...baseRecord, state: done.state, text: done.text, url: done.url };
+    if (!done.live) summary.stale = true;
+    D.lastCard = summary;
+    D.cards.push({ ...summary });
+  };
+
+  if (outcome.status === 'cached') {
+    // 命中会话缓存：直接渲染，标「本次会话已生成」，不再发请求
+    commit({ entry: outcome.entry, ok: true }, true);
+  } else {
+    if (outcome.status === 'inflight') D.explainDeduped = (D.explainDeduped || 0) + 1;
+    const settled = await outcome.promise;
+    if (settled.ok) {
+      commit(settled, false);
     } else {
-      setCardAnswer(card, text);
-      setCardStatus(card, 'ok', `${note}讲解已生成（${kind}）。`);
-      D.lastCard = { paragraph: paragraphId, kind, state: 'ok', text, url, at: Date.now() };
+      const err = settled.error;
+      const copy = `讲解生成失败：${err.message}。这一段仍可在右侧「原文」抽屉里对照原文。`;
+      const summary = {
+        ...baseRecord,
+        state: 'error',
+        text: copy,
+        url: err.url || null,
+        errorKind: (err.detail && err.detail.kind) || null,
+      };
+      if (isLive(token)) {
+        setCardStatus(card, 'error', copy);
+        D.lastCard = summary;
+      } else {
+        // 迟到且失败的请求：不覆盖当前卡片
+        D.lastCard = { ...summary, stale: true };
+      }
+      D.cards.push({ ...D.lastCard });
+      degrade('explain-error', `讲解请求失败（${paragraphId}）：${err.message}`);
     }
+  }
+
+  // 收尾再刷新一次缓存快照：这里才是「本次请求彻底结束」的时点
+  D.explainCache = cacheSnapshot();
+  setExplainButtonsDisabled(card, false);
+}
+
+/** token 还是当前卡片的那一个吗？不是就说明响应迟到了。 */
+function isLive(token) {
+  return Boolean(state.pending && state.pending.seq === token.seq && state.pending.key === token.key);
+}
+
+/**
+ * 把一次请求结果写进卡片（只在 token 仍然有效时动 DOM）。
+ * @returns {{state:string, text:string, url:string|null, live:boolean}}
+ */
+function renderExplainResult(card, { paragraphId, kind, selectionText, selectionFrom, token, result, fromCache }) {
+  const entry = result.entry || {};
+  const payload = entry.payload || {};
+  const url = entry.url || null;
+  const live = isLive(token);
+  const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+  const notes = [];
+  if (fromCache) notes.push('本次会话已生成（直接复用，没有再次请求模型）');
+  if (payload.cached === true) notes.push('后端缓存命中');
+  if (payload.selection_truncated === true) notes.push('片段超过 600 字，本次只按前 600 字讲解');
+  const fixtureMismatch = entry.mode === 'fixture'
+    && typeof payload.paragraph === 'string'
+    && payload.paragraph !== paragraphId;
+  if (fixtureMismatch) {
+    notes.push(`夹具模式：这份 explain.json 是 ${payload.paragraph} 的样例讲解，不是本段自己的`);
+  }
+  if (selectionText && payload.scope !== 'selection') {
+    notes.push(payload.scope === 'paragraph'
+      ? '后端按整段讲的（scope: paragraph）：段号不存在之类的请求在片段校验之前就返回了'
+      : '响应没有 scope 字段：无法确认后端是按片段讲的（旧响应或夹具）');
+  }
+  const scopeNote = selectionText
+    ? `讲解按选中片段生成（第 ${paragraphId} 段，来自${selectionFrom === 'source' ? '原文' : '改写稿'}）`
+    : `讲解已生成（${kind}）`;
+
+  let nextState = 'ok';
+  let copy = text;
+  let statusText = '';
+  if (payload.degraded === true) {
+    copy = text || (selectionText
+      ? '模型不可用：本次片段讲解没有生成。该段原文可在右侧「原文」抽屉里对照。'
+      : '模型不可用：本次讲解没有生成。该段原文可在右侧「原文」抽屉里对照。');
+    nextState = 'degraded';
+    statusText = `降级显示：${copy}`;
+  } else if (!text) {
+    copy = selectionText
+      ? '模型返回了空内容：本次片段讲解没有生成。该段原文可在右侧「原文」抽屉里对照。'
+      : '模型返回了空内容：本次讲解没有生成。该段原文可在右侧「原文」抽屉里对照。';
+    nextState = 'degraded';
+    statusText = `降级显示：${copy}`;
+  } else {
+    statusText = notes.length ? `${scopeNote}。${notes.join('；')}` : `${scopeNote}。`;
+  }
+
+  if (live) {
+    if (nextState === 'ok') setCardAnswer(card, text);
+    setCardStatus(card, nextState, statusText);
+    if (fromCache) setCardMeta(card, '本次会话已生成');
+  }
+  if (nextState === 'degraded') {
+    degrade(`explain-${fromCache ? 'cached-degraded' : 'degraded'}`,
+      `讲解降级（${paragraphId}${selectionText ? ' 片段' : ''}）：${copy}`);
+  }
+  return { state: nextState, text: copy, url, live };
+}
+
+/* --------------------------------------------------- 选片讲解浮条（①） */
+
+function currentBrowserSelection() {
+  try {
+    return window.getSelection ? window.getSelection() : null;
   } catch (err) {
-    const copy = `讲解生成失败：${err.message}。这一段仍可在右侧「原文」抽屉里对照原文。`;
-    setCardStatus(card, 'error', copy);
-    D.lastCard = {
-      paragraph: paragraphId,
-      kind,
-      state: 'error',
-      text: copy,
-      url: err.url || null,
-      errorKind: (err.detail && err.detail.kind) || null,
-      at: Date.now(),
-    };
-    degrade('explain-error', `讲解请求失败（${paragraphId}）：${err.message}`);
-  } finally {
-    setExplainButtonsDisabled(card, false);
-    D.cards.push({ ...D.lastCard });
+    return null;
   }
 }
 
-/* ------------------------------------------------------------ 交互接线 */
+function hideSelectBar() {
+  if (!dom.selectBar) return;
+  dom.selectBar.hidden = true;
+  dom.selectBar.dataset.state = 'hidden';
+  D.toolbarOpen = false;
+  state.selection = null;
+  D.selection = null;
+}
 
+function showSelectBar(desc) {
+  const bar = dom.selectBar;
+  if (!bar) return;
+  window.clearTimeout(state.barTimer);
+  setSelectBarInfo(bar, desc);
+  bar.hidden = false;
+  bar.dataset.state = 'shown';
+  bar.dataset.paragraph = desc.paragraphId;
+  bar.dataset.source = desc.from;
+  bar.dataset.selection = desc.normalized;
+
+  const bounds = selectionRect(currentBrowserSelection());
+  if (bounds) {
+    const pos = toolbarPosition(bounds, { width: bar.offsetWidth, height: bar.offsetHeight }, {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    });
+    bar.style.left = `${pos.left}px`;
+    bar.style.top = `${pos.top}px`;
+    const arrow = bar.querySelector('[data-role="select-bar-arrow"]');
+    if (arrow) arrow.hidden = pos.arrow === null;
+    if (arrow && pos.arrow !== null) arrow.style.left = `${pos.arrow}px`;
+  }
+  D.toolbarOpen = true;
+  const snapshot = {
+    paragraph: desc.paragraphId,
+    from: desc.from,
+    text: desc.normalized,
+    chars: desc.chars,
+    spans: desc.spans,
+    preview: desc.preview,
+    previewTruncated: desc.previewTruncated,
+  };
+  // 页面内部状态与调试面同源：点浮条按钮时读的就是这一份
+  state.selection = snapshot;
+  D.selection = { ...snapshot };
+}
+
+/**
+ * 选完就更新浮条：选区不可用（空 / 纯空白 / 1 个字符）或不在可讲区里 → 收起。
+ * 用 setTimeout(0) 而不是动画帧：某些无头环境里动画帧不一定按预期推。
+ */
+function refreshSelectionBar() {
+  window.clearTimeout(state.barTimer);
+  state.barTimer = window.setTimeout(() => {
+    state.barTimer = null;
+    // 这一次是「按浮条按钮」触发的 mouseup：按钮那边已经接手，别再弹回来
+    if (state.suppressBarRefresh) {
+      state.suppressBarRefresh = false;
+      return;
+    }
+    if (state.settingsPanelOpen) { hideSelectBar(); return; }
+    const selection = currentBrowserSelection();
+    const desc = describeSelection(selection);
+    if (!desc) { hideSelectBar(); return; }
+    showSelectBar(desc);
+  }, 0);
+}
+
+/**
+ * 调试/自动化入口：像鼠标那样选中指定段落里的一段文字，然后弹出浮条。
+ * 与 `__arDebug` 的其它字段同一性质（可断言的显式状态），不是业务逻辑；
+ * 无头验证用它复现「跨段选区」，免得拖拽的像素位置受字体渲染影响。
+ *
+ * 注意：主栏块与抽屉原文**共用段号**，所以 `from` 必须显式给（默认 rewritten）。
+ */
+function debugSelect({ paragraph, from = 'rewritten', start = 0, length = 8 }) {
+  window.setTimeout(() => {
+    const node = from === 'source'
+      ? document.querySelector(`.src-para[data-paragraph="${paragraph}"]`)
+      : document.querySelector(`#rewritten .block[data-paragraph="${paragraph}"]`);
+    const scope = node ? findSelectionScope(node) : null;
+    if (!node || !scope) return;
+    // 选哪一段文字：主栏取 block-text，抽屉取 src-para-text
+    const host = scope.from === 'source'
+      ? node.querySelector('[data-role="src-para-text"]') || node
+      : node.querySelector('[data-role="block-text"]') || node;
+    const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+    const parts = [];
+    let textNode = walker.nextNode();
+    while (textNode) {
+      parts.push(textNode);
+      textNode = walker.nextNode();
+    }
+    const full = parts.map((n) => n.nodeValue).join('');
+    const begin = Math.max(0, Math.min(start, Math.max(0, full.length - 1)));
+    const end = Math.max(begin + 1, Math.min(begin + length, full.length));
+    const locate = (offset) => {
+      let seen = 0;
+      for (let i = 0; i < parts.length; i += 1) {
+        const len = parts[i].nodeValue.length;
+        if (offset <= seen + len) return { node: parts[i], offset: offset - seen };
+        seen += len;
+      }
+      const last = parts[parts.length - 1];
+      return { node: last, offset: last.nodeValue.length };
+    };
+    const a = locate(begin);
+    const b = locate(end);
+    const range = document.createRange();
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, b.offset);
+    const selection = currentBrowserSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    refreshSelectionBar();
+  }, 0);
+}
+
+/* ------------------------------------------------------------ 交互接线 */
 function wireInteractions() {
   // 段落标记：悬停显示动作与依据；点击弹卡片
   state.blocks.forEach((block, paragraphId) => {
@@ -367,16 +776,74 @@ function wireInteractions() {
     });
   });
 
-  // 点外部关闭卡片；Esc 也关
+  // 点外部关闭卡片；Esc 也关（顺带收浮条与设置面板）
   document.addEventListener('click', (event) => {
+    if (state.settingsPanelOpen
+      && !(dom.settingsPanel && dom.settingsPanel.contains(event.target))
+      && !(dom.settingsToggle && dom.settingsToggle.contains(event.target))) {
+      setSettingsPanelOpen_(false);
+    }
     if (!D.cardOpen || !state.card) return;
     if (state.card.contains(event.target)) return;
     if (event.target.closest && event.target.closest('[data-role="marker"]')) return;
     closeCard('outside');
   });
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') closeCard('escape');
+    if (event.key !== 'Escape') return;
+    closeCard('escape');
+    setSettingsPanelOpen_(false);
+    hideSelectBar();
   });
+
+  // ---- ① 选片讲解：选中文字 → 浮条 → 三个按钮走同一套讲解链路
+  dom.selectBar.addEventListener('click', (event) => event.stopPropagation());
+  // 按在浮条上的那一下不许清掉正文选区（否则点到按钮前选区就没了），
+  // 同时把当时那一份选区快照留在手边——mousedown 早于 click，交接就靠它。
+  dom.selectBar.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    state.pickedSelection = state.selection;
+    // 这一次 mouseup 由浮条引起：别让 refreshSelectionBar 再把浮条弹回来
+    state.suppressBarRefresh = true;
+    window.clearTimeout(state.barTimer);
+    state.barTimer = null;
+  });
+  dom.selectBar.querySelectorAll('[data-role="select-explain"]').forEach((btn) => {
+    btn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const desc = state.pickedSelection || state.selection;
+      state.pickedSelection = null;
+      if (!desc) return;
+      openCard(desc.paragraph, dom.selectBar, {
+        text: desc.text,
+        preview: desc.preview,
+        previewTruncated: desc.previewTruncated,
+        paragraphs: desc.spans,
+        chars: desc.chars,
+        from: desc.from,
+      });
+      hideSelectBar();
+      requestCardExplain(desc.paragraph, btn.dataset.kind, {
+        text: desc.text,
+        from: desc.from,
+        preview: desc.preview,
+        previewTruncated: desc.previewTruncated,
+      });
+    });
+  });
+
+  document.addEventListener('mouseup', refreshSelectionBar);
+  document.addEventListener('keyup', (event) => {
+    if (event.key === 'Shift' || event.key.startsWith('Arrow') || event.key === 'a') {
+      refreshSelectionBar();
+    }
+  });
+  document.addEventListener('mousedown', (event) => {
+    if (dom.selectBar.contains(event.target)) return;
+    hideSelectBar();
+  });
+  window.addEventListener('scroll', () => hideSelectBar(), { passive: true });
+  dom.drawerList.addEventListener('scroll', () => hideSelectBar(), { passive: true });
 
   dom.drawerToggle.addEventListener('click', () => setDrawer(!D.drawerOpen));
 
@@ -421,6 +888,22 @@ function updateCurrentFromScroll() {
 /* ------------------------------------------------------------ 启动 */
 
 async function boot() {
+  // 无头验证入口（同 __arDebug 的其它字段：可断言的显式状态，不是业务逻辑）
+  D.debugSelect = debugSelect;
+
+  // ① 选片讲解浮条：先造出来（无头验证要能查到 [data-role="select-bar"]），选区变化时才显示
+  const bar = buildSelectBar();
+  if (dom.selectBar) dom.selectBar.replaceWith(bar);
+  dom.selectBar = bar;
+  hideSelectBar();
+
+  // ② 显示设置先落地：首访跟随系统深浅色，用户手动选过就以手动为准（存档在 ar.settings.v1）
+  state.settings = bootstrapSettings(document.body);
+  D.settings = { ...state.settings };
+  mountSettings();
+  syncDisplaySettings();       // 量一次对比度：手动组合读不清时设置面板里会出现告警
+  D.profileSignal = state.profileSignal;
+
   state.ctx = readContext(window.location.search);
   D.mode = state.ctx.mode;
   D.sourceId = state.ctx.sourceId;

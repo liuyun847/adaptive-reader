@@ -428,6 +428,20 @@ def test_compression_notice_appears_only_after_reading_to_the_end(page, ar_serve
     stats = dbg(page)["compression"]
     assert stats["shown"] is False
 
+    # 2026-10-08：读完提示从「底部浮窗」改成正文末尾的**流内块**——
+    # 必须在 #rewritten 之外、在「— 改写稿结束 —」之后，且不能是 position: fixed
+    assert page.eval_on_selector(
+        '[data-role="compression"]', "el => getComputedStyle(el).position"
+    ) == "static", "读完提示不许是浮窗"
+    assert page.evaluate(
+        """() => {
+            const notice = document.querySelector('[data-role="compression"]');
+            const end = document.querySelector('[data-role="end-mark"]');
+            return !document.querySelector('#rewritten').contains(notice)
+                && Boolean(end.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING);
+        }""",
+    ), "读完提示要在「— 改写稿结束 —」之后、#rewritten 之外"
+
     page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
     expect(notice).to_be_visible()
 

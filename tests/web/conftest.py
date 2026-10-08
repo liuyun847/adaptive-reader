@@ -9,6 +9,9 @@
   - **就绪靠页面里的显式标志** `globalThis.__arDebug.ready`，不 sleep。
   - 注入开关（`INJECT`）用来造「请求失败 / 响应降级 / 改写稿缺段 / 没有概念清单」这些负向现场，
     全部在服务端做，页面代码里没有测试后门。
+
+例外：`test_reader_features.py` 末尾两条是**真服务联调**，打 `http://127.0.0.1:8765`
+（服务没起就 skip；其中真调模型的那条还要 `AR_E2E_BILLABLE=1` 才跑），不走这里的静态服务。
 """
 
 from __future__ import annotations

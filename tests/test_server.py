@@ -195,7 +195,10 @@ def test_explain_uses_model_when_configured(dirs: SimpleNamespace, sample_md: Pa
     payload = response.json()
     assert payload["degraded"] is False
     assert payload["text"] == "这一段说的是商品的二重性。"
-    assert payload["model"] == "fake-model" and payload["prompt_version"] == "explain-v1"
+    # explain-v2（2026-10-08）：新增「选中片段」作用域，提示词语义变了 → 版本号跟着升（不是放宽断言）
+    assert payload["model"] == "fake-model" and payload["prompt_version"] == "explain-v2"
+    assert payload["scope"] == "paragraph"  # 不带 selection：作用域仍是整段
+    assert "cached" not in payload  # 首次调用不是缓存命中
     # 提示词里必须带上那一段的原文，并写明要求的讲解方式
     sent = fake.calls[0][1]["content"]
     assert "第一段" in sent and "更简单的话" in sent

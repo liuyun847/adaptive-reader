@@ -261,8 +261,13 @@ EXPLAIN: dict = {
         "所以结论正好相反：懒和笨不会让商品更值钱，只会让这个人在同样的时间里创造出更少的价值。"
     ),
     "degraded": False,
+    # 下面两个键（paragraph / kind）是**夹具专用**的信息性字段：后端 /api/explain 不返回它们，
+    # 前端据此在夹具模式下提示「这份样例对应哪一段、哪种 kind」。响应里其它键严格照后端形状：
+    # scope 每次响应都给；cached / selection_truncated 只在为真时出现（这份样例两者都不为真）；
+    # selection_from 是**请求**字段，不属于响应（2026-10-08 复核修）。
     "paragraph": "p022",
     "kind": "simpler",
+    "scope": "selection",
 }
 
 

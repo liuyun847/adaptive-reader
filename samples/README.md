@@ -65,9 +65,14 @@ samples/
 ## explain.json
 
 契约规定它是 `POST /api/explain` 的**响应体**（不是多段的字典），所以整个夹具只有一份讲解，
-对应 `p022`（「越懒越有价值」那个误解）。响应体里多带了一个信息性字段 `"paragraph": "p022"`；
-前端在夹具模式下若发现请求的段与它不一致，会在卡片里显示一行「夹具样例对应 p022」的说明，
-不假装这就是那段自己的讲解。
+对应 `p022`（「越懒越有价值」那个误解）。响应体里多带了两个**夹具专用**的信息性字段
+`"paragraph": "p022"` 与 `"kind": "simpler"`；前端在夹具模式下若发现请求的段与它不一致，
+会在卡片里显示一行「夹具样例对应 p022」的说明，不假装这就是那段自己的讲解。
+**后端不返回这两个键**——真实响应里只有 `text` / `degraded` / `scope`（+ 成功时的
+`model` / `prompt_version`、降级时的 `reason`，以及**为真才出现**的 `cached` /
+`selection_truncated`）。`selection_from` 是**请求**字段，不属于响应，这里不再出现
+（2026-10-08 复核修：之前误把请求字段写进了响应夹具，还显式写了后端从不返回的
+`cached: false` / `selection_truncated: false`）。`tests/web/test_fixture_schema.py` 会守住这两条。
 
 ## 用法
 

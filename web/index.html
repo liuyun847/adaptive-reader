@@ -7,16 +7,67 @@
   <title>自适应阅读器 · 改写稿</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="css/reader.css">
+  <script>
+    /*
+     * 显示设置的「渲染前应用」：在 body 解析之前、样式表之后同步执行，
+     * 按 localStorage["ar.settings.v1"] 给 <html> 打好属性 —— 刷新时不会先闪一下纸白底。
+     * 口径与 js/settings.js 的 normalizeSettings/initialSettings 一致（那边 bootstrap() 会再接管一次）。
+     */
+    (function () {
+      var KEY = 'ar.settings.v1';
+      var BG = ['paper', 'warm', 'dark'];
+      var INK = ['ink', 'light'];
+      var SIZE = ['15', '16', '17', '19'];
+      var e = document.documentElement;
+      var settings = null;
+      try {
+        var raw = localStorage.getItem(KEY);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && BG.indexOf(parsed.bg) !== -1) {
+            settings = parsed;
+          }
+        }
+      } catch (err) { settings = null; }
+      var stored = settings !== null;
+      if (!settings) {
+        var dark = false;
+        try { dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches); } catch (err) { dark = false; }
+        settings = { bg: dark ? 'dark' : 'paper', ink: dark ? 'light' : 'ink', size: '16', inkExplicit: false };
+        try { localStorage.setItem(KEY, JSON.stringify(settings)); } catch (err) { /* 存储被禁用：本次会话照常生效 */ }
+      }
+      var bg = BG.indexOf(settings.bg) !== -1 ? settings.bg : 'paper';
+      var inkExplicit = settings.inkExplicit === true && INK.indexOf(settings.ink) !== -1;
+      e.dataset.bg = bg;
+      e.dataset.ink = inkExplicit ? settings.ink : (bg === 'dark' ? 'light' : 'ink');
+      e.dataset.size = SIZE.indexOf(String(settings.size)) !== -1 ? String(settings.size) : '16';
+      e.dataset.inkExplicit = String(inkExplicit);
+      e.dataset.settingsStored = String(stored);
+    })();
+  </script>
 </head>
 
-<body data-drawer="collapsed" data-mode="unknown" data-current-paragraph="">
+<body data-drawer="collapsed" data-mode="unknown" data-current-paragraph=""
+  data-bg="paper" data-ink="ink" data-size="16" data-ink-explicit="false">
 
   <header class="topbar">
     <div class="topbar__brand">自适应阅读器</div>
-    <div class="topbar__meta">
-      <span class="badge" data-role="source-id">材料：—</span>
-      <span class="badge badge--mode" data-role="mode-badge">加载中</span>
-      <span class="badge" data-role="progress">第 — / — 段</span>
+    <div class="topbar__side">
+      <div class="topbar__meta">
+        <span class="badge" data-role="source-id">材料：—</span>
+        <span class="badge badge--mode" data-role="mode-badge">加载中</span>
+        <span class="badge" data-role="progress">第 — / — 段</span>
+      </div>
+      <!-- 阅读显示设置：背景 / 文字颜色 / 正文字号，落 localStorage，刷新后仍在 -->
+      <div class="topbar__settings">
+        <button class="settings-toggle" type="button" data-role="settings-toggle"
+          aria-expanded="false" aria-controls="settings-panel" title="阅读显示设置（背景 / 文字颜色 / 字号）">
+          <span class="settings-toggle__mark" aria-hidden="true">Aa</span>
+          <span class="settings-toggle__text">显示</span>
+        </button>
+        <div class="settings" id="settings-panel" data-role="settings-panel" data-state="closed" hidden
+          role="dialog" aria-label="阅读显示设置"></div>
+      </div>
     </div>
   </header>
 
@@ -26,8 +77,14 @@
   <div class="reader" data-role="reader">
     <main class="main" data-role="main">
       <article class="article" id="rewritten" data-role="rewritten" aria-label="改写稿主栏"></article>
-      <div class="end-sentinel" data-role="end-sentinel" aria-hidden="true"></div>
       <p class="article__end" data-role="end-mark">— 改写稿结束 —</p>
+      <!-- 读完才显示的哨兵：IntersectionObserver 一直盯着它，读完逻辑不改 -->
+      <div class="end-sentinel" data-role="end-sentinel" aria-hidden="true"></div>
+      <!--
+        读完提示：正文末尾的**流内块**（不是浮窗），初始 hidden，读完才显示。
+        必须在 #rewritten 之外（有测试在数 #rewritten .block），文字里保留「比原文短」与百分比。
+      -->
+      <div class="compression" data-role="compression" data-state="hidden" hidden></div>
     </main>
   </div>
 
@@ -48,9 +105,12 @@
     </div>
   </aside>
 
-  <!-- 讲解卡片层与压缩提示 -->
+  <!-- 选片讲解浮条：选中文字后出现在选区旁（内容由 main.js 装配） -->
+  <div class="select-bar" data-role="select-bar" data-state="hidden" hidden
+    role="toolbar" aria-label="选中片段的讲解动作"></div>
+
+  <!-- 讲解卡片层 -->
   <div class="card-layer" data-role="card-layer"></div>
-  <div class="compression" data-role="compression" data-state="hidden" hidden></div>
 
   <script>
     // 就绪标志：无头验证只依赖它，不靠 sleep。
@@ -76,6 +136,17 @@
       lastCard: null,
       compression: null,
       degradations: [],
+      // 选片讲解 / 显示设置 / 会话缓存：无头验证断言这三块的状态
+      toolbarOpen: false,
+      selection: null,
+      settings: null,
+      settingsPanelOpen: false,
+      inkContrast: null,          // 正文栏实测对比度（手动组合读不清时 < 4.5）
+      inkContrastLow: false,
+      explainCache: null,
+      explainDeduped: 0,
+      pendingExplain: null,
+      profileSignal: '',          // 会话缓存键里的画像指纹（夹具模式为空串）
     };
     globalThis.addEventListener('error', function (e) {
       globalThis.__arDebug.errors.push({

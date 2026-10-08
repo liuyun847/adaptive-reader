@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .ingest import normalize_text
+
 __all__ = [
     "CONCEPTS_PROMPT_VERSION",
     "EXPLAIN_PROMPT_VERSION",
@@ -16,6 +18,10 @@ __all__ = [
     "build_concepts_messages",
     "EXPLAIN_SYSTEM_PROMPT",
     "EXPLAIN_KINDS",
+    "SELECTION_MAX_CHARS",
+    "SELECTION_SOURCES",
+    "DEFAULT_SELECTION_FROM",
+    "SELECTION_SOURCE_LABELS",
     "build_explain_messages",
     "REWRITE_SYSTEM_PROMPT",
     "REWRITE_ACTIONS",
@@ -23,7 +29,9 @@ __all__ = [
 ]
 
 CONCEPTS_PROMPT_VERSION = "concepts-v1"
-EXPLAIN_PROMPT_VERSION = "explain-v1"
+# explain-v2（2026-10-08）：新增「选中片段」作用域（selection / selection_from），
+# 讲解对象可能只是段里的一小段文字而不是整段——提示词语义变了，版本号必须跟着升。
+EXPLAIN_PROMPT_VERSION = "explain-v2"
 REWRITE_PROMPT_VERSION = "rewrite-v1"
 
 CONCEPTS_SYSTEM_PROMPT = (
@@ -54,6 +62,8 @@ CONCEPTS_USER_TEMPLATE = """材料（每段前面是段落 id，引用时必须�
 EXPLAIN_SYSTEM_PROMPT = (
     "你是中文阅读助手。读者正在读一段材料，点开了这一段。请针对这一段给出他需要的那一种讲解。"
     "只讲这一段涉及的内容，不要复述整篇文章，不要输出 Markdown 标题，直接给正文（可含短列表）。"
+    "如果读者另外给出了「选中的片段」，讲解的重点就是那段选中的文字：整段原文只作上下文，"
+    "用来判断指代与前后文，不要把它整段复述或逐句讲解。"
 )
 
 EXPLAIN_KINDS: dict[str, str] = {
@@ -61,6 +71,14 @@ EXPLAIN_KINDS: dict[str, str] = {
     "simpler": "用更简单的话重讲这一段：短句、少术语（术语必须出现时顺手解释）、保留原来的事实与数字。",
     "detail": "把这一段讲深一点：补充它省略的推理步骤、它的前提与它可能引出的疑问。",
 }
+
+# ---------------------------------------------------------------- 选中片段 --
+# 读者在主栏改写稿或抽屉原文里划一段文字 → 只讲这段文字，段落仍然提供上下文。
+# 上限 600 字符：超出就截断并**如实上报** ``selection_truncated``（降级必须可见，不许静默截断）。
+SELECTION_MAX_CHARS = 600
+SELECTION_SOURCES = ("rewritten", "source")
+DEFAULT_SELECTION_FROM = "rewritten"
+SELECTION_SOURCE_LABELS: dict[str, str] = {"rewritten": "改写稿", "source": "原文"}
 
 
 def build_concepts_messages(meta: dict[str, Any]) -> list[dict[str, str]]:
@@ -158,9 +176,30 @@ def build_explain_messages(
     paragraph_text: str,
     neighbors: list[tuple[str, str]] | None = None,
     profile_hint: str | None = None,
+    selection: str | None = None,
+    selection_from: str = DEFAULT_SELECTION_FROM,
 ) -> list[dict[str, str]]:
-    """讲解卡片的提示词：本段原文 + 少量上下文 + 读者画像提示。"""
-    parts = [f"段落 id：{paragraph_id}", "", "这一段原文：", paragraph_text]
+    """讲解卡片的提示词：本段原文 + 少量上下文 + 读者画像提示。
+
+    ``selection`` 非空时换成「选片」版式：**讲解重点 = 选中的片段**，整段原文降级为上下文
+    （邻段、画像、kind 指令照旧都在，段落 id 仍然用于定位）。
+    传进来的 ``selection`` 由调用方（``ar.explain.prepare_selection``）保证已规范化并截断到
+    ``SELECTION_MAX_CHARS``；这里再按锚点口径（``ingest.normalize_text``，幂等）规范化一次只是兜底。
+    """
+    parts = [f"段落 id：{paragraph_id}"]
+    focus = normalize_text(selection or "")
+    if focus:
+        label = SELECTION_SOURCE_LABELS.get(selection_from, SELECTION_SOURCE_LABELS[DEFAULT_SELECTION_FROM])
+        parts += [
+            "",
+            f"读者选中的片段（来自{label}；**讲解重点就是这段文字**，其余内容只作上下文）：",
+            focus,
+            "",
+            "该片段所在的整段原文（只作上下文：用它判断指代与前后文，不要整段复述）：",
+            paragraph_text,
+        ]
+    else:
+        parts += ["", "这一段原文：", paragraph_text]
     if neighbors:
         parts += ["", "前后段（仅供定位，不要讲解它们）："]
         parts += [f"[{nid}] {text[:200]}" for nid, text in neighbors]

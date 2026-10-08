@@ -99,7 +99,7 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 | `profiles/<reader>/profile.yaml` | 读者画像（`concepts` / `preferences` / `overrides`） |
 
 `concepts.json` / `decisions.json` / `changes.json` 的 `meta` 是回归基线（DESIGN §7）：
-`model`、`prompt_version`（`concepts-v1` / `rewrite-v1` / `explain-v1`）、`generated_at`，
+`model`、`prompt_version`（`concepts-v1` / `rewrite-v1` / `explain-v2`）、`generated_at`，
 另有 `usage`（token）与 `degraded`（本次所有可见降级）。
 **任何元数据里都不含密钥值。**
 
@@ -116,7 +116,8 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 | `rewrite.py` | 逐段决策（`planDecisions`）、改写（`rewrite`）、事实锚复核（`check_fidelity`）（M3） |
 | `fidelity.py` | 事实锚抽取与逐段比对（数字 / 引号引文 / 书名号《》+ 段缺失）（M3） |
 | `profile.py` | 画像 YAML 读写、自评写入（`overrides` 追记） |
-| `explain.py` | `POST /api/explain` 的业务实现（降级可见） |
+| `explain.py` | `POST /api/explain` 的业务实现（整段 / 选中片段两种作用域，降级可见） |
+| `cache.py` | 讲解的进程内 LRU 缓存（成功结果、容量 128、按画像指纹失效） |
 | `server.py` | HTTP 层、静态托管（`web/` + `samples/`） |
 | `cli.py` | 5 个子命令、退出码、打印（`ingest` 的切分与校验入口都在这条链上） |
 
@@ -216,7 +217,7 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 | `GET /api/doc/<source_id>` | `{ meta, rewritten, changes, concepts, degraded }`；产物缺失的字段是 `null`，原因写在 `degraded` 里 |
 | `GET /api/profile` | `{ profile, degraded }`（默认读者 `local-default`） |
 | `POST /api/profile/rating` | `{ concept_id, state, note? }`（`state ∈ known/partial/unknown`）→ 写回 `profile.yaml`，返回 `{ ok, profile }` |
-| `POST /api/explain` | `{ source_id, paragraph, kind }`（`kind ∈ explain/simpler/detail`）→ `{ text, degraded? }` |
+| `POST /api/explain` | `{ source_id, paragraph, kind, selection?, selection_from? }`（`kind ∈ explain/simpler/detail`；`selection_from ∈ rewritten/source`，默认 `rewritten`）→ `{ text, degraded, scope, cached?, selection_truncated?, model?, prompt_version? }` |
 | `GET /api/health` | `{ ok, model_configured, model, api_key_origin, web_static }` |
 
 另外挂了一个**只读**的 `/samples/`（指向项目根的 `samples/`）：契约没要求，
@@ -229,6 +230,33 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
   `degraded: true` + 一段说明文本（前端直接渲染进卡片），不返回空白、不假装成功。
 - `degraded` 是数组（`/api/doc`、`/api/profile`）或布尔（`/api/explain`），是**追加**字段：
   §4 冻结的键一个不少，前端可以只读自己认识的部分。
+- **选中片段讲解**（`/api/explain` 的追加能力，旧请求体不受影响）：请求体多两个**可选**字段
+  `selection`（读者划中的那段文字）与 `selection_from`（`rewritten` 默认 / `source`，只用于在提示词里
+  标注片段来自改写稿还是原文；给别的值回 400）。
+  - `selection` 缺失或规范化后为空 → **行为与旧版逐字一致**（讲整段，`scope: "paragraph"`）；
+  - 规范化口径与锚点一致（去首尾空白 + 合并连续空白 + 全角空格 U+3000 转半角），规范化后上限 **600 字符**：
+    超出截断到 600 并在响应里追加 `selection_truncated: true`（**降级必须可见，不许静默截断**）；
+  - `selection` 非空 → 讲解对象是**那段片段**，`paragraph` 继续提供上下文（邻段、画像），
+    响应里 `scope` 记为 `"selection"`；`selection` **不引入任何新锚点或哈希**。
+- `scope` / `cached` / `selection_truncated` 是**追加**字段：`scope`（`paragraph` / `selection`）与
+  `selection_truncated` 描述**这次请求要什么**，每次响应都给（前端靠 `scope` 确认「确实按片段讲的」）；
+  `cached`（缓存命中）与 `model` / `prompt_version` 描述**这次产出了什么**，只在成功响应
+  （`degraded: false`）里出现。降级响应因此是 `{ text, degraded, reason, scope }`——旧键一个不少、
+  `reason` 枚举不变。
+- **`scope` 的口径例外**：`p404 + selection` 这类「段号不存在」的请求在**段号校验**阶段就走掉了
+  （`src/ar/explain.py` 里 `find_paragraph` 早于 `prepare_selection`），所以响应里的 `scope`
+  是默认的 `"paragraph"`、也不会出现 `selection_truncated`——**不是请求里带 `selection` 就一定回
+  `"selection"`**。前端遇到这种响应会在状态行写明「后端按整段讲的（scope: paragraph）」。
+- **讲解缓存**（进程内，`src/ar/cache.py`）：容量 128 的 LRU，键 =
+  `(source_id, paragraph, kind, 规范化并截断后的 selection, 画像指纹)`，其中画像指纹 =
+  `profiles/<reader>/profile.yaml` 的 `(路径, 字节数, mtime_ns)`。命中时响应追加 `cached: true`
+  且**不再调模型**；**只缓存成功结果**（失败与降级不进缓存）。不落盘、不加 HTTP 缓存头、服务重启即空；
+  画像一变（自评写回 / 手改 `overrides`）指纹就变，旧条目自然失效。`selection_from` 不进键（键按契约冻结），
+  所以同一段文字按「改写稿 / 原文」各请求一次时，第二次直接命中。
+  **缓存只在画像变化时失效，没有「重新生成」入口**：同一段（或同一片段 + 同一 kind）在一个进程里
+  拿到的永远是同一份文字，**刷新页面也一样**（缓存不在浏览器里）；要换一份，只能改画像（换指纹）
+  或重启服务。前端另有一层**会话内**缓存（`web/js/cache.js`，刷新即空、不落盘），它的键也带画像指纹
+  （每次请求前读一次 `GET /api/profile` 的内容摘要）。
 - `/api/profile/rating` 同时写两处：`concepts[<cid>].state`（当前状态）与
   `overrides[]`（手动结论，按 DESIGN 优先级最高、行为信号不得覆盖）。
   自评给的把握度是 `confidence = 0.7`：自评只反映「以为知道」，所以不给满分。
@@ -276,13 +304,34 @@ uv run ar serve   --port 8765      # 再打开 http://127.0.0.1:8765/?source=cap
 ## 7. 测试
 
 ```powershell
-uv run pytest tests -q            # 后端用例（139 passed）：默认不收集 tests/web（前端用例单独跑）
-python -m pytest tests/web -q     # 前端无头用例（26 passed，W2 提供，需要本机 Edge）
+uv run pytest tests -q            # 后端用例（167 passed）：默认不收集 tests/web（前端用例单独跑）
+python -m pytest tests/web -q     # 前端无头用例（45 passed + 1 skipped，W2 提供，需要本机 Edge）
 ```
+
+`tests/web` 里有两条**真服务联调**用例打 `http://127.0.0.1:8765`（跑之前先 `uv run ar serve --port 8765`；
+**服务没起就 skip，不是失败**）：
+
+- `test_real_service_page_and_explain_payload_without_calling_the_model`：**默认就跑**。它用
+  `page.route` 把 `POST /api/explain` 拦下来核对请求体（`source_id` / `paragraph` / `kind` /
+  `selection` / `selection_from`），一个模型调用都不发；
+- `test_real_service_explain_end_to_end_is_billable`：**默认 skip**，要显式开开关才跑：
+
+  ```powershell
+  $env:AR_E2E_BILLABLE = "1"; python -m pytest tests/web -q -k billable
+  ```
+
+  代价是**一次真实的 `/api/explain` 模型调用**（历史记录里 12–46 秒、单次计费；后端进程内缓存
+  命中时不再调模型，卡片状态行会标「后端缓存命中」，那一次不计费）。开关之外的任何运行都不会
+  产生模型费用。
 
 后端用例全部使用**假模型**（注入固定响应或 `monkeypatch`），默认不发真实网络请求；
 负向对照照 `学习/_整理/selfcheck.py` 的做法：只在临时副本上注入缺陷 + 断言「注入确实生效」
 + 只看退出码。事实锚的负向对照在 `tests/test_rewrite.py`，覆盖数字 / 引文 / 书名 / 段缺失 / 多余段。
+
+`tests/test_explain_scope.py` 守**选中片段作用域与讲解缓存**（2026-10-08）：
+`selection` 缺失时与旧版逐字一致、非空时片段确实进了发往模型的 messages、规范化口径与锚点一致、
+超 600 字符截断并上报 `selection_truncated`、缓存命中不再调模型、画像文件一变即失效、
+失败与降级不进缓存、LRU 容量/淘汰/线程安全、三条既有降级路径的响应键集不变。
 
 `tests/test_no_silent_degradation.py` 专门守**静默降级与检查器空跑**（2026-10-05 对抗性复核
 实测出的五处缺陷，每处至少一条负向对照）：删 / 清空 `changes.json` 后 `check` 必须非零退出、
@@ -321,3 +370,11 @@ python -m pytest tests/web -q     # 前端无头用例（26 passed，W2 提供�
     不靠「展开段数」——**0 个展开段不等于失败，有 model_errors 才是**。
 11. **部分失败需要人工重跑**：退出码 6 的那次产物已经落盘、能读（失败批次退回原文），
     但没有「只重跑失败批次」的增量入口，只能整篇 `ar rewrite` 重跑（局部重跑属后续里程碑）。
+12. **讲解缓存只在进程内**：容量 128，**服务重启即空**，按**画像指纹**（`profile.yaml` 的路径 + 字节数 +
+    mtime_ns）失效；多进程 / 多实例部署时各持一份（本骨架就是单进程 uvicorn）。它算的是「别为同一件事
+    重复付费」的账，不是持久化结果——**别把缓存当产物**：`data/` 里没有它，重启后第一次讲解照旧重新调模型。
+    它**没有「重新生成」入口**：同一段重复点、刷新页面都拿到同一份文字（要换只能改画像或重启，见 §4）。
+13. **显示设置允许手动组合出读不清的正文**（背景 3 档 × 文字 2 档，6 种组合里有 3 种是低对比：
+    纸白 / 暖黄 + 浅灰、深色 + 深墨）。这类组合不拦（用户有权这么选），但设置面板里会显示实测对比度
+    告警（阈值 AA 4.5:1）；「浮在内容之上的面」（顶栏 / 徽标 / 抽屉 / 卡片 / 浮条 / 设置面板）按**背景档**
+    配对底色与文字，与文字颜色档无关，所以面板里的正文类文字在任何组合下都 ≥ 4.5:1。

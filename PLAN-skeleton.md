@@ -87,9 +87,19 @@ GET  /                      → web/index.html
 GET  /api/doc/<source_id>   → { meta, rewritten, changes, concepts }
 GET  /api/profile           → { profile }（默认读者 local-default）
 POST /api/profile/rating    → { concept_id, state, note? } 更新画像（写回 YAML）
-POST /api/explain           → { source_id, paragraph, kind: "explain"|"simpler"|"detail" } → { text, degraded? }
+POST /api/explain           → { source_id, paragraph, kind: "explain"|"simpler"|"detail",
+                                selection?: string, selection_from?: "rewritten"|"source" }
+                              → { text, degraded, scope, cached?, selection_truncated?,
+                                  model?, prompt_version? }
 GET  /api/health            → { ok, model_configured }
 ```
+
+**追加字段不破坏旧键**（2026-10-08 补；README §4 的 `degraded` 是先例）：`/api/explain` 的
+`selection` / `selection_from` 都是**可选**请求字段，缺省时行为与旧版逐字一致；响应里的
+`scope`（`paragraph` / `selection`）与 `selection_truncated`（选中片段超 600 字符被截断）描述
+「这次请求要什么」，每次响应都给；`cached`（进程内缓存命中）与 `model` / `prompt_version` 描述
+「这次产出了什么」，只在成功响应里出现。旧键 `text` / `degraded` / 失败时的 `reason` 一个不改、
+`reason` 枚举不变。提示词版本随之升到 `explain-v2`（讲解对象可能是段里的一小段文字，语义变了）。
 
 前端**双模式**（写进契约，便于前后端并行开发）：
 

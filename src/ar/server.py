@@ -7,7 +7,8 @@
 ``GET  /api/doc/<source_id>`` ``{ meta, rewritten, changes, concepts, degraded }``
 ``GET  /api/profile``         ``{ profile, degraded }``（默认读者 local-default）
 ``POST /api/profile/rating``  ``{ concept_id, state, note? }`` → 更新画像并写回 YAML
-``POST /api/explain``         ``{ source_id, paragraph, kind }`` → ``{ text, degraded? }``
+``POST /api/explain``         ``{ source_id, paragraph, kind, selection?, selection_from? }``
+                              → ``{ text, degraded, scope?, cached?, selection_truncated? }``
 ``GET  /api/health``          ``{ ok, model_configured, ... }``
 ===========================  ==================================================
 
@@ -19,6 +20,10 @@
   只回一个写明原因的 404，不崩、不影响 ``/api/*``。
 - ``/api/explain`` 在模型未配置或调用失败时返回 200 + ``degraded: true`` + 说明文本，
   让前端能直接把这段说明渲染进卡片。
+- ``/api/explain`` 的追加字段分两类：**请求侧**的 ``scope``（``paragraph`` / ``selection``）与
+  ``selection_truncated``（选中片段超 600 字符被截断）每次响应都给；**产出侧**的 ``cached``
+  （进程内缓存命中，见 ``ar.cache``）只在成功响应里出现。旧键（``text`` / ``degraded`` /
+  ``model`` / ``prompt_version`` / 失败时的 ``reason``）逐字不变、枚举不变。
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from .cache import ExplainCache
 from .config import Config
 from .errors import InputError
 from .explain import aexplain
@@ -47,6 +53,7 @@ from .paths import (
     doc_dir,
 )
 from .profile import apply_rating, load_profile, save_profile
+from .prompts import DEFAULT_SELECTION_FROM, SELECTION_SOURCES
 
 __all__ = ["build_app"]
 
@@ -103,13 +110,19 @@ def build_app(
     config: Config | None = None,
     reader: str = DEFAULT_READER,
     client_factory: Callable[[], Any] | None = None,
+    explain_cache: ExplainCache | None = None,
 ) -> Starlette:
-    """组装应用。测试可注入 ``client_factory``（返回带 ``achat`` 的假客户端）。"""
+    """组装应用。测试可注入 ``client_factory``（返回带 ``achat`` 的假客户端）。
+
+    ``explain_cache`` 默认**每个应用一个**（容量 128 的进程内 LRU）：一次进程内所有请求共用，
+    进程重启即空；测试可以注入自己的实例来观察/清空缓存。
+    """
     config = config or Config()
     data_root = Path(data_dir)
     profiles_root = Path(profiles_dir)
     web_root = Path(web_dir)
     samples_root = Path(samples_dir) if samples_dir is not None else None
+    cache = explain_cache if explain_cache is not None else ExplainCache()
 
     def make_client() -> Any:
         if client_factory is not None:
@@ -202,28 +215,49 @@ def build_app(
         source_id = body.get("source_id")
         paragraph = body.get("paragraph")
         kind = body.get("kind") or "explain"
+        selection = body.get("selection")
+        selection_from = body.get("selection_from")
         if not isinstance(source_id, str) or not source_id.strip():
             raise InputError("source_id 必须是非空字符串")
         if not isinstance(paragraph, str) or not paragraph.strip():
             raise InputError("paragraph 必须是非空字符串（段 id，如 p012）")
         if not isinstance(kind, str):
             raise InputError("kind 必须是字符串（explain / simpler / detail）")
+        if selection is not None and not isinstance(selection, str):
+            raise InputError("selection 必须是字符串（页面上选中的那段文字，可省略）")
+        if selection_from is None or (isinstance(selection_from, str) and not selection_from.strip()):
+            selection_from = DEFAULT_SELECTION_FROM  # 可选字段：缺省 / 空串都按默认值处理
+        elif not isinstance(selection_from, str) or selection_from.strip() not in SELECTION_SOURCES:
+            raise InputError(
+                f"selection_from 只能是 {' / '.join(SELECTION_SOURCES)}（默认 {DEFAULT_SELECTION_FROM}）"
+            )
 
         outcome = await aexplain(
             source_id.strip(),
             paragraph.strip(),
             kind.strip(),
+            selection=selection,
+            selection_from=selection_from.strip(),
             data_dir=data_root,
             profiles_dir=profiles_root,
             reader=reader,
             client=make_client(),
+            cache=cache,
         )
         payload: dict[str, Any] = {"text": outcome.text, "degraded": outcome.degraded}
         if outcome.reason:
             payload["reason"] = outcome.reason
+        # scope 与 selection_truncated 描述的是**这次请求要什么**（整段还是片段、片段有没有被截断），
+        # 与模型是否可用无关，所以每次响应都给（前端拿 scope 确认「确实按片段讲的」）。
+        payload["scope"] = outcome.scope
+        if outcome.selection_truncated:
+            payload["selection_truncated"] = True
         if not outcome.degraded:
+            # 下面几个描述的是**这次产出了什么**：失败/降级时一律不出现
             payload["model"] = outcome.model
             payload["prompt_version"] = outcome.prompt_version
+            if outcome.cached:
+                payload["cached"] = True
         return _json(payload)
 
     async def api_not_found(request: Request) -> Response:
