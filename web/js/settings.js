@@ -2,8 +2,11 @@
  * 阅读显示设置：背景 3 档 × 文字 2 档 × 正文字号 4 档。
  *
  * 三条纪律：
- *   1. **渲染前应用**：`index.html` 里有一段同步脚本按同一套口径先给 `<body>` 打上属性，
- *      本模块的 `bootstrap()` 再接管。所以刷新时不会先闪一下纸白底。
+ *   1. **渲染前应用**：主题选择器认的是 `body[data-bg|data-ink|data-size]`（见 `css/reader.css` 末尾），
+ *      所以两页都在渲染前把设置打到 `<body>` 上——启动页（`index.html`）是 `<head>` 的同步脚本算好结论、
+ *      `<body>` 开头那句打到 body 上；阅读器页（`reader.html`）是 `<head>` 的脚本先打 `<html>`，
+ *      再由 `main.js` boot 里的 `bootstrapSettings(document.body)` 补 body（两个页面的 boot 都调它）。
+ *      这样刷新时不会先闪一下纸白底，本模块的 `bootstrap()` 随后接管（幂等）。
  *   2. **驱动方式是 body 上的属性**（`data-bg` / `data-ink` / `data-size`），
  *      颜色全部由 reader.css 的变量承担——页面里不再散落硬编码颜色。
  *   3. **首访跟随系统深浅色**（`prefers-color-scheme`）；用户手动选过之后以手动为准

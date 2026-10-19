@@ -8,8 +8,27 @@
   规范化    = 去首尾空白 + 合并连续空白 + 全角空格(U+3000)转半角
 
 改写稿是本文件里手写的 25 段（与底本的 25 个空行切分段一一对应），
-`changes` 里的 action / why / confidence / facts 也全部手写，**不是骨架 rewrite 的真实输出**。
+`changes` 里的 action / why / confidence / facts 也全部手写，**不是 rewrite 的真实输出**。
 脚本只做三件事：切段打锚点、把手写内容装配成 doc.json、把长度比对照表打到 stdout 供人工复核。
+
+2026-10-13 重定（PLAN-actions-feedback.md §4 / §12 的 W 路，compress / illustrate 已实现）：
+
+  - **去掉全部 `deferred`**：它表示「枚举内、本期未实现」；compress 与 illustrate 本批都实现了，
+    再挂着就是假的。`deferred` 机制本身仍在 schema 里（留给将来的枚举成员），只是本夹具不再有。
+  - **配图段**：`p013`（mermaid 流程图）与 `p024`（SVG 柱状图）是 **illustrate 段**。
+    图**不进 `rewritten.md`**（§1 第 2 条）：这两段的正文与底本**逐字节相同**，
+    图由前端在该段容器内就地插入。所以脚本里这两段用 `SAME_AS_SOURCE` 占位（装配时填原文，
+    免得手抄一遍抄错）。
+  - **配图失败样本**：`p016` 是「想配图但模型给的图过不了校验」的那一段——`action` 记 `keep`、
+    带 `figure_error`、正文照旧（`§4.1` 的失败口径），前端据此走「退回文字说明」那条路。
+
+2026-10-14 补两处（夹具必须跟着产物字段一起长，见 `samples/README.md`）：
+
+  - **事实锚申报样本**（`§14.1`）：`p004` 带 `fact_declarations`，`fidelity` 里配 `fact_anchor_policy` /
+    `waived`——脚本会先算一遍「申报的项在底本里有、在改写稿里真的没有」再落盘；
+  - **兜底补齐样本**：`p005` 带 `profile_refs_filled: true`（`why.note` 末尾追加那一句出处）。
+    此前这个字段只在 `doc.json` 里手改过、**生成器不产出**——一重生成夹具样本就消失，
+    `tests/web/test_fixture_schema.py` 那条断言当场变红。现在由 `PROFILE_REFS_FILLED` 装配。
 """
 
 from __future__ import annotations
@@ -49,7 +68,10 @@ def split_paragraphs(raw: str) -> list[str]:
 # ---------------------------------------------------------------- 手写改写稿
 # 25 段，与底本空行切分的 25 段一一对应（段序一致）。形态参照 C-现代重述.md：
 # 自由重述、带导读与结论表、不逐句对应原文；引证体例从简。
-REWRITTEN: list[str] = [
+# `SAME_AS_SOURCE`：这一段与底本**逐字节相同**（illustrate 段的正文要求，见文件头）。
+SAME_AS_SOURCE = None
+
+REWRITTEN: list = [
     # p001 标题
     "# 第一篇 商品和货币 / 第一章 商品 / 1．商品的两个因素：使用价值与价值",
     # p002 体例说明（替换底本的「底本/说明」引首）
@@ -89,10 +111,8 @@ REWRITTEN: list[str] = [
     "既然一夸特小麦可以按各种极不相同的比例同 x 量鞋油、y 量绸缎、z 量金交换，小麦就有许多种交换价值。"
     "既然这些都是它的交换价值，它们必定能互相代替、同样大。由此得出两点：第一，同一种商品的各种有效交换价值"
     "表示一个等同的东西；第二，交换价值只能是某种与它相区别的内容的表现方式，即「表现形式」。",
-    # p013 等式与第三种东西
-    "拿小麦和铁来说：不管交换比例怎样，总可以用一个等式表示——一定量的小麦等于若干量的铁。"
-    "这个等式说明，在两种不同的物里面有一种等量的共同东西；二者都等于第三种东西，"
-    "后者本身既不是小麦也不是铁。因此，每一个只要是交换价值，就必定能化为这第三种东西。",
+    # p013 等式与第三种东西（illustrate：正文＝原文，图就地插）
+    SAME_AS_SOURCE,
     # p014 几何学类比
     "用一个简单的几何学例子就能说明这一点：为了确定和比较各种直线形的面积，把它们分成三角形，"
     "再用三角形化成与外形完全不同的表现——底乘高的一半。各种商品的交换价值同样要化成一种共同东西，"
@@ -101,9 +121,8 @@ REWRITTEN: list[str] = [
     # p015 共同东西不是天然属性
     "这种共同东西不可能是商品的几何的、物理的、化学的或其他天然属性——因为商品交换关系的特点"
     "恰恰在于抽去使用价值：只要比例适当，一种使用价值就和任何另一种使用价值完全相等。",
-    # p016 巴尔本 + 质的差别/量的差别
-    "老巴尔本说得更干脆：只要交换价值相等，一种商品就同另一种商品一样，彼此没有任何差别。"
-    "作为使用价值，商品首先有质的差别；作为交换价值，商品只有量的差别，因而不包含任何一个使用价值的原子。",
+    # p016 巴尔本 + 质的差别/量的差别（illustrate 失败样本：正文＝原文，只有 figure_error）
+    SAME_AS_SOURCE,
     # p017 只剩劳动产品
     "那么把商品体的使用价值撇开，商品体就只剩下一个属性：它是劳动产品。",
     # p018 抽掉具体劳动
@@ -132,15 +151,8 @@ REWRITTEN: list[str] = [
     "制造某种使用价值所需要的劳动时间。",
     # p023 底本伪重复段（原文与上一段逐字重复）
     "（底本此处有一整段与上一段逐字重复的录入冗余，约 429 字，此处不再重复。）",
-    # p024 价值量与劳动生产力成反比
-    "如果生产商品所需要的劳动时间不变，价值量也就不变；但劳动时间随劳动生产力的每一次变动而变动。"
-    "劳动生产力由多种情况决定：工人的平均熟练程度，科学的发展水平及其工艺应用程度，生产过程的社会结合，"
-    "生产资料的规模和效能，以及自然条件。例证：同一劳动量在丰收年表现为 8 蒲式耳小麦，歉收年只有 4 蒲式耳；"
-    "用在富矿比用在贫矿能提供更多的金属；金刚石稀少，发现它平均要花很多劳动时间，所以一小块就代表很多劳动。"
-    "厄什韦葛说过，到 1823 年，巴西金刚石矿八十年的总产量价格，还赶不上巴西甘蔗种植园或咖啡种植园"
-    "一年半的平均产量价格。假如能用不多的劳动把煤变成金刚石，金刚石的价值就会低于砖。总之，"
-    "劳动生产力越高，生产一种物品所需要的劳动时间就越少，凝结在其中的劳动量就越小，价值就越小；反之则越大。"
-    "**商品的价值量与体现在商品中的劳动的量成正比，与这一劳动的生产力成反比。**",
+    # p024 价值量与劳动生产力成反比（illustrate：正文＝原文，图就地插）
+    SAME_AS_SOURCE,
     # p025 三条例外 + 结论表
     "三条例外：① 一个物可以是使用价值而不是价值——凡不是由于劳动而对人有用的情况都是，例如空气、处女地、"
     "天然草地、野生林。② 一个物可以有用、又是人类劳动产品，却不是商品——用自己的产品满足自己需要的人，"
@@ -157,8 +169,8 @@ REWRITTEN: list[str] = [
 ]
 
 # ------------------------------------------------- 手写变更记录（index 与上表对齐）
-# action ∈ expand|compress|keep|illustrate；compress/illustrate 在骨架里未实现，
-# 一律带 deferred: true（PLAN-skeleton §2.4）。
+# action ∈ expand|compress|keep|illustrate（四个都实现了，2026-10-13 起不再有 `deferred`）。
+# 配图段（p013 / p024）与配图失败段（p016）的图字段由 FIGURES / FIGURE_ERRORS 在 build() 里挂上。
 CHANGES: list[dict] = [
     dict(action="keep", confidence=0.96, profile=[], note="标题层级段，只把连接词改为顿号，不增删信息"),
     dict(action="compress", confidence=0.93, profile=[],
@@ -180,14 +192,16 @@ CHANGES: list[dict] = [
     dict(action="keep", confidence=0.91, profile=[], note="巴特勒诗句原样保留；补一句转折承接「进一步考察」"),
     dict(action="compress", confidence=0.75, profile=["c03:partial"],
          note="鞋油/绸缎/金的三个符号保留，对象征推理的复述压紧"),
-    dict(action="compress", confidence=0.73, profile=["c03:partial", "c04:unknown"],
-         note="等式推理的复述压紧，「第三种东西」保留"),
+    dict(action="illustrate", confidence=0.73, profile=["c03:partial", "c04:unknown"],
+         note="等式链是三步递进（一夸特小麦 → 三种商品 → 第三种东西），纯文字看不出先后："
+              "配一张流程图，正文照旧不动"),
     dict(action="expand", confidence=0.84, profile=["c04:unknown"],
          note="几何类比是理解「化为共同东西」的关键，补一句它与后文「抽掉使用价值」的对应关系"),
     dict(action="compress", confidence=0.70, profile=["c04:unknown"],
          note="老巴尔本引文已在 p016 出现，此处只留结论句"),
-    dict(action="compress", confidence=0.76, profile=["c04:partial"],
-         note="引文与注释合并；「质的差别/量的差别」原样保留"),
+    dict(action="keep", confidence=0.76, profile=["c04:partial"], figure_error=True,
+         note="「质的差别 / 量的差别」适合并列对照，本想配一张对比图；"
+              "模型给的图源码过不了校验，按配图失败处理，正文保持原文"),
     dict(action="keep", confidence=0.92, profile=[], note="短承接段，原样保留"),
     dict(action="compress", confidence=0.78, profile=["c05:unknown"],
          note="「抽掉使用价值」的连锁推理压紧，术语「抽象人类劳动」保留并加粗"),
@@ -200,10 +214,10 @@ CHANGES: list[dict] = [
     dict(action="compress", confidence=0.79, profile=["c07:unknown"],
          note="「越懒越有价值」的误解保留（它是本段的论证枢纽），社会必要劳动时间的定义原样保留，"
               "革除重复的铺陈"),
-    dict(action="compress", confidence=0.82, profile=["c08:unknown"], deferred_note=True,
-         note="底本此处与上一段逐字重复（429 字伪重复），按压缩处理并说明；骨架未实现 compress，按保持处理"),
-    dict(action="compress", confidence=0.68, profile=["c08:unknown"],
-         note="五位决定因素与四组例证保留，杰科布那句疑问删去"),
+    dict(action="compress", confidence=0.82, profile=["c08:unknown"],
+         note="底本此处与上一段逐字重复（429 字伪重复），按压缩处理并说明"),
+    dict(action="illustrate", confidence=0.68, profile=["c08:unknown"],
+         note="同一劳动量在丰收年 / 歉收年表现为 8 比 4 蒲式耳：一张柱状图比文字省力，正文照旧不动"),
     dict(action="keep", confidence=0.75, profile=["c09:unknown"],
          note="三条例外压紧为一段；末尾按 C 版形态补了一张结论表，两相抵消，长度与原文基本持平"),
 ]
@@ -247,9 +261,101 @@ CONCEPTS: list[dict] = [
 
 ILLUSTRATION_CANDIDATES: list[dict] = [
     dict(paragraph="p013", kind="流程", why="小麦 → 鞋油/绸缎/金 的等式链是三步递进，纯文字看不出先后"),
+    dict(paragraph="p016", kind="对比", why="使用价值有质的差别、交换价值只有量的差别，两组并列对照更省力"),
     dict(paragraph="p024", kind="数量", why="同一劳动量在丰年/歉年、富矿/贫矿的产出对比，表格比文字省力"),
     dict(paragraph="p025", kind="对比", why="使用价值/价值、商品/非商品的四组边界情形适合并列对照"),
 ]
+
+# ------------------------------------------------------- 手写图定义（PLAN-actions-feedback §4.1）
+# 形状与后端产出的 `changes[i].figure` 一致：{kind, source, caption?}；kind ∈ {mermaid, svg}。
+#
+# 两条口径（§4.1）：
+#   - **图不进 rewritten.md**：配图段的正文与底本逐字节相同，图由前端在该段容器内就地插入；
+#   - **图只在成功时出现**：失败的那一段（见 FIGURE_ERRORS）没有 `figure`，只有 `figure_error`，
+#     且 `action` 记 `keep`（正文照旧）。
+#
+# mermaid 源码首词必须是图类型关键字（这里 `flowchart`）、不含 ``` 围栏、行数 ≤ 40、字符数 ≤ 2000；
+# SVG 必须能被 XML 解析、自包含（不许 `<script>` / `on*` / `foreignObject` / 外部 href）。
+# 这些不是「随便写写」——`tests/web/test_fixture_schema.py` 会照 §4.2 的校验口径逐条守住，
+# 而前端的 `js/figures.js` 也会再校验一遍（白名单双保险）。
+FIGURES: dict[str, dict] = {
+    "p013": {
+        "kind": "mermaid",
+        "caption": "小麦的多种交换价值 → 同一个共同东西",
+        "source": (
+            "flowchart TD\n"
+            '  A["一夸特小麦"] --> B["x 量鞋油"]\n'
+            "  A --> C[\"y 量绸缎\"]\n"
+            '  A --> D["z 量金"]\n'
+            '  B --> E["这些交换价值互相代替、同样大"]\n'
+            "  C --> E\n"
+            "  D --> E\n"
+            '  E --> F["等同的共同东西（第三种东西）"]'
+        ),
+    },
+    "p024": {
+        "kind": "svg",
+        "caption": "同一劳动量：丰收年 8 蒲式耳 / 歉收年 4 蒲式耳",
+        # 自包含 + 只用 currentColor（跟着主题走，不写死颜色）：整份 SVG 就是一根基线 + 两根柱子
+        "source": (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 150" width="320" height="150"'
+            ' role="img" aria-label="同一劳动量在丰收年与歉收年的产出对比">'
+            '<g fill="none" stroke="currentColor" stroke-width="1.5">'
+            '<line x1="40" y1="120" x2="300" y2="120"/>'
+            '<rect x="60" y="40" width="52" height="80"/>'
+            '<rect x="170" y="80" width="52" height="40"/>'
+            "</g>"
+            '<g fill="currentColor" font-size="12" text-anchor="middle">'
+            '<text x="86" y="32">8 蒲式耳</text>'
+            '<text x="196" y="72">4 蒲式耳</text>'
+            '<text x="86" y="138">丰收年</text>'
+            '<text x="196" y="138">歉收年</text>'
+            '<text x="160" y="16">同一劳动量</text>'
+            "</g>"
+            "</svg>"
+        ),
+    },
+}
+
+# 配图失败的样本（§4.1）：一句话原因进 `figure_error`，`action` 记 keep、正文照旧。
+FIGURE_ERRORS: dict[str, str] = {
+    "p016": "mermaid 源码首词不是图类型关键字（模型返回的是说明文字，不是图），按配图失败处理",
+}
+
+# ------------------------------------------- 事实锚申报样本（§14.1，2026-10-14）
+# 「事实锚可申报 + 可见」的两条可见面都在夹具里留样本：
+#   - `changes[i].fact_declarations`：模型逐条申报本段**没有原样保留**哪几项事实锚；
+#   - `changes.fidelity` 的 `fact_anchor_policy` / `waived`：`ar check` 按读者口径把**已申报**的缺失放行。
+# 这里声明的是 p004：底本那一行的编号「1．」在本稿里改成导读标题后不再出现（编号已在 p001 出现），
+# 所以申报放弃数字 1。**这条申报是算出来的、不是手抄的**：脚本会在下面断言
+# 「申报的每一项在底本里真的有、在手写改写稿里真的没有」——申报与实测不符就不许落盘。
+# 口径取 `allow_declared_drops`（要结论）：这个样本正是「申报后放行」那一档；
+# `keep_all`（严口径）下同一份申报会被判违规（`ar check` 退出码 4），后端用例守着那条。
+FACT_ANCHOR_POLICY = "allow_declared_drops"
+DECLARATIONS: dict[str, dict] = {
+    "p004": {
+        "numbers": ["1"],
+        "note": "底本的编号「1．」在本稿里换成导读标题（编号已在 p001 出现），本段不再重复这个数字",
+    },
+}
+
+# ------------------------------------- 兜底补齐样本（2026-10-14 复核修复的可见面）
+# 后端在「这一段涉及的概念**读者有自评**、模型却没给 `why.profile` 引用（漏键 / 给错形状 /
+# 该给引用却给空数组）」时，照**读者自己的自评**兜底补齐那一段的 `why.profile`，并在
+# `why.note` 末尾追加一句出处，同时在本段产物上留一个**结构化标记**
+# `changes[i].profile_refs_filled: true`（**为真才出现**，照 `figure` / `deferred` 的先例；
+# **不进** `decisions.json`）——页面那枚「骨架兜底补齐（模型没给引用）」徽标只认这个字段。
+#
+# 下面那句出处**逐字照抄** `ar.rewrite.run_rewrite` 里追加的那一句：抄错一个标点，
+# 夹具就不再是「与后端真实形态一致」的样本（`tests/web/test_fixture_schema.py` 守的是形状，
+# 文案由这条常量与后端同源——本文件是**手造样例**，做不到自动对账，所以只留一处常量）。
+PROFILE_REFS_FILLED_NOTE = "（依据画像由骨架兜底补齐：模型没有给 why.profile 引用，这里照读者自评逐条列出）"
+#: 哪几段是「兜底补齐」样本。**只能是一段**：`test_fixture_schema.py` 明确断言只有一条，
+#: 前端那枚徽标的渲染分支留一个样本就够（多几条只会让「哪条是样本」变模糊）。
+PROFILE_REFS_FILLED = ("p005",)
+
+#: 事实锚的抽取口径（与 `ar.fidelity` 同一条正则；这里只用来核对上面的申报，别拿它做别的）
+NUMBER_PATTERN = re.compile(r"\d+(?:,\d+)*(?:\.\d+)?")
 
 EXPLAIN: dict = {
     "text": (
@@ -279,6 +385,17 @@ def build() -> dict:
     assert len(CHANGES) == len(paragraphs)
     assert len(FACTS) == len(paragraphs)
 
+    # `SAME_AS_SOURCE` 占位：装配时填**原文**，保证「配图段正文与底本逐字节相同」这条口径
+    # 是算出来的、不是手抄的（抄一遍就可能抄错，而 §4.1 要求逐字节相等）。
+    rewritten = []
+    for i, text in enumerate(REWRITTEN, start=1):
+        pid = f"p{i:03d}"
+        if text is SAME_AS_SOURCE:
+            assert pid in FIGURES or pid in FIGURE_ERRORS, f"{pid} 用了 SAME_AS_SOURCE 却没有图定义"
+            rewritten.append(paragraphs[i - 1])
+        else:
+            rewritten.append(text)
+
     meta_paragraphs = []
     for i, text in enumerate(paragraphs, start=1):
         meta_paragraphs.append({
@@ -291,19 +408,24 @@ def build() -> dict:
     # 长度对照（人工复核用）。标注规则：长度比 = 改写字符数 / 底本字符数；
     # 比例带 [0.85, 1.15] → keep，>1.15 → expand，<0.85 → compress；
     # 底本不足 60 字符的结构性短块（标题/分隔线/诗行引子）不受比例带约束，按意图标注。
+    # 配图段（illustrate，含配图失败退回 keep 的那一段）不受比例带约束：图不进 md，正文＝原文。
     report = []
     mismatches = 0
-    for i, (src, rw) in enumerate(zip(paragraphs, REWRITTEN), start=1):
+    for i, (src, rw) in enumerate(zip(paragraphs, rewritten), start=1):
         ratio = len(rw) / len(src) if src else 0.0
         action = CHANGES[i - 1]["action"]
-        if len(src) >= 60:
+        pid = f"p{i:03d}"
+        if action == "illustrate" or pid in FIGURE_ERRORS:
+            expect = None
+            assert rw == src, f"{pid} 是配图段，正文必须与底本逐字节相同"
+        elif len(src) >= 60:
             expect = "expand" if ratio > 1.15 else ("compress" if ratio < 0.85 else "keep")
         else:
             expect = action
-        flag = "" if expect == action else f"  <<< 与比例带不符（应为 {expect}）"
+        flag = "" if expect in (None, action) else f"  <<< 与比例带不符（应为 {expect}）"
         if flag:
             mismatches += 1
-        report.append((f"p{i:03d}", len(src), len(rw), ratio, action, flag))
+        report.append((pid, len(src), len(rw), ratio, action, flag))
 
     changes = []
     for i, spec in enumerate(CHANGES, start=1):
@@ -318,9 +440,49 @@ def build() -> dict:
                 "quotes": FACTS[i - 1].get("quotes", []),
             },
         }
-        if spec["action"] in ("compress", "illustrate"):
-            entry["deferred"] = True
+        # 图：只在成功时出现（照 `deferred` 的「为真才出现」先例）；失败时只给 `figure_error`
+        if pid in FIGURES:
+            assert spec["action"] == "illustrate", f"{pid} 有 figure，action 必须是 illustrate"
+            entry["figure"] = dict(FIGURES[pid])
+        if pid in FIGURE_ERRORS:
+            assert spec["action"] == "keep", f"{pid} 是配图失败样本，action 必须是 keep（正文照旧）"
+            assert pid not in FIGURES, f"{pid} 不能既成功又失败"
+            entry["figure_error"] = FIGURE_ERRORS[pid]
+        # `deferred`（枚举内、本期未实现）本批之后不再有：compress / illustrate 都实现了
+        assert "deferred" not in entry, f"{pid} 还挂着 deferred"
+        if pid in DECLARATIONS:
+            entry["fact_declarations"] = dict(DECLARATIONS[pid])
+        if pid in PROFILE_REFS_FILLED:
+            # 兜底补齐样本（2026-10-14）：标记「为真才出现」+ `why.note` 追加那一句出处。
+            # **补齐出来的引用不可能是空数组**——后端只在「读者对这一段涉及的概念有自评」时才补齐
+            # （没有可引用的自评时压根不走那条分支），所以这里先断言夹具自己没写错。
+            assert entry["why"]["profile"], f"{pid} 标了兜底补齐，却没有自评引用（后端不会这样产出）"
+            assert PROFILE_REFS_FILLED_NOTE not in entry["why"]["note"], f"{pid} 的 note 里已经有那句出处"
+            entry["why"]["note"] = entry["why"]["note"] + PROFILE_REFS_FILLED_NOTE
+            entry["profile_refs_filled"] = True
         changes.append(entry)
+
+    # 申报样本要**对得上实测**：申报的每一项都得「底本有、改写稿没有」，否则这份夹具在骗自己
+    for pid, declaration in DECLARATIONS.items():
+        index = int(pid[1:]) - 1
+        source_numbers = NUMBER_PATTERN.findall(paragraphs[index])
+        rewritten_numbers = NUMBER_PATTERN.findall(rewritten[index])
+        for number in declaration.get("numbers", []):
+            assert number in source_numbers, f"{pid} 申报的数字 {number!r} 在底本里没有"
+            assert number not in rewritten_numbers, f"{pid} 申报放弃了 {number!r}，但改写稿里还有它"
+
+    fidelity = {"checked": True, "mismatches": [], "fact_anchor_policy": FACT_ANCHOR_POLICY,
+                "waived": [
+                    {
+                        "paragraph": pid,
+                        "kind": "numbers",
+                        "missing": list(declaration.get("numbers") or []),
+                        "detail": f"数字：申报 {len(declaration.get('numbers') or [])} 项，"
+                                  f"按 {FACT_ANCHOR_POLICY} 放行",
+                    }
+                    for pid, declaration in DECLARATIONS.items()
+                    if declaration.get("numbers")
+                ]}
 
     doc = {
         "meta": {
@@ -333,10 +495,11 @@ def build() -> dict:
             },
             "paragraphs": meta_paragraphs,
         },
-        "rewritten": "\n\n".join(REWRITTEN),
+        "rewritten": "\n\n".join(rewritten),
         "changes": {
             "changes": changes,
-            "fidelity": {"checked": True, "mismatches": []},
+            # 形状样本（不是真的跑过校验）：口径 + 放行条目都留了样本，见上面 DECLARATIONS 的说明
+            "fidelity": fidelity,
         },
         "concepts": {
             "concepts": CONCEPTS,
@@ -346,22 +509,31 @@ def build() -> dict:
 
     out_dir = SAMPLES / SOURCE_ID
     out_dir.mkdir(parents=True, exist_ok=True)
+    # ``newline=""`` 是必须的：``Path.write_text`` 默认做通用换行转换，
+    # Windows 下会把 JSON 里的 ``\n`` 写成 CRLF ⇒ 夹具在工作区变成纯 CRLF，
+    # 与仓库里存的 LF 版本只差行尾（``git status`` 显示 M、``git diff`` 却是空的假改动）。
+    # 夹具是**跨平台的字面量**，行尾必须与仓库里那份逐字节一致。
     (out_dir / "doc.json").write_text(
-        json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="")
     (out_dir / "explain.json").write_text(
-        json.dumps(EXPLAIN, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        json.dumps(EXPLAIN, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="")
 
     src_total = sum(len(p) for p in paragraphs)
-    rw_total = sum(len(p) for p in REWRITTEN)
+    rw_total = sum(len(p) for p in rewritten)
     counts: dict[str, int] = {}
     for spec in CHANGES:
         counts[spec["action"]] = counts.get(spec["action"], 0) + 1
 
     print(f"source_id={SOURCE_ID}")
-    print(f"paragraphs={len(paragraphs)} 手写改写段={len(REWRITTEN)}")
+    print(f"paragraphs={len(paragraphs)} 手写改写段={len(rewritten)}")
     print(f"底本总字符={src_total} 改写总字符={rw_total} "
           f"差={src_total - rw_total} ({(1 - rw_total / src_total) * 100:.1f}% 短)")
     print(f"action 分布={counts}")
+    print(f"图={ {pid: spec['kind'] for pid, spec in FIGURES.items()} } "
+          f"配图失败={sorted(FIGURE_ERRORS)}")
+    print(f"事实锚申报样本={sorted(DECLARATIONS)} 口径={FACT_ANCHOR_POLICY} "
+          f"放行条目={[row['paragraph'] for row in fidelity['waived']]}")
+    print(f"兜底补齐样本={sorted(PROFILE_REFS_FILLED)}（同段带 profile_refs_filled 标记）")
     print(f"doc.json={out_dir / 'doc.json'}")
     print(f"比例带不符条数={mismatches}")
     print("--- 逐段长度对照 (id, src, rw, rw/src, action) ---")

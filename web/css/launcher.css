@@ -1,0 +1,245 @@
+/* 启动页样式（零构建，单文件）：只服务 web/index.html，阅读器页（web/reader.html）**不加载**它。
+ *
+ * 颜色**全部**走 css/reader.css 里那套变量（--bg / --panel* / --warn-* / --focus…），
+ * 本文件里不留一个硬编码颜色（**字号是例外**：逐条写死的 rem，没走 --reading-size——那是正文栏专用档）。
+ * 启动页因此和阅读器共用同一份 `body[data-bg] / data-ink / data-size` 主题
+ * （`<head>` 打 `<html>`、`<body>` 一开头打 body，两处用同一份结论，见 web/index.html 里那两段脚本）。
+ *
+ * 版面：顶栏（沿用 .topbar，fixed）之下是一列卡片，四块按 ①状态 ②做测试 ③历史记录 ④输入文件 排列。
+ * 状态面板 / 问卷卡片是浮层（.status-layer / .survey-layer，position: fixed），由各自模块插入宿主，
+ * 这里只管宿主自己不占位、不留框。 */
+
+body[data-page="launcher"] .launcher {
+  padding-top: calc(var(--topbar-h) + 1.2rem);
+  padding-bottom: 4rem;
+}
+
+.launcher {
+  max-width: 52rem;
+  margin: 0 auto;
+  padding-left: 1.25rem;
+  padding-right: 1.25rem;
+}
+
+/* 导语：颜色必须取**跟 data-bg 成对**的那一档（--panel-muted 与 --bg 同跟 data-bg 走）。
+   不能借 --muted / --ink-soft：那两个跟 data-ink 走，「纸白背景 + 浅灰文字」这类手动组合下
+   只剩 1.84:1（暖黄 + 浅灰 1.64:1、深色 + 深墨 2.94:1），而启动页**没有设置面板**可以放对比度告警
+   ——2026-10-15 复核实测六种组合后改成 --panel-muted（纸白 5.41:1 / 暖黄 4.82:1 / 深色 8.64:1）。*/
+.launcher__lead {
+  margin: 0 0 1rem;
+  color: var(--panel-muted);
+  font-size: .88rem;
+  line-height: 1.7;
+}
+
+/* ---------------------------------------------------------------- 卡片 */
+.lcard {
+  background: var(--panel);
+  color: var(--panel-ink);
+  border: 1px solid var(--panel-line);
+  border-radius: 10px;
+  padding: .9rem 1rem 1rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 2px 10px var(--shadow-drawer);
+}
+
+.lcard__title {
+  margin: 0 0 .4rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.lcard__lead {
+  margin: 0 0 .7rem;
+  color: var(--panel-muted);
+  font-size: .8rem;
+  line-height: 1.65;
+}
+
+.lcard__lead code {
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  background: var(--panel-sunken);
+  border-radius: 3px;
+  padding: 0 .25rem;
+}
+
+.lcard__row {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  flex-wrap: wrap;
+}
+
+/* 行内状态行：data-state 是可断言的状态，颜色也按它分档（与横幅同一套语义色） */
+.lcard__state {
+  font-size: .82rem;
+  line-height: 1.6;
+  color: var(--panel-ink-soft);
+}
+
+.lcard__state[data-state="loading"] { color: var(--panel-muted); }
+.lcard__state[data-state="empty"] { color: var(--panel-muted); }
+.lcard__state[data-state="ready"] { color: var(--ok-ink); }
+.lcard__state[data-state="ok"],
+.lcard__state[data-state="answered"] { color: var(--ok-ink); }
+.lcard__state[data-state="skipped"],
+.lcard__state[data-state="unanswered"],
+.lcard__state[data-state="invalid"] { color: var(--warn-ink); }
+.lcard__state[data-state="uploading"] { color: var(--info-ink); }
+.lcard__state[data-state="error"],
+.lcard__state[data-state="degraded"] { color: var(--err-ink); }
+
+.lcard__stamp { color: var(--panel-muted); font-size: .78rem; }
+
+.lcard__note { color: var(--panel-muted); font-size: .78rem; line-height: 1.6; flex: 1 1 12rem; }
+
+.lcard__btn {
+  flex: 0 0 auto;
+  border: 1px solid var(--panel-line);
+  background: var(--panel);
+  color: var(--panel-ink);
+  border-radius: 6px;
+  padding: .28rem .7rem;
+  font: inherit;
+  font-size: .8rem;
+  line-height: 1.5;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.lcard__btn:hover { border-color: var(--accent); color: var(--accent); }
+.lcard__btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.lcard__btn:disabled { opacity: .5; cursor: not-allowed; }
+.lcard__btn:disabled:hover { border-color: var(--panel-line); color: var(--panel-ink); }
+
+/* ---------------------------------------------------------------- 说明列表 / 结果块 */
+.lnotes {
+  list-style: none;
+  margin: .55rem 0 0;
+  padding: 0;
+}
+
+.lnotes[hidden] { display: none; }
+
+.lnotes__item {
+  border-left: 3px solid var(--warn-line);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: 0 5px 5px 0;
+  padding: .3rem .5rem;
+  font-size: .78rem;
+  line-height: 1.6;
+  margin-bottom: .3rem;
+}
+
+.lcard__result {
+  margin-top: .7rem;
+  border: 1px solid var(--ok-line);
+  background: var(--ok-bg);
+  color: var(--ok-ink);
+  border-radius: 8px;
+  padding: .55rem .7rem;
+  font-size: .82rem;
+  line-height: 1.7;
+}
+
+.lcard__result[hidden] { display: none; }
+
+.lresult__row { display: flex; gap: .5rem; flex-wrap: wrap; }
+.lresult__label { flex: 0 0 5.5rem; color: var(--panel-muted); }
+.lresult__value { flex: 1 1 auto; word-break: break-all; }
+.lresult__note { margin-top: .4rem; }
+.lcard__result .lcard__btn { margin-top: .55rem; }
+
+/* ---------------------------------------------------------------- ③ 历史记录 */
+.hist {
+  list-style: none;
+  margin: .6rem 0 0;
+  padding: 0;
+}
+
+.hist__item + .hist__item { margin-top: .5rem; }
+
+.hist__link {
+  display: block;
+  border: 1px solid var(--panel-line);
+  background: var(--panel-sunken);
+  color: inherit;
+  border-radius: 8px;
+  padding: .5rem .65rem;
+  text-decoration: none;
+}
+
+.hist__link:hover { border-color: var(--accent); }
+.hist__link:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.hist__head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+
+.hist__id {
+  font-weight: 600;
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  word-break: break-all;
+}
+
+.hist__badge {
+  flex: 0 0 auto;
+  border: 1px solid var(--panel-line);
+  border-radius: 999px;
+  padding: 0 .5rem;
+  font-size: .72rem;
+  color: var(--panel-muted);
+}
+
+.hist__badge[data-state="ok"] { border-color: var(--ok-line); background: var(--ok-bg); color: var(--ok-ink); }
+.hist__badge[data-state="error"] { border-color: var(--err-line); background: var(--err-bg); color: var(--err-ink); }
+.hist__badge[data-state="warn"] { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); }
+
+.hist__meta {
+  display: flex;
+  gap: .8rem;
+  flex-wrap: wrap;
+  margin-top: .2rem;
+  color: var(--panel-muted);
+  font-size: .78rem;
+}
+
+.hist__note {
+  margin-top: .2rem;
+  color: var(--panel-ink-soft);
+  font-size: .76rem;
+  line-height: 1.6;
+}
+
+/* ---------------------------------------------------------------- ④ 输入文件 */
+.lfield {
+  flex: 0 1 auto;
+  min-width: 0;
+  border: 1px solid var(--panel-line);
+  background: var(--panel);
+  color: var(--panel-ink);
+  border-radius: 6px;
+  padding: .28rem .45rem;
+  font: inherit;
+  font-size: .8rem;
+}
+
+.lfield:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.lcheck {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  border: 1px solid var(--panel-line);
+  border-radius: 6px;
+  padding: .28rem .5rem;
+  font-size: .78rem;
+  cursor: pointer;
+}
+
+.lcheck input { margin: 0; accent-color: var(--accent); }
+.lcheck:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* 宿主自己不占位：面板 / 问卷是浮层（.status-layer / .survey-layer 都是 position: fixed），
+   没有浮层时宿主是空的、不产生任何高度；关掉之后宿主里一个节点都不剩（有测试守着）。
+   横幅出现时把内容整体让下去一点，免得固定定位的横幅盖住第一块卡片的标题。 */
+.banners:not(:empty) + .launcher { padding-top: calc(var(--topbar-h) + 6rem); }

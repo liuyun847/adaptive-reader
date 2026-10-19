@@ -68,7 +68,8 @@ def dbg(page) -> dict:
 
 
 def open_reader(page, ar_server, fixture_id: str = FIXTURE_ID, extra: str = "") -> str:
-    url = f"{ar_server}/web/index.html?fixture={fixture_id}{cache_bust(extra)}"
+    """阅读器页：2026-10-15 拆页后是 `web/reader.html`（`web/index.html` 变成了启动页）。"""
+    url = f"{ar_server}/web/reader.html?fixture={fixture_id}{cache_bust(extra)}"
     page.goto(url)
     wait_ready(page)
     return url
@@ -215,11 +216,23 @@ def test_selection_mode_hides_fact_anchors_but_keeps_concepts(page, ar_server, c
 
 def test_selection_spanning_two_paragraphs_says_which_one_is_used(page, ar_server):
     open_reader(page, ar_server)
-    # 先滚好位置：顶栏是 fixed（3rem=48px），滚到 p006 之后它会被盖住，所以再补一段偏移
-    page.evaluate(
+    # 顶栏与横幅栏（`[data-role=banners]`）都是 position: fixed 的浮层，横幅栏会盖住视口顶部一段。
+    # 拖拽起点必须落在它们下面，否则鼠标先落到横幅上——选中的会是提示文字，不是正文。
+    # （夹具里 `p016` 的配图降级横幅就是要挂着的，所以这里按实测的浮层底边定位，不写死像素。）
+    overlay_bottom = page.evaluate(
         """() => {
-            window.scrollTo(0, window.scrollY + document.querySelector('#blk-p006').getBoundingClientRect().top - 80);
+            const topbar = document.querySelector('.topbar');
+            const banners = document.querySelector('[data-role=banners]');
+            const topbarBottom = topbar ? topbar.getBoundingClientRect().bottom : 0;
+            const bannersBottom = banners ? banners.getBoundingClientRect().bottom : 0;
+            return Math.max(topbarBottom, bannersBottom);
         }""",
+    )
+    page.evaluate(
+        """(arg) => {
+            window.scrollTo(0, window.scrollY + document.querySelector(`#blk-${arg[0]}`).getBoundingClientRect().top - arg[1]);
+        }""",
+        ["p006", overlay_bottom + 24],
     )
     page.wait_for_timeout(150)
 

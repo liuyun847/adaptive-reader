@@ -17,6 +17,9 @@
   而"模型说了不存在的段"这件事仍然看得见。
 
 ``uv run ar analyze <id> --check-only`` 只校验已有 ``concepts.json``，不调模型。
+
+``format_illustration_block`` 把 ``illustration_candidates`` 拼成 ``rewrite`` 提示词里的
+「配图候选」固定块（``rewrite-v4`` 起，逐字稳定；没有候选时是**空串**，模板那一格一个字符都不出现）。
 """
 
 from __future__ import annotations
@@ -28,19 +31,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import tools
 from .errors import InputError, ModelUnavailable, ValidationFailed
 from .ingest import paragraph_id
 from .jsonio import now_iso, read_json, read_json_if_exists, write_json, write_text
 from .paths import doc_dir
-from .prompts import CONCEPTS_PROMPT_VERSION, build_concepts_messages
+from .prompts import CONCEPTS_PROMPT_VERSION
 
 __all__ = [
     "CONCEPT_ID_RE",
     "ILLUSTRATION_KINDS",
+    "ILLUSTRATION_BLOCK_LIMIT",
     "REQUIRED_CONCEPT_FIELDS",
     "REQUIRED_ILLUSTRATION_FIELDS",
     "AnalyzeResult",
     "extract_json_object",
+    "format_illustration_block",
     "normalize_inventory",
     "validate_inventory",
     "run_analyze",
@@ -49,6 +55,8 @@ __all__ = [
 
 CONCEPT_ID_RE = re.compile(r"^c\d{2,}$")
 ILLUSTRATION_KINDS = ("流程", "结构", "对比", "数量")
+#: 进 ``rewrite`` 提示词的配图候选条数上限（与 ``_format_concept_block`` 的 40 条同一取舍：省 token）
+ILLUSTRATION_BLOCK_LIMIT = 20
 REQUIRED_CONCEPT_FIELDS = (
     "id",
     "name",
@@ -126,6 +134,39 @@ def _as_str_list(value: Any) -> list[str]:
 
 def _paragraph_ids(meta: dict[str, Any]) -> list[str]:
     return [str(p.get("id")) for p in (meta.get("paragraphs") or []) if p.get("id")]
+
+
+def format_illustration_block(inventory: dict[str, Any] | None, *, limit: int = ILLUSTRATION_BLOCK_LIMIT) -> str:
+    """把 ``concepts.json`` 的 ``illustration_candidates`` 拼成提示词里的「配图候选」素描。
+
+    产物是 **``rewrite`` 提示词固定块的一部分**（``rewrite-v4`` 起；放在概念清单之后、材料正文之前），
+    所以必须**逐字稳定**：同一个 ``inventory`` 两次调用得到同一个字符串，
+    里面没有任何时间戳 / 随机量 / 字典序不定的遍历（只按候选数组的原有顺序逐条拼）。
+
+    - 没有清单 / 没有候选 → **空串**：模板那一格随之零字符插入（空块 == 缺省 == 有块与无块的差异
+      只在那一格；**不是**「``rewrite-v4`` 与 ``rewrite-v3`` 逐字相同」——那一批同时还改了规则与示例）；
+    - 每条候选一行：``p034 流程：三步递进，纯文字看不出先后``；超过 ``limit`` 条时补一行「…另有 N 条未列出」。
+    """
+    if not isinstance(inventory, dict):
+        return ""
+    raw = inventory.get("illustration_candidates")
+    if not isinstance(raw, list):
+        return ""
+    usable = [
+        item
+        for item in raw
+        if isinstance(item, dict) and str(item.get("paragraph") or "").strip()
+    ]
+    shown = usable[: max(0, int(limit))]
+    lines: list[str] = []
+    for item in shown:
+        paragraph = str(item.get("paragraph") or "").strip()
+        kind = str(item.get("kind") or "").strip()
+        why = str(item.get("why") or "").strip()
+        lines.append(f"{paragraph} {kind}：{why}" if kind else f"{paragraph}：{why}")
+    if len(usable) > len(shown):
+        lines.append(f"…另有 {len(usable) - len(shown)} 条未列出")
+    return "\n".join(lines)
 
 
 def normalize_inventory(raw: dict[str, Any], meta: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -417,26 +458,49 @@ def run_analyze(
     *,
     at: str | None = None,
 ) -> AnalyzeResult:
-    """调模型抽概念清单，校验通过后写 ``data/<id>/concepts.json``。
+    """调模型抽概念清单（经工具层 ``analyze_concepts``），校验通过后写 ``data/<id>/concepts.json``。
 
-    ``client`` 需要提供 ``chat(messages, *, max_tokens=None) -> ModelReply``
-    （真实实现是 ``ModelClient``，测试用固定响应的假客户端）。
+    ``client`` 一路转交给工具层与统一调用层（真实实现是 ``ar.model`` 里的模型客户端，
+    测试用固定响应的假客户端）；拼提示词 / 调模型 / 解析都在工具层完成，
+    **校验（``validate_inventory``）与落盘仍在这里**。
+
+    产物 ``meta`` 追加两项记账：``attempts``（逐次尝试）与 ``retry_account``（整次调用的汇总）。
     """
     meta = _load_meta(data_dir, source_id)
-    messages = build_concepts_messages(meta)
-    reply = client.chat(messages, max_tokens=None)
-    raw_text = getattr(reply, "text", "") or ""
+    # 工具入参是**契约形态**的段落表（只要 id 与 text）：source.meta.json 的段还带 index / text_hash，
+    # 直接丢进去会被入参校验按「未知字段」打回；提示词本来也只读这两个字段。
+    paragraphs = [
+        {"id": str(item.get("id")), "text": str(item.get("text") or "")}
+        for item in (meta.get("paragraphs") or [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+    if not paragraphs:
+        # 0 段材料（``ingest`` 不允许空文档，只有手改过的 source.meta.json 会这样）：
+        # 没有段落可抽取，也不值得为它发一次请求——照「校验不过」的语义报出去（退出码 4）
+        raise ValidationFailed(
+            ["source.meta.json 里没有任何段落，无法抽取概念清单（0 段，未调模型）"],
+            headline="概念清单未通过契约校验，未写入 concepts.json",
+        )
+    run = tools.run_tool("analyze_concepts", {"paragraphs": paragraphs}, client=client)
+    raw_text = run.raw_text
 
-    try:
-        data = extract_json_object(raw_text)
-    except InputError as exc:
-        raw_path = doc_dir(data_dir, source_id) / "concepts.raw.txt"
-        write_text(raw_path, raw_text)
+    if not run.ok:
+        # 面向用户的报错带**尝试次数与末次错误码**（重试白花了几次必须看得见）
+        message = run.failure_message()
+        if run.model_replied:
+            # 模型答了、但输出不成结构：把**原始输出**落盘供排查（只进 concepts.raw.txt，不进任何 meta）
+            raw_path = doc_dir(data_dir, source_id) / "concepts.raw.txt"
+            write_text(raw_path, raw_text)
+            raise ModelUnavailable(
+                f"概念清单抽取失败：{message}。模型原始输出已存到 {raw_path} 供排查。"
+                "已降级为「无画像」模式：本材料没有 concepts.json，可继续按原文阅读（不静默假装成功）"
+            )
         raise ModelUnavailable(
-            f"概念清单抽取失败：{exc}。模型原始输出已存到 {raw_path} 供排查。"
+            f"概念清单抽取失败：{message}。"
             "已降级为「无画像」模式：本材料没有 concepts.json，可继续按原文阅读（不静默假装成功）"
-        ) from exc
+        )
 
+    data = run.data if isinstance(run.data, dict) else {}
     inventory, repairs = normalize_inventory(data, meta)
     problems = validate_inventory(inventory, meta)
     if problems:
@@ -446,16 +510,19 @@ def run_analyze(
         source_id=source_id,
         inventory=inventory,
         repairs=repairs,
-        model=getattr(reply, "model", None),
+        model=run.model,
         raw_text=raw_text,
     )
     extra: dict[str, Any] = {}
-    usage = getattr(reply, "usage", None)
+    usage = run.usage
     if isinstance(usage, dict):
         extra["usage"] = usage
-    degraded = getattr(reply, "degraded_params", ())
+    degraded = run.degraded
     if degraded:
         extra["degraded"] = list(degraded)
+    # 记账（追加字段）：逐次尝试 + 整次调用的汇总
+    extra["attempts"] = run.attempt_records
+    extra["retry_account"] = run.account()
     payload = build_payload(result, meta, at=at, extra_meta=extra)
     write_json(doc_dir(data_dir, source_id) / "concepts.json", payload)
     return result

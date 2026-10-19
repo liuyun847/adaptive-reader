@@ -27,7 +27,8 @@ from ar.fidelity import compare_blocks
 from ar.rewrite import CheckOutcome, check_fidelity, fidelity_problems, run_rewrite
 from test_rewrite import (  # noqa: I001 - 同一 tests 目录里的共享素材与夹具
     FAKE_NUMBERS,
-    PROMPT_PARAGRAPH_RE,
+    batch_text,
+    prompt_ids,
     _copy_doc_dir,
     fake_handler_for,
     fake_run,
@@ -224,6 +225,8 @@ def test_p2_whole_batch_failure_exits_nonzero_with_evidence(
     errors = payload["meta"]["model_errors"]
     assert errors, "产物里没有 model_errors：失败批次没有留下可读证据"
     assert errors[0]["batch"] and errors[0]["paragraphs"] and errors[0]["error"], errors
+    # 批次错误文案统一走 ar.llm.failure_message：带尝试次数与末次错误码（策略是「不重试」→ 已试 1 次）
+    assert "已试 1 次，末次 UNKNOWN" in errors[0]["error"], errors[0]["error"]
     assert set(errors[0]["paragraphs"]) == {"p001", "p002", "p003", "p004", "p005", "p006"}
     # 失败归失败，变更账仍然是「每段一条」（check 的完整性校验以此为据）
     assert len(payload["changes"]) == 6
@@ -246,7 +249,7 @@ def test_p2_partial_batch_failure_also_exits_nonzero(dirs: SimpleNamespace, fake
     def handler(messages):  # noqa: ANN001
         prompt = messages[-1]["content"]
         # 认准「这一段在本批里」：`[p001] ` 只会出现在段落块里（提示词的 JSON 例子里是 "paragraph":"p001"）
-        if "[p001] " in prompt:
+        if "[p001] " in batch_text(prompt):
             raise RuntimeError("这一批的网关抖了（回归用例假模型）")
         return ok_handler(messages)
 
@@ -272,7 +275,7 @@ def test_p2_missing_decisions_without_batch_failure_also_exit_nonzero(
     write_fake_doc(dirs)
 
     def handler(messages):  # noqa: ANN001
-        ids = PROMPT_PARAGRAPH_RE.findall(messages[-1]["content"])
+        ids = prompt_ids(messages[-1]["content"])
         return json.dumps(
             {
                 "decisions": [
@@ -394,18 +397,23 @@ def test_p4_checked_flips_only_after_check(
 
 # --------------------------------------------------------------------- P5 --
 def test_p5_unknown_action_wording_matches_artifact(dirs: SimpleNamespace, fake_chat_client) -> None:
-    """未知动作（含模型没给 action）按保持处理、**不标 deferred**，文案必须与产物一致。"""
+    """未知动作（含模型没给 action）按保持处理、**不标 deferred**，文案必须与产物一致。
+
+    P5 的原始样本（拿 ``compress`` 当「枚举内未实现」的动作）在 2026-10-13 之后不成立了
+    ——四个动作都已实现、``deferred`` 不再有对象。现在守的是同一件事的另一半：
+    **枚举外的动作文案说「未标 deferred」，产物里就必须真的没有 deferred 键**；
+    而 ``deferred`` 机制本身仍在（``ar.rewrite.UNIMPLEMENTED_ACTIONS`` 空元组 + 那段文案都保留），
+    这里用一条直调 ``_finalize_items`` 的记账断言把它钉住。
+    """
 
     def handler(messages):  # noqa: ANN001
-        ids = PROMPT_PARAGRAPH_RE.findall(messages[-1]["content"])
+        ids = prompt_ids(messages[-1]["content"])
         decisions = []
         for pid in ids:
             if pid == "p001":
                 action = ""  # 模型没给 action
             elif pid == "p002":
                 action = UNKNOWN_ACTION  # 枚举外的动作
-            elif pid == "p006":
-                action = "compress"  # 枚举内、未实现 → 按保持并标 deferred
             else:
                 action = "keep"
             decisions.append(
@@ -424,22 +432,37 @@ def test_p5_unknown_action_wording_matches_artifact(dirs: SimpleNamespace, fake_
     assert len(outcome.decisions) == len(doc["paragraphs"])
 
     by_id = {change["paragraph"]: change for change in outcome.changes}
-    # 产物侧：未知动作 → keep 且**没有** deferred 键；compress → keep + deferred: true
+    # 产物侧：未知动作 → keep 且**没有** deferred 键
     assert by_id["p001"]["action"] == "keep" and "deferred" not in by_id["p001"]
     assert by_id["p002"]["action"] == "keep" and "deferred" not in by_id["p002"]
-    assert by_id["p006"]["action"] == "keep" and by_id["p006"]["deferred"] is True
 
-    # 文案侧：声称「并标 deferred」的条目，产物里必须真的有 deferred: true（不许对不上）
-    claimed = [line for line in outcome.degraded if "并标 deferred" in line]
-    assert claimed, "compress 的降级文案不见了"
-    for line in claimed:
-        pid = line.split("：", 1)[0]
-        assert by_id[pid].get("deferred") is True, f"文案说标了 deferred，产物里没有：{line}"
+    # 文案侧：声称「未标 deferred」的条目，产物里就必须真的没有 deferred 键（不许对不上）
     for pid in ("p001", "p002"):
         lines = [line for line in outcome.degraded if line.startswith(f"{pid}：")]
         assert lines, f"{pid} 的降级没有被记下来（静默降级）"
         for line in lines:
             assert "未标 deferred" in line, f"文案与产物不一致（产物没有 deferred 键）：{line}"
+    assert not [line for line in outcome.degraded if "并标 deferred" in line], "四个动作都实现了，不该再有 deferred 文案"
     # 未知动作的说明写在 why.note 里，页面上也看得见
     assert "不在四类之内" in by_id["p001"]["why"]["note"]
     assert "deferred" in by_id["p001"]["why"]["note"]
+
+
+def test_p5_deferred_mechanism_still_writes_true_only_for_unimplemented_actions() -> None:
+    """``deferred`` 机制保留（文案与字段都不删）：只有**枚举内未实现**的动作才标它。
+
+    当前 ``UNIMPLEMENTED_ACTIONS`` 是空元组（四个动作都实现了），所以产物里不会再出现
+    ``deferred: true``；这条用直调 ``_finalize_items`` 把「机制还在、只是没有对象」钉住——
+    将来真有枚举内未实现的动作时，它必须重新回到「按 keep + 标 deferred + 文案一致」。
+    """
+    from ar.rewrite import UNIMPLEMENTED_ACTIONS, _finalize_items
+
+    assert UNIMPLEMENTED_ACTIONS == ()
+    degraded: list[str] = []
+    paragraph = {"id": "p001", "text": "第一段原文。"}
+    item = _finalize_items(
+        paragraph,
+        {"paragraph": "p001", "action": "keep", "why": {"profile": [], "note": "假依据"}, "confidence": 0.5, "rewrite": ""},
+        degraded=degraded,
+    )
+    assert item.decision.deferred is False and degraded == []

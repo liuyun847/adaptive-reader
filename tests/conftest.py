@@ -21,11 +21,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from ar.llm import LlmRequest, LlmResult, RetryPolicy  # noqa: E402 - 必须在 sys.path 注入之后
+
 # 前端无头用例在 tests/web（由另一路并行开发）：默认 `pytest tests` 不收集
 collect_ignore = ["web"]
 
 # 契约里的主样例材料（5,341 字符 / 22 段）；不存在时相关用例 skip
-REAL_SAMPLE = Path(r"C:\Users\MLTZ\Desktop\code\working\学习\_第1章第1节三版对照\00-底本.md")
+REAL_SAMPLE = Path.home() / "Desktop" / "code" / "working" / "学习" / "_第1章第1节三版对照" / "00-底本.md"
 
 SAMPLE_DOC = """# 样例标题
 
@@ -77,8 +79,44 @@ class FakeModelReply:
     degraded_params: tuple[str, ...] = ()
 
 
+def reply_to_result(reply: Any) -> LlmResult:
+    """假回复 → 统一调用层的 ``LlmResult``（几个假客户端的 ``arequest_once`` 共用这一段）。"""
+    usage = getattr(reply, "usage", None)
+    return LlmResult(
+        ok=True,
+        text=getattr(reply, "text", "") or "",
+        model=getattr(reply, "model", None),
+        finish_reason=getattr(reply, "finish_reason", None),
+        usage=dict(usage) if isinstance(usage, dict) else None,
+        degraded_params=tuple(getattr(reply, "degraded_params", ()) or ()),
+    )
+
+
+class FakeOnceMixin:
+    """把「只实现了同步 ``chat``」的假客户端接到统一调用层要的 ``arequest_once`` 上。
+
+    四个业务模块迁移后都走 ``ar.tools`` → ``ar.llm``：那一层只认
+    ``arequest_once`` / ``retry_policy`` / ``configured`` 三个成员。这里补上前两个，
+    既有写法（假模型只管 ``chat`` 回什么、``calls`` 记账）一个都不用改。
+
+    ``chat`` 抛出的异常**照旧往外抛**：``ar.llm`` 会把它归一成 ``UNKNOWN`` 失败
+    （与迁移前「假模型抛错 = 调用失败」同一条降级路径）。
+
+    默认策略是**不重试**：用例不必等退避，也不会因为一次失败多打几次账；
+    要考重试的用例自己构造带 ``policy`` 的假客户端。
+    """
+
+    def retry_policy(self) -> RetryPolicy:
+        policy = getattr(self, "policy", None)
+        return policy if isinstance(policy, RetryPolicy) else RetryPolicy(max_retries=0)
+
+    async def arequest_once(self, request: LlmRequest) -> LlmResult:
+        reply = self.chat([dict(message) for message in request.messages], max_tokens=request.max_tokens)
+        return reply_to_result(reply)
+
+
 @dataclass
-class FakeModelClient:
+class FakeModelClient(FakeOnceMixin):
     """假模型客户端：同步 ``chat`` + 异步 ``achat``，记录收到的消息。
 
     ``error`` 非空时每次调用都抛它，用来验证「调用失败 → 可见降级」。
@@ -111,7 +149,7 @@ def fake_reply() -> type[FakeModelReply]:
 
 
 @dataclass
-class FakeChatClient:
+class FakeChatClient(FakeOnceMixin):
     """可编程的假模型：``on_chat(messages)`` 决定这批请求回什么（或抛错）。
 
     ``run_rewrite`` 会**并发**发多批请求，所以假客户端必须自己认得出「这一批问的是哪几段」
@@ -153,6 +191,11 @@ def fake_chat_client() -> type[FakeChatClient]:
     return FakeChatClient
 
 
+# ⚠ `run_cli` 是**进程内**直调 `ar.cli.main()`：不传 `--config` 时 `load_config()` 走的是
+# `paths.DEFAULT_CONFIG_PATH`，也就是**开发机真实的** `config.local.json`。
+# 凡是要断言「模型未配置」（退出码 5 / 启动横幅写「未配置」）的用例，必须显式传一份空配置
+# （用下面的 `nokey_config`），否则开发机一配钥匙，用例就从绿转红——2026-10-09 实测踩到：
+# 本机 `config.local.json` 补上 `api_key` 后，3 条用例当场变红（详见 README §7）。
 @pytest.fixture
 def run_cli(capsys: pytest.CaptureFixture[str]):
     """跑一次 CLI 并拿到 (退出码, 合并输出)；打印流同时被捕获。"""
@@ -168,3 +211,25 @@ def run_cli(capsys: pytest.CaptureFixture[str]):
         return code, captured.out + captured.err
 
     return _run
+
+
+@pytest.fixture
+def nokey_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """一份**不含密钥**的临时配置，给 CLI 用例显式 `--config` 用。
+
+    两件事一起做，少一件就仍然与开发机有关：
+
+    1. 配置文件里 `api_key: ""`（其余键由 `load_config()` 用默认值补齐）；
+    2. 把环境变量 `AR_API_KEY` 摘掉——它的优先级**高于**配置文件，
+       开发机若设过它，光写空配置照样是「模型已配置」。
+
+    于是「模型未配置 → 退出码 5」「启动横幅写未配置」这类断言只取决于用例自己
+    （与 `test_rewrite.py` 的 `rewrite_env` 同一口径，那边填的是假 key）。
+    """
+    path = tmp_path / "config.nokey.json"
+    path.write_text(json.dumps({"api_key": ""}), encoding="utf-8")
+    # 延迟导入：sys.path 注入（src 布局）在本文件开头的模块级语句里，这里跟着 run_cli 的口径写
+    from ar.config import API_KEY_ENV
+
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    return path

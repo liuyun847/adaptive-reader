@@ -252,6 +252,9 @@ body[data-drawer="open"] .topbar { padding-right: calc(var(--drawer-w) + 1rem); 
 .settings__warn[hidden] { display: none; }
 
 /* ------------------------------------------------------------ 降级横幅 */
+/* 显示层纪律（2026-10-09，实现见 js/view.js 的 addBanner）：同文本只留一条（叠计数）、
+   每条带 `×` 可手动关（`warn`/`error` 只能这样关掉）、`info` 成功类到点自动消失。
+   四档配色：默认 warn（黄）/ error（红）/ info（绿＝做成了）。 */
 .banners:empty { display: none; }
 
 .banners {
@@ -269,12 +272,44 @@ body[data-drawer="open"] .topbar { padding-right: calc(var(--drawer-w) + 1rem); 
 body[data-drawer="open"] .banners { padding-right: calc(var(--drawer-w) + 1rem); }
 
 .banner {
+  display: flex;
+  align-items: flex-start;
+  gap: .5rem;
   border: 1px solid var(--warn-line);
   background: var(--warn-bg);
   color: var(--warn-ink);
   border-radius: 6px;
-  padding: .45rem .75rem;
+  padding: .45rem .5rem .45rem .75rem;
   font-size: .86rem;
+}
+
+.banner__text { flex: 1 1 auto; min-width: 0; }
+
+/* 同文本重复触发时的计数（首次出现时 hidden） */
+.banner__repeat { flex: 0 0 auto; font-size: .78rem; opacity: .8; white-space: nowrap; }
+.banner__repeat[hidden] { display: none; }
+
+/* 手动关闭：原生 button，Enter/Space 即点；键盘聚焦时给轮廓（与其它控件同一口径） */
+.banner__close {
+  flex: 0 0 auto;
+  margin: -.1rem 0 0;
+  padding: 0 .35rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.banner__close:hover { border-color: currentColor; }
+.banner__close:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.banner[data-state="info"] {
+  border-color: var(--ok-line);
+  background: var(--ok-bg);
+  color: var(--ok-ink);
 }
 
 .banner[data-state="error"] {
@@ -454,6 +489,76 @@ code {
 .tip__note { display: block; margin-top: .15rem; color: var(--tip-note); }
 .tip__profile { display: block; margin-top: .15rem; color: var(--tip-muted); }
 .tip__deferred { display: block; margin-top: .15rem; color: var(--tip-warn); }
+/* 事实锚申报（PLAN-actions-feedback §14.1）：悬停这一段就能看见「放弃了哪几项锚点」 */
+.tip__declared { display: block; margin-top: .15rem; color: var(--tip-warn); }
+/* 依据画像兜底补齐（2026-10-14）：这一段的 why.profile 不是模型给的，是骨架照读者自评补的.
+   与申报同一处悬停区、同一套提示色 —— 都是「要核对」的说明，不是错误。 */
+.tip__filled { display: block; margin-top: .15rem; color: var(--tip-warn); }
+
+/* ------------------------------------------------ 「太啰嗦」标记（DESIGN §5）
+   它与动作标记同在「段落标记区」（.block__gutter）里：默认不显示，
+   悬停这一段 / 键盘聚焦到这一段的标记上才现身（读正文时不许到处冒按钮）。
+   配色跟 .marker 走同一套（它在正文栏的页面底色上）。 */
+.gutter-action {
+  display: inline-block;
+  margin-top: .35rem;
+  padding: 0 .3rem;
+  white-space: nowrap;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: .68rem;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--marker-bg);
+  border: 1px solid var(--marker-line);
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+
+.block.is-hover .gutter-action,
+.block__gutter:hover .gutter-action,
+.block:focus-within .gutter-action,
+.gutter-action:focus-visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.gutter-action:hover { border-color: var(--accent); color: var(--accent); }
+.gutter-action:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-line); }
+.gutter-action[data-state="pending"] { cursor: progress; color: var(--muted); }
+.gutter-action[data-state="done"] {
+  color: var(--ok-ink);
+  border-color: var(--ok-line);
+  background: var(--ok-bg);
+  cursor: default;
+}
+.gutter-action[data-state="error"] { color: var(--warn-ink); border-color: var(--warn-line); }
+
+/* ------------------------------------------------ 就地配图（PLAN-actions-feedback §4.3）
+   图容器在段落内、正文之后；它是**内容**（在正文栏那一轴上取色），
+   失败时整块换成警示色并在原位留一句可读说明（不留空白、不留破图）。 */
+.figure {
+  margin: .2rem 0 .9rem;
+  padding: .55rem .65rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: .82rem;
+}
+
+.figure[data-state="fallback"] { border-color: var(--warn-line); background: var(--warn-bg); }
+.figure[data-state="loading"] .figure__hold,
+.figure[data-state="pending"] .figure__hold { color: var(--muted); }
+
+.figure__hold { overflow-x: auto; color: var(--ink-soft); }
+.figure__hold svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.figure__caption { margin-top: .35rem; color: var(--muted); font-size: .76rem; }
+.figure__fallback { margin: 0; color: var(--warn-ink); }
 
 /* ------------------------------------------------------------ 原文抽屉 */
 .drawer {
@@ -749,6 +854,10 @@ body[data-drawer="open"] .drawer__rail-chevron { transform: rotate(180deg); }
 
 .card__chips { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .2rem; }
 
+/* `why.profile` 为空时的显式说明（2026-10-14）：颜色比 chip 淡一档——它是「没有自评引用」，
+   不是一条引用，也不等于「画像为空」（背景依据按契约只写在 why.note 里）。 */
+.card__profile-empty { color: var(--panel-muted); font-size: .78rem; margin-top: .2rem; }
+
 .chip {
   font-size: .74rem;
   border: 1px solid var(--panel-line);
@@ -757,6 +866,14 @@ body[data-drawer="open"] .drawer__rail-chevron { transform: rotate(180deg); }
   color: var(--panel-ink-soft);
   background: var(--panel-sunken);
 }
+
+/* 申报的两枚徽标（§14.1）：放行 = 提示色（读者知道自己丢了什么），未放行 = 警示色（会算违规） */
+.chip--waived { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); }
+.chip--blocked { border-color: var(--err-line); background: var(--err-bg); color: var(--err-ink); }
+
+/* 兜底补齐徽标（2026-10-14）：这一段的 `why.profile` 不是模型给的，是骨架照读者自评补的.
+   用提示色（与 `--waived` 同一套 token）：它是一条**要核对**的出处说明，不是错误、也不改退出码。 */
+.chip--filled { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); }
 
 /* 状态行：在 .card__foot 里（不随内容滚动）。
    超长时自己滚（顶端始终可见），免得把整张卡片的高度预算吃光。 */
@@ -833,6 +950,401 @@ body[data-drawer="open"] .drawer__rail-chevron { transform: rotate(180deg); }
   font-size: .82rem;
   letter-spacing: .2em;
 }
+
+/* ------------------------------------------- 读前背景问卷（2026-10-08 新增）
+   项目里此前没有任何模态 / 遮罩先例，这是新建的一份：居中卡片 + 半透明衬托。
+
+   **指针事件模型（这一段是这块界面最关键的三行）**：问卷不许吞正文点击，所以
+   层 `pointer-events: none`；但 `pointer-events` 是**继承属性**，只写这一条会连卡片里的
+   单选框、输入框、按钮一起变成点不动（实测：`input` 与 `button` 的 computed 值也成了
+   `none`，Playwright 报「subtree intercepts pointer events」）。因此：
+     1) 层 none（正文照常可滚可点）；
+     2) 卡片 auto（把卡片内部重新交还给本人）；
+     3) 卡片里**非交互的部分**（标题、说明、选项行、状态区……）再显式 none ——
+        这样连「卡片范围内的正文点击」也不会被卡片的空白吃掉。
+   控件（input / textarea / button / label）拿到 auto。
+
+   **题区（`.survey__body`）的滚动归 JS 管，2026-10-09 补**：它是卡片里唯一的滚动容器，
+   而它也必须留在上面第 3) 组里（`pointer-events: none`）—— 一旦给它 auto，
+   卡片这块矩形就变成点击死区，正文在卡片范围内的点击会被它吃掉（实测：
+   `test_open_survey_does_not_block_scrolling_or_swallow_clicks` 与
+   `test_escape_works_after_focus_leaves_the_card` 同时失败，Playwright 报
+   「from `#survey-host` subtree intercepts pointer events」）。
+   而 `pointer-events: none` 的元素会被命中测试跳过，于是滚轮落到背后正文上（用户实测的
+   「背景问卷的滚动会穿透」）。所以滚轮归 `survey.js` 的 `handleWheel` 按**坐标命中判定**接管：
+   指针在卡片矩形里就拦下默认动作、把滚动量给题区；指针在层上别处一律不插手。
+   `overscroll-behavior: contain` 留在题区上，作为滚动链的第二道闸（滚到顶/底不把页面带走）。
+
+   配色只走变量（--panel / --panel-ink / --panel-line / --info-* / --warn-* / --err-*），
+   三档背景 × 两档文字六种组合下卡片都是「面板底 + 面板字」这一对，不会出现白底浅字。
+   关闭时整层被 JS 移除（不留残影），所以这里不做显隐过渡。 */
+.survey-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 70;                 /* 在讲解卡片层（60）与降级横幅（35）之上 */
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: calc(var(--topbar-h) + .8rem) 1rem 1.4rem;
+  background: rgba(24, 26, 30, .28);
+  pointer-events: none;        /* ① 正文照常收得到点击 */
+}
+
+.survey {
+  /* ⚠ 卡片本身**不吃**指针事件：这样连「卡片范围内的正文点击」也照常落到正文上，
+     不会出现「标题下方那一块死区」。真正需要收事件的只有控件，
+     它们的 `pointer-events` 在下面 `.survey__option / .survey__text / .survey__btn / .survey__close`
+     那一组里显式要回 auto（`pointer-events` 是继承属性，作者声明的 none 会盖掉浏览器给控件的默认值）。 */
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  width: min(34rem, calc(100vw - var(--rail-w) - 2rem));
+  max-height: calc(100vh - var(--topbar-h) - 2.4rem);
+  background: var(--panel);
+  color: var(--panel-ink);
+  border: 1px solid var(--panel-line);
+  border-radius: 10px;
+  box-shadow: 0 18px 44px var(--shadow-card);
+  padding: .8rem .95rem .85rem;
+  font-size: .86rem;
+}
+
+/* ③ 卡片里的非交互部分继续让路给正文；控件（label / input / textarea / button）保持可点。
+   ⚠ `.survey__body` 也留在这里：它虽然是滚动容器，但给它 auto 就会把「卡片范围内的正文点击」
+   变成死区（2026-10-09 实测两条既有用例同时失败），所以题区的滚轮由 JS 的坐标命中判定接管，
+   见本块顶部的说明与 `web/js/survey.js` 的 `handleWheel`。 */
+.survey__head,
+.survey__title,
+.survey__lead,
+.survey__phase,
+.survey__body,
+.survey__q,
+.survey__followup,
+.survey__label,
+.survey__hint,
+.survey__options,
+.survey__foot,
+.survey__note,
+.survey__status { pointer-events: none; }
+
+/* `pointer-events` 会继承：上面把容器置 none 之后，**必须**把真正的控件显式要回来，
+   否则单选框与按钮会连点都点不动（作者声明的 none 覆盖浏览器对控件的默认 auto）。
+   选项行本身是 `<label>`：点它也等于点里面的勾选框，所以它也要 auto。 */
+.survey__option,
+.survey__option input,
+.survey__text,
+.survey__btn,
+.survey__close { pointer-events: auto; }
+
+.survey__head { display: flex; align-items: center; justify-content: space-between; }
+.survey__title { font-weight: 600; }
+
+.survey__close {
+  border: 0;
+  background: transparent;
+  color: var(--panel-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.survey__close:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.survey__lead {
+  margin: .25rem 0 .55rem;
+  color: var(--panel-muted);
+  font-size: .78rem;
+  line-height: 1.55;
+}
+
+/* 阶段说明区（提交完成 / 模型追问这两步用；初始 hidden） */
+.survey__phase {
+  margin: .1rem 0 .5rem;
+  padding: .45rem .55rem;
+  border: 1px solid var(--info-line);
+  background: var(--info-bg);
+  color: var(--info-ink);
+  border-radius: 6px;
+  font-size: .8rem;
+  line-height: 1.55;
+}
+
+.survey__phase[hidden] { display: none; }
+.survey__phase-title { font-weight: 600; }
+.survey__phase-note { margin-top: .2rem; }
+.survey__phase .survey__btn { margin-top: .45rem; }
+
+/* 追问的一题：问题 + 后端给的 hint + 输入框 */
+.survey__followup { margin-bottom: .7rem; }
+
+/* 中间是滚动区：题多的时候不会把底部按钮顶出视口。
+   `overscroll-behavior: contain` 是**滚动链的第二道闸**：这一块是内部滚动区，
+   滚到顶/底也不许把剩下的滚动交给页面。滚轮本身归不归它，由 survey.js 的 `handleWheel`
+   按坐标判定（因为它必须保持 `pointer-events: none`，见上一条注释）。 */
+.survey__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-right: .15rem;
+}
+
+.survey__q { margin-bottom: .7rem; }
+.survey__q[hidden] { display: none; }
+.survey__label { font-size: .8rem; color: var(--panel-ink); font-weight: 600; }
+
+.survey__hint {
+  margin: .1rem 0 .25rem;
+  color: var(--panel-muted);
+  font-size: .74rem;
+  line-height: 1.5;
+}
+
+.survey__options { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .3rem; }
+
+.survey__option {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  border: 1px solid var(--panel-line);
+  border-radius: 999px;
+  padding: .12rem .55rem;
+  cursor: pointer;
+  font-size: .78rem;
+  color: var(--panel-ink-soft);
+  background: var(--panel-sunken);
+}
+
+.survey__option:hover { border-color: var(--accent); }
+.survey__option:has(input:checked) { border-color: var(--accent); color: var(--accent); background: var(--info-bg); }
+.survey__option:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 1px; }
+.survey__option input { margin: 0; accent-color: var(--accent); }
+
+.survey__text {
+  display: block;
+  width: 100%;
+  margin-top: .3rem;
+  font-family: inherit;
+  font-size: .82rem;
+  color: var(--panel-ink);
+  background: var(--panel-sunken);
+  border: 1px solid var(--panel-line);
+  border-radius: 6px;
+  padding: .3rem .5rem;
+  resize: vertical;
+}
+
+.survey__text:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* 校验 / 降级状态区：语义色跟 data-bg 走（与卡片的 .card__status 同一套） */
+.survey__status {
+  margin-top: .5rem;
+  border: 1px solid var(--panel-line);
+  background: var(--panel-sunken);
+  color: var(--panel-ink-soft);
+  border-radius: 6px;
+  padding: .35rem .5rem;
+  font-size: .78rem;
+  line-height: 1.5;
+}
+
+.survey__status[hidden] { display: none; }
+.survey__status[data-state="submitting"] { border-color: var(--info-line); background: var(--info-bg); color: var(--info-ink); }
+.survey__status[data-state="invalid"],
+.survey__status[data-state="confirm"] { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); }
+.survey__status[data-state="error"] { border-color: var(--err-line); background: var(--err-bg); color: var(--err-ink); }
+
+.survey__foot {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-wrap: wrap;
+  margin-top: .6rem;
+}
+
+.survey__btn {
+  font-family: inherit;
+  font-size: .8rem;
+  border-radius: 6px;
+  padding: .22rem .7rem;
+  cursor: pointer;
+  border: 1px solid var(--panel-line);
+  background: var(--panel);
+  color: var(--panel-ink-soft);
+}
+
+.survey__btn:hover { border-color: var(--accent); color: var(--accent); }
+.survey__btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.survey__btn--primary {
+  border-color: var(--accent-line);
+  background: var(--info-bg);
+  color: var(--info-ink);
+  font-weight: 600;
+}
+
+.survey__note { color: var(--panel-muted); font-size: .74rem; flex: 1 1 9rem; }
+
+/* ------------------------------------------- 顶栏「状态」入口 + 状态面板（2026-10-09 新增）
+   数据源只有一个：同源静态文件 `/status.json`（`tools/gen_status.py` 生成），前端不硬编码数字。
+   形态沿用问卷那一套（居中卡片 + 半透明衬托），配色只走变量
+   （--panel* / --info-* / --warn-* / --err-* / --focus），三档背景 × 两档文字下都是「面板底 + 面板字」。
+
+   **指针事件**：沿用问卷那套三段式（层 none → 卡片 none → 控件 auto），面板打开时
+   正文照常可滚、可点、可选字；滚动区 `.status__body` 因此也拿不到滚轮，归 `js/status.js` 的
+   `handleWheel` 按坐标命中判定接管（口径同 survey.js），`overscroll-behavior: contain` 作第二道闸。
+   关闭时整层被 JS 移除（不留残影），所以这里不做显隐过渡。 */
+.status-toggle {
+  flex: 0 0 auto;
+  border: 1px solid var(--panel-line);
+  background: var(--panel);
+  color: var(--panel-ink);
+  border-radius: 6px;
+  padding: .28rem .55rem;
+  font: inherit;
+  font-size: .76rem;
+  cursor: pointer;
+}
+
+.status-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.status-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.status-toggle[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); }
+
+.status-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 72;                 /* 在问卷层（70）与讲解卡片层（60）之上：同开时它是最上面那一层 */
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: calc(var(--topbar-h) + .8rem) 1rem 1.4rem;
+  background: rgba(24, 26, 30, .28);
+  pointer-events: none;        /* ① 正文照常收得到点击 */
+}
+
+.status {
+  pointer-events: none;        /* ② 卡片本身也不吃指针事件：正文在卡片范围内的点击照常落到正文上 */
+  display: flex;
+  flex-direction: column;
+  width: min(42rem, calc(100vw - var(--rail-w) - 2rem));
+  max-height: calc(100vh - var(--topbar-h) - 2.4rem);
+  background: var(--panel);
+  color: var(--panel-ink);
+  border: 1px solid var(--panel-line);
+  border-radius: 10px;
+  box-shadow: 0 18px 44px var(--shadow-card);
+  padding: .8rem .95rem .85rem;
+  font-size: .86rem;
+}
+
+/* ③ 唯一需要收事件的只有关闭按钮（`pointer-events` 是继承属性，作者声明的 none 会盖掉浏览器默认值） */
+.status__close {
+  pointer-events: auto;
+  border: 0;
+  background: transparent;
+  color: var(--panel-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.status__close:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+.status__head { display: flex; align-items: center; gap: .5rem; }
+.status__title { font-weight: 600; }
+.status__stamp { margin-left: auto; color: var(--panel-muted); font-size: .74rem; }
+
+.status__lead {
+  margin: .25rem 0 .55rem;
+  color: var(--panel-muted);
+  font-size: .78rem;
+  line-height: 1.55;
+}
+
+/* 中间是唯一滚动区：条目多的时候不会把底部说明顶出视口。
+   `overscroll-behavior: contain` 是滚动链的第二道闸；滚轮本身归 `handleWheel` 按坐标判定。 */
+.status__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-right: .15rem;
+}
+
+.status__section { margin-bottom: .8rem; }
+.status__heading { margin: 0 0 .4rem; font-size: .84rem; font-weight: 600; }
+.status__loading { color: var(--panel-muted); font-size: .8rem; }
+
+/* 一套测试的结论：ok / error / skip 三态，语义色跟 data-bg 走 */
+.status__suite {
+  border: 1px solid var(--panel-line);
+  background: var(--panel-sunken);
+  border-radius: 6px;
+  padding: .45rem .55rem;
+  margin-bottom: .45rem;
+  font-size: .8rem;
+  line-height: 1.55;
+}
+
+.status__suite[data-state="ok"] { border-color: var(--ok-line); background: var(--ok-bg); color: var(--ok-ink); }
+.status__suite[data-state="error"] { border-color: var(--err-line); background: var(--err-bg); color: var(--err-ink); }
+.status__suite[data-state="skip"] { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); }
+.status__suite-name { font-weight: 600; }
+.status__suite-counts { font-weight: 600; margin-top: .15rem; }
+.status__suite-seconds { font-size: .76rem; }
+/* 摘要行比结论行弱一档靠字号，**不靠 opacity**：`.85` 会让 --ok-ink on --ok-bg 从
+   6.07:1 掉到 4.42:1（低于 AA 4.5:1，实测合成色 #3E8057）——小字够小就够了，颜色别打折。 */
+.status__suite-summary { margin-top: .15rem; font-size: .74rem; }
+.status__suite-note { margin-top: .15rem; }
+
+/* 报告读不到 / 坏掉时的可见降级（不许空白、不许假装成功） */
+.status__missing {
+  border: 1px solid var(--warn-line);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: 6px;
+  padding: .5rem .6rem;
+  font-size: .8rem;
+  line-height: 1.55;
+}
+
+.status__missing-title { font-weight: 600; }
+.status__missing-body { margin-top: .2rem; }
+.status__missing-reason { margin-top: .3rem; color: var(--panel-muted); font-size: .74rem; }
+
+.status__note {
+  border-left: 2px solid var(--info-line);
+  padding-left: .45rem;
+  color: var(--panel-ink);
+  font-size: .8rem;
+  line-height: 1.55;
+}
+
+.status__head-line { margin-top: .3rem; color: var(--panel-muted); font-size: .76rem; }
+.status__head-code { color: var(--panel-ink-soft); word-break: break-all; }
+.status__totals { margin-top: .3rem; font-weight: 600; }
+.status__warn { color: var(--err-ink); font-size: .78rem; }
+.status__empty { color: var(--panel-muted); font-size: .78rem; }
+
+/* 文件清单：条目多时靠 .status__body 滚动，行内不换行的地方用 break-all 兜住长路径 */
+.status__files { list-style: none; margin: .35rem 0 0; padding: 0; }
+.status__file {
+  display: flex;
+  align-items: baseline;
+  gap: .4rem;
+  padding: .18rem 0;
+  border-bottom: 1px dashed var(--panel-line);
+  font-size: .78rem;
+}
+.status__file:last-child { border-bottom: 0; }
+.status__file-code { flex: 0 0 auto; font-family: ui-monospace, Consolas, "Courier New", monospace; color: var(--panel-muted); }
+.status__file-label { flex: 0 0 auto; color: var(--panel-muted); font-size: .72rem; }
+.status__file[data-untracked="true"] .status__file-label { color: var(--info-ink); }
+.status__file-path { flex: 1 1 auto; word-break: break-all; }
+.status__file-lines { flex: 0 0 auto; color: var(--panel-ink-soft); font-variant-numeric: tabular-nums; }
+
+.status__foot { margin-top: .35rem; }
+.status__foot-note { color: var(--panel-muted); font-size: .74rem; }
 
 /* ============================================================ 主题覆盖
    body[data-bg]（背景 3 档）× body[data-ink]（文字 2 档）。

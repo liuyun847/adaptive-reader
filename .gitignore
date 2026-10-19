@@ -7,7 +7,7 @@ __pycache__/
 
 # ── 测试 / 覆盖率 / 类型检查缓存 ─────────────────────
 .pytest_cache/
-pytest-of-MLTZ/
+pytest-of-*/
 .coverage
 .coverage.*
 htmlcov/
@@ -22,6 +22,10 @@ htmlcov/
 data/
 profiles/
 config.local.json
+
+# ── 机器生成的状态报告(web/README.md「状态面板」:由 tools/gen_status.py 生成) ──
+web/status.json
+.status-tmp/
 
 # ── 系统 / 编辑器杂项 ───────────────────────────────
 .DS_Store

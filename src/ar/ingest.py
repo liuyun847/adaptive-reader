@@ -16,20 +16,21 @@
 
 锚点规则：``text_hash = sha256(规范化文本)[:8]``，
 规范化 = 去首尾空白 + 合并连续空白 + 全角空格（U+3000）转半角。**同一文件重复摄取必得同一组 id 与 text_hash**。
+
+写盘：两份产物都走 ``ar.jsonio`` 的原子写（唯一一份写盘实现），目标目录不可写时**立刻**抛
+``WriteError``（点名目录与 errno，CLI 退出码 2），不空转、不留半个文件。
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .errors import InputError
-from .jsonio import now_iso, read_json_if_exists, write_json
+from .jsonio import now_iso, read_json_if_exists, write_bytes, write_json
 from .paths import doc_dir
 
 __all__ = [
@@ -78,20 +79,6 @@ def split_paragraphs(raw: str) -> list[str]:
         # 段内换行统一成 \n（CRLF → LF），段文本本身不改字
         paragraphs.append(block.replace("\r\n", "\n").replace("\r", "\n"))
     return paragraphs
-
-
-def _write_bytes(path: Path, payload: bytes) -> Path:
-    """按字节原子写入（保证 ``source.md`` 与源文件逐字节一致）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
-    return path
 
 
 @dataclass
@@ -180,7 +167,13 @@ def ingest(
         ],
     }
 
-    _write_bytes(target / "source.md", raw_bytes)
+    # 两份产物都走 ``ar.jsonio`` 的原子写（**唯一一份写盘实现**）：
+    # ``source.md`` 按字节写（与源文件逐字节一致），``source.meta.json`` 走 JSON 写。
+    # 目录不可写时两份都**立刻**抛 ``WriteError``（点名目录与 errno，CLI 退出码 2）——
+    # 此前 ``source.md`` 用裸 ``tempfile.mkstemp``：Windows 上它把 ``PermissionError``
+    # 当成「候选名被占用」吞掉、按 ``TMP_MAX``（本机实测 2147483647，近似无界）空转
+    # ⇒ `ar ingest` 在坏目录上「不报错、单核 100%、长时间不结束」（2026-10-14 复核补漏）。
+    write_bytes(target / "source.md", raw_bytes)
     write_json(target / "source.meta.json", meta)
 
     return IngestResult(

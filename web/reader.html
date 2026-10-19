@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>自适应阅读器 · 改写稿</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/reader.css">
+  <script>
+    /*
+     * 显示设置的「渲染前应用」：在 body 解析之前、样式表之后同步执行，
+     * 按 localStorage["ar.settings.v1"] 给 <html> 打好属性 —— 刷新时不会先闪一下纸白底。
+     * 口径与 js/settings.js 的 normalizeSettings/initialSettings 一致（那边 bootstrap() 会再接管一次）。
+     */
+    (function () {
+      var KEY = 'ar.settings.v1';
+      var BG = ['paper', 'warm', 'dark'];
+      var INK = ['ink', 'light'];
+      var SIZE = ['15', '16', '17', '19'];
+      var e = document.documentElement;
+      var settings = null;
+      try {
+        var raw = localStorage.getItem(KEY);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object' && BG.indexOf(parsed.bg) !== -1) {
+            settings = parsed;
+          }
+        }
+      } catch (err) { settings = null; }
+      var stored = settings !== null;
+      if (!settings) {
+        var dark = false;
+        try { dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches); } catch (err) { dark = false; }
+        settings = { bg: dark ? 'dark' : 'paper', ink: dark ? 'light' : 'ink', size: '16', inkExplicit: false };
+        try { localStorage.setItem(KEY, JSON.stringify(settings)); } catch (err) { /* 存储被禁用：本次会话照常生效 */ }
+      }
+      var bg = BG.indexOf(settings.bg) !== -1 ? settings.bg : 'paper';
+      var inkExplicit = settings.inkExplicit === true && INK.indexOf(settings.ink) !== -1;
+      e.dataset.bg = bg;
+      e.dataset.ink = inkExplicit ? settings.ink : (bg === 'dark' ? 'light' : 'ink');
+      e.dataset.size = SIZE.indexOf(String(settings.size)) !== -1 ? String(settings.size) : '16';
+      e.dataset.inkExplicit = String(inkExplicit);
+      e.dataset.settingsStored = String(stored);
+    })();
+  </script>
+</head>
+
+<body data-drawer="collapsed" data-mode="unknown" data-current-paragraph=""
+  data-bg="paper" data-ink="ink" data-size="16" data-ink-explicit="false">
+
+  <header class="topbar">
+    <div class="topbar__brand">自适应阅读器</div>
+    <div class="topbar__side">
+      <div class="topbar__meta">
+        <span class="badge" data-role="source-id">材料：—</span>
+        <span class="badge badge--mode" data-role="mode-badge">加载中</span>
+        <span class="badge" data-role="progress">第 — / — 段</span>
+      </div>
+      <!-- 阅读显示设置：背景 / 文字颜色 / 正文字号，落 localStorage，刷新后仍在 -->
+      <div class="topbar__settings">
+        <button class="settings-toggle" type="button" data-role="settings-toggle"
+          aria-expanded="false" aria-controls="settings-panel" title="阅读显示设置（背景 / 文字颜色 / 字号）">
+          <span class="settings-toggle__mark" aria-hidden="true">Aa</span>
+          <span class="settings-toggle__text">显示</span>
+        </button>
+        <div class="settings" id="settings-panel" data-role="settings-panel" data-state="closed" hidden
+          role="dialog" aria-label="阅读显示设置"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 全页级降级提示（模型不可用 / 段数对不上 / 概念清单缺失 等）都落在这里，不允许静默 -->
+  <div class="banners" data-role="banners" aria-live="polite"></div>
+
+  <div class="reader" data-role="reader">
+    <main class="main" data-role="main">
+      <!-- tabindex="-1"：问卷关闭后把焦点交还正文栏（不进入 Tab 序，但可以被脚本聚焦） -->
+      <article class="article" id="rewritten" data-role="rewritten" tabindex="-1" aria-label="改写稿主栏"></article>
+      <p class="article__end" data-role="end-mark">— 改写稿结束 —</p>
+      <!-- 读完才显示的哨兵：IntersectionObserver 一直盯着它，读完逻辑不改 -->
+      <div class="end-sentinel" data-role="end-sentinel" aria-hidden="true"></div>
+      <!--
+        读完提示：正文末尾的**流内块**（不是浮窗），初始 hidden，读完才显示。
+        必须在 #rewritten 之外（有测试在数 #rewritten .block），文字里保留「比原文短」与百分比。
+      -->
+      <div class="compression" data-role="compression" data-state="hidden" hidden></div>
+    </main>
+  </div>
+
+  <!-- 原文抽屉：右侧窄边，默认折叠；点开滑出并跟随当前段 -->
+  <aside class="drawer" data-role="drawer" data-state="collapsed" aria-label="原文抽屉">
+    <button class="drawer__rail" type="button" data-role="drawer-toggle" aria-expanded="false"
+      aria-controls="drawer-body" title="展开/收起原文">
+      <span class="drawer__rail-chevron" aria-hidden="true">‹</span>
+      <span class="drawer__rail-text">原文</span>
+    </button>
+    <div class="drawer__body" id="drawer-body" data-role="drawer-body">
+      <div class="drawer__head">
+        <span class="drawer__title">原文（底本）</span>
+        <span class="drawer__current" data-role="drawer-current">当前段 —</span>
+      </div>
+      <div class="drawer__list" data-role="drawer-list"></div>
+      <div class="drawer__empty" data-role="drawer-empty" hidden></div>
+    </div>
+  </aside>
+
+  <!-- 选片讲解浮条：选中文字后出现在选区旁（内容由 main.js 装配） -->
+  <div class="select-bar" data-role="select-bar" data-state="hidden" hidden
+    role="toolbar" aria-label="选中片段的讲解动作"></div>
+
+  <!-- 讲解卡片层 -->
+  <div class="card-layer" data-role="card-layer"></div>
+
+  <!--
+    读前背景问卷的宿主：卡片由 js/survey.js 造（项目里没有现成的模态组件，这是新建的一份）。
+    层本身 pointer-events: none —— 问卷打开时正文照常可滚可点，只有卡片自己收事件；
+    关闭时整层被移除，不留残影。
+  -->
+  <div id="survey-host" data-role="survey-host"></div>
+
+  <script>
+    // 就绪标志：无头验证只依赖它，不靠 sleep。
+    // 这段必须在模块之前同步执行，好让 ES 模块加载失败时也留下可读的 errors（而不是让测试干等超时）。
+    globalThis.__arDebug = {
+      ready: false,
+      jsLoaded: false,
+      mode: null,
+      sourceId: null,
+      docUrl: null,
+      errors: [],
+      fatal: null,
+      paragraphs: [],
+      rewrittenParagraphs: [],
+      unrewritten: [],
+      changes: {},
+      concepts: {},
+      drawerOpen: false,
+      currentParagraph: null,
+      cardOpen: false,
+      cards: [],
+      cardOpens: [],              // 卡片打开流水（不进行为流：§7.1 的白名单里没有这一类）
+      cardCloses: [],
+      lastCard: null,
+      compression: null,
+      degradations: [],
+      // 选片讲解 / 显示设置 / 会话缓存：无头验证断言这三块的状态
+      toolbarOpen: false,
+      selection: null,
+      settings: null,
+      settingsPanelOpen: false,
+      inkContrast: null,          // 正文栏实测对比度（手动组合读不清时 < 4.5）
+      inkContrastLow: false,
+      explainCache: null,
+      explainDeduped: 0,
+      pendingExplain: null,
+      profileSignal: '',          // 会话缓存键里的画像指纹（夹具模式为空串）
+      // 读前背景问卷（js/survey.js 写这些字段；无头验证只等 `surveyOpen` 这类显式状态）
+      survey: null,               // 本次打开问卷的元信息（题目 id / 打开原因 / 夹具）
+      surveyUrl: null,            // GET /api/survey 实际打到的地址
+      surveyQuestionSource: null, // 题目从哪来：api | fixture | fixture-response | api-fallback-fixture
+      surveyQuestionsRaw: [],     // 题目的 { qid, field } 清单（与提交体键集对齐用）
+      surveyFixtureResponse: null,// `?survey=fixture` 时读到的夹具响应体（版本 / 答案回填的来源）
+      surveyPhase: null,          // questions | done | followup（同一次问卷流程里的三个阶段）
+      surveyFollowup: null,       // POST /api/survey/followup 的响应体（模型追问 / 降级说明）
+      surveyFollowupQuestions: [],// 这次追问的问题清单（模型给的 q）
+      surveyOpen: false,
+      surveyState: 'closed',      // closed | open | submitting
+      surveyVisible: {},          // 题目显隐快照（条件题规则的可断言形态）
+      surveySeen: [],             // 这一次表单里实际渲染出来的题目块（含被条件藏起来的）
+      surveyAnswers: {},
+      surveyAnswerCount: 0,
+      surveyDegraded: [],         // 问卷相关的可见降级清单
+      surveyEvents: [],           // open / change / invalid / submit-request / submit-done / skip-done / close
+      surveyBootReason: null,     // 没弹问卷的原因：fixture-mode | already-answered | skipped-before | load-failed
+      // 状态面板（js/status.js 写这些字段；数据源是同源静态文件 /status.json）
+      statusOpen: false,
+      statusState: 'closed',      // closed | loading | ok | error | degraded
+      statusUrl: null,            // /status.json 实际打到的地址
+      statusPayload: null,        // 读到的报告（降级时为 null）
+      statusError: null,          // 报告用不了的原因（可读文案）
+      statusDegraded: [],         // 状态面板里出现过的降级清单
+      statusEvents: [],           // open / render / degrade / close
+      // 配图（js/figures.js 写这些字段；PLAN-actions-feedback §4.3）
+      figures: [],                // 本次渲染的图：{paragraph, kind, caption, state, reason, where, sourceChars}
+                                  //   state: pending | loading | ready | fallback | removed
+      figureScript: {             // mermaid 懒加载：不进首屏，注入上限 1 次
+        src: 'vendor/mermaid.min.js',
+        injected: 0,              // 真实注入 <script> 的次数（0 或 1）
+        state: 'idle',            // idle | loading | ready | failed
+        error: null,
+      },
+      // 「太啰嗦」当场压缩（js/main.js 写这些字段；§5.2）
+      compress: null,             // 最近一次点击的结果：{paragraph, state, ok, reason, text, url, hint?,
+                                  //   cached, model, artifactsUpdated, degraded?}
+                                  //   state: request | ok | degraded | error | fixture
+                                  //   ok 为真时 degraded 非空 = 后端有降级说明（那条行为事件没记上）：
+                                  //   正文照常刷新，另打一条 warn 横幅（kind: compress-degraded-notes）
+      compressEvents: [],         // compress-request / compress-done（可断言的流水）
+      // 行为埋点（js/events.js 写这些字段；§7.1/§7.2）
+      events: null,               // 快照：{buffered, sent, attempted, dropped, failed, kinds, flushes, records…}
+      eventsFlushIntervalMs: 15000,
+    };
+    globalThis.addEventListener('error', function (e) {
+      globalThis.__arDebug.errors.push({
+        kind: 'window-error',
+        message: String((e && e.message) || e),
+      });
+    });
+    globalThis.addEventListener('unhandledrejection', function (e) {
+      var r = e && e.reason;
+      globalThis.__arDebug.errors.push({
+        kind: 'unhandled-rejection',
+        message: String((r && r.message) || r),
+      });
+    });
+  </script>
+  <script type="module" src="js/main.js"></script>
+</body>
+
+</html>

@@ -17,6 +17,7 @@ from __future__ import annotations
 __all__ = [
     "ArError",
     "InputError",
+    "WriteError",
     "NotImplementedYet",
     "ValidationFailed",
     "ModelUnavailable",
@@ -45,6 +46,29 @@ class ArError(Exception):
 
 class InputError(ArError):
     """输入不可用：文件不存在、source_id 非法、JSON 无法解析等。"""
+
+    exit_code = EXIT_USAGE
+
+
+class WriteError(ArError):
+    """**写盘**失败：目标目录不可写、路径不合法等。
+
+    抛出点（2026-10-14 复核后**全部**写盘入口统一到这一条）：
+    ``ar.jsonio`` 的 ``write_text`` / ``write_json`` / ``write_bytes``（后者的用途是
+    ``ingest`` 的 ``source.md``）、``ar.profile.save_profile``（``profile.yaml``）、
+    ``ar.events.append_events``（``events.jsonl``，唯一一处非原子写）。
+
+    与 ``InputError`` 分开是有意的：它**不是**调用方的输入错误。CLI 上两者都是退出码 2
+    （「用法 / 输入错误」这一档：`--data-dir` / `--profiles-dir` 本来就是调用方给的），
+    但 HTTP 层不能把它当 400 回——`InputError` 的处理器会把消息伪装成「客户端给了坏输入」，
+    而这里坏的是**服务端跑在哪个目录上**（`ar.tools` 那条「抛 InputError 会被报成 400」
+    的教训同源）。所以它不注册专门的处理器，落进 Starlette 的兜底 → 500 + 可读消息
+    （2026-10-14 起 `POST /api/profile/rating` / `/api/profile/preference` 也在这条路上，
+    此前它们抛的是裸 ``PermissionError``）。
+
+    消息里必须点名**是哪个目录**不可写、**原始 errno** 是什么——2026-10-14 的真缺陷就是
+    「不报错、单核 100%、十几分钟不结束」，一句可读的错胜过任何重试。
+    """
 
     exit_code = EXIT_USAGE
 

@@ -3,7 +3,25 @@
   "model": "deepseek/deepseek-v4.1-flash",
   "temperature": 0.6,
   "timeout_s": 90,
-  "max_retries": 1,
   "max_tokens": null,
-  "api_key": ""
+  "api_key": "",
+  "retry": {
+    "_note": [
+      "retry 段可选：整段不写 = 用下面这份默认值（与 DSH 内置重试同一口径）。",
+      "mode：normal = 有界重试；always（无上限）本项目不实现，写了直接报错退出（码 2）。",
+      "maxRetries：默认 5，即最多 6 次尝试；0 = 只试一次（不重试）。",
+      "retryableCodes：白名单——只有列在这里的错误码才会重试。默认 5 个：EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT；AUTH / INVALID_REQUEST / QUOTA / NOT_CONFIGURED / UNKNOWN 默认不在白名单里，即默认永不重试（显式写进白名单才会重试）。",
+      "backoff：首次 500ms、每次翻倍、封顶 10000ms、每次 ±10% 抖动（退避序列 500/1000/2000/4000/8000/10000）；上游 Retry-After 在封顶内优先用它，超界则放弃重试。",
+      "下划线开头的键是注释，读配置时忽略，不进未知字段告警。",
+      "顶层 max_retries 已废弃：仍兼容读入并映射成 retry.maxRetries，同时打印一条废弃提示；两处都写时以 retry 段为准。"
+    ],
+    "mode": "normal",
+    "maxRetries": 5,
+    "retryableCodes": ["EMPTY_RESPONSE", "RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT"],
+    "backoff": {
+      "initialDelayMs": 500,
+      "maxDelayMs": 10000,
+      "jitterRatio": 0.1
+    }
+  }
 }

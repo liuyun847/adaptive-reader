@@ -2,11 +2,14 @@
  * 视图层：把数据造成 DOM。只负责「造」，不负责「什么时候造」——交互都在 main.js。
  *
  * 所有可断言的状态都落在 data-* 上（data-paragraph / data-action / data-current / data-state /
- * data-unrewritten），无头验证既断言文字也断言这些属性，避免只靠样式猜状态。
+ * data-unrewritten / data-repeats），无头验证既断言文字也断言这些属性，避免只靠样式猜状态。
  */
 
 import { renderInto } from './md.js';
-import { changeSummary, DEFERRED_NOTE } from './schema.js';
+import {
+  changeSummary, DEFERRED_NOTE, FACT_ANCHOR_POLICY_LABELS, factDeclarations, NO_PROFILE_REFS_LABEL,
+  PROFILE_REFS_FILLED_BADGE, PROFILE_REFS_FILLED_TIP,
+} from './schema.js';
 
 export const EXPLAIN_KINDS = [
   { kind: 'explain', label: '没懂' },
@@ -14,16 +17,23 @@ export const EXPLAIN_KINDS = [
   { kind: 'detail', label: '再详细点' },
 ];
 
-/** 主栏一个段落块：左侧动作标记 + 悬停说明，右侧正文。 */
-export function buildParagraphBlock({ paragraphId, text, change, unrewritten = false, sourceText = null }) {
+/**
+ * 「太啰嗦」标记的文案（DESIGN §5 的那一行：默认不显示，点一下触发**局部压缩**）。
+ * 它跟动作标记在同一个「段落标记区」（`.block__gutter`）里，悬停或键盘聚焦该段时出现。
+ */
+export const TOO_VERBOSE_LABEL = '太啰嗦';
+
+/** 主栏一个段落块：左侧动作标记 + 悬停说明（含「太啰嗦」入口），右侧正文。 */
+export function buildParagraphBlock({
+  paragraphId, text, change, unrewritten = false, sourceText = null, fidelity = null,
+}) {
   const block = document.createElement('div');
   block.className = 'block';
   block.id = `blk-${paragraphId}`;
   block.dataset.paragraph = paragraphId;
   block.dataset.unrewritten = String(Boolean(unrewritten));
 
-  // ---- 标记槽：动作 + 依据摘要
-  const summary = changeSummary(change);
+  // ---- 标记槽：动作标记 + 悬停说明 + 「太啰嗦」（都在 .block__gutter 里，悬停才现身）
   const gutter = document.createElement('div');
   gutter.className = 'block__gutter';
 
@@ -32,8 +42,7 @@ export function buildParagraphBlock({ paragraphId, text, change, unrewritten = f
   marker.className = 'marker';
   marker.dataset.role = 'marker';
   marker.dataset.paragraph = paragraphId;
-  marker.dataset.action = summary.action || 'none';
-  marker.setAttribute('aria-label', `段落 ${paragraphId} 的改写动作：${summary.label}；点击查看讲解`);
+  marker.dataset.action = 'none';
   gutter.appendChild(marker);
 
   const tip = document.createElement('div');
@@ -41,36 +50,20 @@ export function buildParagraphBlock({ paragraphId, text, change, unrewritten = f
   tip.dataset.role = 'tip';
   tip.dataset.paragraph = paragraphId;
   tip.setAttribute('role', 'tooltip');
-
-  const tipAction = document.createElement('span');
-  tipAction.className = 'tip__action';
-  tipAction.dataset.role = 'tip-action';
-  tipAction.textContent = summary.action ? `动作：${summary.label}` : summary.label;
-  tip.appendChild(tipAction);
-
-  const tipNote = document.createElement('span');
-  tipNote.className = 'tip__note';
-  tipNote.dataset.role = 'tip-note';
-  tipNote.textContent = summary.note;
-  tip.appendChild(tipNote);
-
-  if (summary.profile.length) {
-    const tipProfile = document.createElement('span');
-    tipProfile.className = 'tip__profile';
-    tipProfile.dataset.role = 'tip-profile';
-    tipProfile.textContent = `依据画像：${summary.profile.join('、')}`;
-    tip.appendChild(tipProfile);
-  }
-
-  if (summary.deferred) {
-    const tipDeferred = document.createElement('span');
-    tipDeferred.className = 'tip__deferred';
-    tipDeferred.dataset.role = 'tip-deferred';
-    tipDeferred.textContent = `（${DEFERRED_NOTE}）`;
-    tip.appendChild(tipDeferred);
-  }
-
   gutter.appendChild(tip);
+
+  // 「太啰嗦」：不在动作标记里（那个是「看为什么」），它是「当场把这段压短」的动作入口。
+  // 放在同一个标记槽里，靠 CSS 由悬停 / 键盘聚焦驱动显隐（默认不显示，见 reader.css）。
+  const verbose = document.createElement('button');
+  verbose.type = 'button';
+  verbose.className = 'gutter-action';
+  verbose.dataset.role = 'too-verbose';
+  verbose.dataset.paragraph = paragraphId;
+  verbose.dataset.state = 'idle';
+  verbose.textContent = TOO_VERBOSE_LABEL;
+  verbose.setAttribute('aria-label', `段落 ${paragraphId} 写得太啰嗦：点一下当场压缩这一段，正文会刷新`);
+  gutter.appendChild(verbose);
+
   block.appendChild(gutter);
 
   // ---- 正文
@@ -92,7 +85,130 @@ export function buildParagraphBlock({ paragraphId, text, change, unrewritten = f
   }
 
   block.appendChild(body);
+  applyChangeToBlock(block, change, { fidelity });
   return block;
+}
+
+/**
+ * 把变更记录写进块上的标记槽（动作 + 依据摘要 + `deferred` 说明 + 事实锚申报）。
+ *
+ * 单独一个函数是为了**压缩之后能就地刷新**：`applyCompressed()` 改了这一段之后要重画
+ * 动作标记与悬停文案（`web/js/main.js` 的「太啰嗦」那条链路会再调一次）。
+ *
+ * @returns {ReturnType<typeof changeSummary>} 这次算出来的摘要（调用方可直接用）
+ */
+export function applyChangeToBlock(block, change, { fidelity = null } = {}) {
+  const paragraphId = block.dataset.paragraph;
+  const summary = changeSummary(change);
+  const declaration = factDeclarations(change, fidelity);
+
+  const marker = block.querySelector('[data-role="marker"]');
+  if (marker) {
+    marker.dataset.action = summary.action || 'none';
+    marker.dataset.declared = String(declaration.total > 0);
+    // 兜底补齐（2026-10-14）：可断言的结构化标记（页面徽标与悬停行都只认它，不猜 why.note）
+    marker.dataset.profileFilled = String(summary.profileFilled);
+    marker.setAttribute('aria-label', `段落 ${paragraphId} 的改写动作：${summary.label}；点击查看讲解`);
+  }
+
+  const tip = block.querySelector('[data-role="tip"]');
+  if (tip) {
+    tip.textContent = '';
+
+    const tipAction = document.createElement('span');
+    tipAction.className = 'tip__action';
+    tipAction.dataset.role = 'tip-action';
+    tipAction.textContent = summary.action ? `动作：${summary.label}` : summary.label;
+    tip.appendChild(tipAction);
+
+    const tipNote = document.createElement('span');
+    tipNote.className = 'tip__note';
+    tipNote.dataset.role = 'tip-note';
+    tipNote.textContent = summary.note;
+    tip.appendChild(tipNote);
+
+    if (summary.profile.length) {
+      const tipProfile = document.createElement('span');
+      tipProfile.className = 'tip__profile';
+      tipProfile.dataset.role = 'tip-profile';
+      tipProfile.dataset.empty = 'false';
+      tipProfile.textContent = `依据画像：${summary.profile.join('、')}`;
+      tip.appendChild(tipProfile);
+    } else {
+      // 空数组也要说出来（2026-10-14）：什么都不显示会被读成「没有画像」——那是另一回事
+      // （读者可能填了背景问卷，背景依据按契约只写在 why.note 里）。文案只说「无自评引用」。
+      const tipProfile = document.createElement('span');
+      tipProfile.className = 'tip__profile';
+      tipProfile.dataset.role = 'tip-profile';
+      tipProfile.dataset.empty = 'true';
+      tipProfile.textContent = NO_PROFILE_REFS_LABEL;
+      tip.appendChild(tipProfile);
+    }
+
+    if (summary.profileFilled) {
+      // 兜底补齐的出处（2026-10-14）：这一段的 why.profile 不是模型给的，是骨架照读者自己的自评
+      // 补的。判据是产物里的 **结构化字段** `changes[i].profile_refs_filled`，不是 why.note 的文案。
+      tip.querySelector('[data-role="tip-profile"]').dataset.filled = 'true';
+      const tipFilled = document.createElement('span');
+      tipFilled.className = 'tip__filled';
+      tipFilled.dataset.role = 'tip-profile-filled';
+      tipFilled.textContent = PROFILE_REFS_FILLED_TIP;
+      tip.appendChild(tipFilled);
+    }
+
+    if (declaration.total > 0) {
+      // 事实锚申报（§14.1）：悬停就能看见「这一段放弃了哪几项锚点」，不必点开卡片。
+      // 三种结论都要说得出：已放行 / 未放行 / **多申报**（锚点一个没少却申报放弃了它）
+      const tipDeclared = document.createElement('span');
+      tipDeclared.className = 'tip__declared';
+      tipDeclared.dataset.role = 'tip-declared';
+      tipDeclared.dataset.waived = String(declaration.waived);
+      tipDeclared.dataset.overDeclared = String(declaration.overDeclared);
+      const verdict = declaration.waived
+        ? '（已按读者口径放行）'
+        : (declaration.overDeclared ? '（多申报：本段一个都没少）' : '（未放行：口径不允许）');
+      tipDeclared.textContent =
+        `事实锚申报：${declaration.items.map((item) => `${item.label}「${item.text}」`).join('、')}${verdict}`;
+      tip.appendChild(tipDeclared);
+    }
+
+    if (summary.deferred) {
+      const tipDeferred = document.createElement('span');
+      tipDeferred.className = 'tip__deferred';
+      tipDeferred.dataset.role = 'tip-deferred';
+      tipDeferred.textContent = `（${DEFERRED_NOTE}）`;
+      tip.appendChild(tipDeferred);
+    }
+  }
+  return summary;
+}
+
+/**
+ * 换掉一个段落的正文（「太啰嗦」压缩成功之后刷新用）。
+ * 走 `md.js` 的同一套渲染（压缩后的正文还是 Markdown），并摘掉可能有的「未改写」徽标。
+ */
+export function setBlockText(block, text) {
+  const body = block.querySelector('[data-role="block-text"]');
+  if (!body) return null;
+  body.textContent = '';
+  renderInto(body, text);
+  const tag = body.querySelector('[data-role="unrewritten-tag"]');
+  if (tag) tag.remove();
+  block.dataset.unrewritten = 'false';
+  return body;
+}
+
+/**
+ * 「太啰嗦」标记的状态：`idle`（可点）/ `pending`（正在压）/ `done`（这一段已压缩）/ `error`（可重试）。
+ * 文案默认回 `TOO_VERBOSE_LABEL`；`done` 之后写「已压缩」，避免同一段重复付费。
+ */
+export function setGutterAction(block, state, label = null) {
+  const btn = block.querySelector('[data-role="too-verbose"]');
+  if (!btn) return null;
+  btn.dataset.state = state;
+  btn.textContent = label || TOO_VERBOSE_LABEL;
+  btn.disabled = state === 'pending' || state === 'done';
+  return btn;
 }
 
 /** 抽屉里的一条原文。 */
@@ -246,7 +362,7 @@ function section(label, valueNode) {
  * 片段模式下卡片头标明「选中片段 + 段号 + 片段预览」，并**隐藏事实锚 chips**
  * （事实锚是整段口径，对片段会误导）；概念 chips 照常显示。
  */
-export function fillCard(card, { paragraphId, change, conceptsById, selection = null }) {
+export function fillCard(card, { paragraphId, change, conceptsById, selection = null, fidelity = null }) {
   const summary = changeSummary(change);
   card.dataset.paragraph = paragraphId;
   card.querySelector('[data-role="card-paragraph"]').textContent = paragraphId;
@@ -289,18 +405,9 @@ export function fillCard(card, { paragraphId, change, conceptsById, selection = 
   why.textContent = summary.note;
   body.appendChild(why);
 
-  if (summary.profile.length) {
-    const chips = document.createElement('div');
-    chips.className = 'card__chips';
-    summary.profile.forEach((item) => {
-      const chip = document.createElement('span');
-      chip.className = 'chip';
-      chip.dataset.role = 'card-profile-chip';
-      chip.textContent = item;
-      chips.appendChild(chip);
-    });
-    body.appendChild(section('依据画像', chips));
-  }
+  // 「依据画像」那一块交给 buildCardProfileSection（同一段代码要给压缩后的就地刷新复用，
+  // 见 renderCardProfile）：这里 body 刚清空，所以插进去就是它该在的位置。
+  body.appendChild(buildCardProfileSection(change));
 
   if (summary.confidence != null) {
     const conf = document.createElement('span');
@@ -356,12 +463,167 @@ export function fillCard(card, { paragraphId, change, conceptsById, selection = 
     body.appendChild(section('事实锚（须与原文一致）', chips));
   }
 
+  // 事实锚申报（§14.1）：这一段**没有原样保留**哪几项事实锚，以及按读者口径放行了没有。
+  // 不申报时这一块整段不出现（键不出现 == 没有申报）；结构读不通就明说「申报读不出来」，不静默。
+  // 片段模式下同样不显示：申报与事实锚一样是**整段口径**（对片段会误导）。
+  renderCardDeclaration(card, change, fidelity);
+
   card.querySelectorAll('[data-role="explain"]').forEach((btn) => {
     btn.dataset.paragraph = paragraphId;
   });
 
   setCardStatus(card, 'empty', '');
   card.querySelector('[data-role="card-answer"]').textContent = '';
+}
+
+/**
+ * 造卡片里「依据画像」那一节（引用 chips + 空的说明 + 兜底补齐徽标）。
+ *
+ * 判据全部来自产物：`why.profile` 为空时写 `NO_PROFILE_REFS_LABEL`（不显示会被读成「画像为空」），
+ * 兜底补齐那枚徽标只认结构化字段 `changes[i].profile_refs_filled`（`changeSummary` 里的
+ * `profileFilled`），**不许拿正则去猜 `why.note` 的文案**。
+ */
+function buildCardProfileSection(change) {
+  const summary = changeSummary(change);
+  if (summary.profile.length || summary.profileFilled) {
+    const chips = document.createElement('div');
+    chips.className = 'card__chips';
+    summary.profile.forEach((item) => {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.dataset.role = 'card-profile-chip';
+      chip.textContent = item;
+      chips.appendChild(chip);
+    });
+    if (summary.profileFilled) {
+      // 可见标记（2026-10-14）：这些引用**不是模型给的**，是骨架照读者自己的自评补的——
+      // 读者据此知道「这条依据的出处要核对」，判据是 changes[i].profile_refs_filled。
+      const badge = document.createElement('span');
+      badge.className = 'chip chip--filled';
+      badge.dataset.role = 'card-profile-filled';
+      badge.textContent = PROFILE_REFS_FILLED_BADGE;
+      chips.appendChild(badge);
+    }
+    return markProfileSection(section('依据画像', chips));
+  }
+  // 空数组也要显式说明（与悬停那一行同一句文案）：不显示会被读成「画像为空」，
+  // 而「读者没提供概念自评」与「没有画像」是两件事（背景依据只写在 why.note 里）。
+  const none = document.createElement('div');
+  none.className = 'card__profile-empty';
+  none.dataset.role = 'card-profile-empty';
+  none.textContent = NO_PROFILE_REFS_LABEL;
+  return markProfileSection(section('依据画像', none));
+}
+
+/** 给「依据画像」那一节盖个可定位的戳，供 `renderCardProfile` 就地换掉它。 */
+function markProfileSection(wrap) {
+  wrap.dataset.role = 'card-profile-section';
+  return wrap;
+}
+
+/**
+ * 渲染（或就地重画）卡片里「依据画像」那一块（2026-10-14）。
+ *
+ * 单独一个函数是为了**压缩之后能就地刷新**：在线压缩会把这一段在产物里的 `why.profile` 清空
+ * （`why.note` 换成压缩说明），本段原来那份 `profile_refs_filled` 标记随之在本段产物上消失——
+ * 页面若沿用压前那一份，就会出现「产物里已经没有标记、卡片上还挂着『骨架兜底补齐』徽标」。
+ * 与 `renderCardDeclaration` 同一条纪律：**只认产物字段**，不猜 `why.note` 的文案。
+ *
+ * 位置纪律：有过旧的就**原地换掉**（不是追加到卡片末尾），免得压缩后卡片的段落顺序变样。
+ *
+ * @returns {HTMLElement|null} 新插入的那一节（拿不到 `card-body` 时是 null）
+ */
+export function renderCardProfile(card, change) {
+  const body = card.querySelector('[data-role="card-body"]');
+  if (!body) return null;
+  const fresh = buildCardProfileSection(change);
+  const stale = body.querySelector('[data-role="card-profile-section"]');
+  if (stale) {
+    stale.replaceWith(fresh);
+  } else {
+    body.appendChild(fresh);
+  }
+  return fresh;
+}
+
+/**
+ * 渲染（或摘掉）卡片里「本段申报（事实锚）」那一块（§14.1）。
+ *
+ * 单独一个函数是为了**压缩之后能就地刷新**：在线压缩（`POST /api/compress` → `compress-v2`）
+ * 现在也可能带回一份申报与放行结论，`web/js/main.js` 那条链路压完要重画这一块
+ * （此前是「压缩后一律摘掉」，因为那时压缩路径没有申报通道）。
+ *
+ * 三条口径：
+ * 1. **键不出现 == 没有申报**：整块不出现，不写「本段没有申报」这种空话；
+ * 2. **片段模式不显示**：申报是整段口径（`card.dataset.scope === 'selection'` 时直接摘掉）；
+ * 3. **结构读不通不静默**：`fact_declarations` 不是对象 / 里面没有可读条目时写明「申报读不出来」。
+ *
+ * @returns {HTMLElement|null} 新插入的那一节（没插任何东西时是 null）
+ */
+export function renderCardDeclaration(card, change, fidelity = null) {
+  const body = card.querySelector('[data-role="card-body"]');
+  if (!body) return null;
+  // 先摘掉旧的那一节（含它里面的「模型说明」行）：压缩后重画时不能留一份过期申报
+  body.querySelectorAll('[data-role="card-declaration"]').forEach((row) => {
+    const wrapper = row.closest('.card__section') || row;
+    wrapper.remove();
+  });
+  if (card.dataset.scope === 'selection') return null;
+
+  const declaration = factDeclarations(change, fidelity);
+  if (!(declaration.total > 0 || declaration.invalid)) return null;
+
+  const chips = document.createElement('div');
+  chips.className = 'card__chips';
+  chips.dataset.role = 'card-declaration';
+  if (declaration.items.length) {
+    declaration.items.forEach((item) => {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.dataset.role = 'card-declaration-item';
+      chip.dataset.field = item.field;
+      chip.textContent = `${item.label}「${item.text}」`;
+      chips.appendChild(chip);
+    });
+  } else {
+    const broken = document.createElement('span');
+    broken.className = 'chip';
+    broken.dataset.role = 'card-declaration-broken';
+    broken.textContent = '申报读不出来（结构不对）';
+    chips.appendChild(broken);
+  }
+  if (declaration.waived) {
+    const badge = document.createElement('span');
+    badge.className = 'chip chip--waived';
+    badge.dataset.role = 'card-declaration-waived';
+    const label = FACT_ANCHOR_POLICY_LABELS[declaration.policy] || declaration.policy;
+    badge.textContent = `已按读者口径放行${label ? `（${label}）` : ''}`;
+    chips.appendChild(badge);
+  } else if (declaration.overDeclared) {
+    // 多申报（2026-10-14 收尾）：锚点一个没少却申报「放弃了某项」——**不是违规**（没有缺失可放行），
+    // 但也不能说成「未放行：口径不允许」（那句会让人以为真丢了锚点）。用提示色单独说清。
+    const badge = document.createElement('span');
+    badge.className = 'chip chip--waived';
+    badge.dataset.role = 'card-declaration-over';
+    badge.textContent = '本段一个锚点都没少：模型多申报了（不影响校验结论）';
+    chips.appendChild(badge);
+  } else if (declaration.items.length) {
+    const badge = document.createElement('span');
+    badge.className = 'chip chip--blocked';
+    badge.dataset.role = 'card-declaration-blocked';
+    badge.textContent = '未放行：当前口径不允许丢掉事实锚';
+    chips.appendChild(badge);
+  }
+  const wrap = section('本段申报（事实锚）', chips);
+  if (declaration.note) {
+    const note = document.createElement('div');
+    note.className = 'card__label';
+    note.dataset.role = 'card-declaration-note';
+    note.textContent = `模型说明：${declaration.note}`;
+    wrap.appendChild(note);
+  }
+  body.appendChild(wrap);
+  return wrap;
 }
 
 /** 卡片状态区。state ∈ empty|loading|ok|degraded|error，非 empty 时必有可见文字。 */
@@ -433,14 +695,118 @@ export function repositionCard(card, anchor) {
   else layoutCardFixed(card);
 }
 
-/** 页头/横幅：任何降级都要在这里留下可见文字。 */
+/* --------------------------------------------------- 横幅（页头降级提示） */
+
+/**
+ * 成功类横幅的自动消失时长（毫秒）。
+ *
+ * 取 8 秒的理由：它要说的只是「刚做的事成了」（如「背景已保存」），没有待办；
+ * 中文一眼扫完一行约 2–3 秒，8 秒给了「正在看别处」的读者三倍余量，
+ * 而短于 5 秒会让人来不及看清写了什么，长于 10 秒就变成新的视觉噪音。
+ * 改这个数只改这一处：`web/README.md` 的「降级纪律」与
+ * `tests/web/test_banner_lifecycle.py` 的 `AUTO_DISMISS_MS` 都按它对齐。
+ */
+export const BANNER_AUTO_DISMISS_MS = 8000;
+
+/**
+ * 会自动消失的横幅状态：只有「做成了」这一类。
+ *
+ * `warn` / `error` 是**降级与失败**——`web/README.md` 的「降级纪律（DESIGN §6）」要求它们可见，
+ * 自己消失等于把降级藏起来，所以它们只能被读者手动关掉（`×`）。
+ */
+const BANNER_AUTO_DISMISS_STATES = new Set(['info', 'ok']);
+
+/** 每条横幅的自动消失定时器（关闭 / 移除时清掉，别让定时器抓着已经不在页面上的元素）。 */
+const bannerTimers = new WeakMap();
+
+/** 容器里同文本的那一条；只在**还在页面上**的横幅里找——关掉之后再出现算新的一条。 */
+function findBannerByText(container, message) {
+  const list = container.querySelectorAll('[data-role="banner"]');
+  for (const el of list) {
+    if ((el.dataset.text || '') === message) return el;
+  }
+  return null;
+}
+
+/** 移掉一条横幅：清定时器 + 摘 DOM（`×` 与自动消失走同一条路）。 */
+function removeBanner(el) {
+  const timer = bannerTimers.get(el);
+  if (timer) {
+    clearTimeout(timer);
+    bannerTimers.delete(el);
+  }
+  if (el.parentNode) el.parentNode.removeChild(el);
+}
+
+/** 成功类横幅排一次自动消失；同一文本重复触发时从**最后一次**出现重新计时。 */
+function scheduleAutoDismiss(el) {
+  const timer = bannerTimers.get(el);
+  if (timer) clearTimeout(timer);
+  bannerTimers.set(el, setTimeout(() => removeBanner(el), BANNER_AUTO_DISMISS_MS));
+}
+
+/**
+ * 页头/横幅：任何降级都要在这里留下可见文字。
+ *
+ * 三条显示层纪律（2026-10-09 修「横幅不消失、还会重复堆叠」）：
+ *   - **同文本只留一条**：同内容再来时只把 `data-repeats` 加一、可读地写「已出现 N 次」，
+ *     不再叠一条（重复触发照样各记一条 `__arDebug.degradations`——去重属显示层，不是记录层）；
+ *   - **每条都能手动关**：`×` 按钮，鼠标与键盘等价（原生 button：Enter/Space 即点），
+ *     关掉一条不动别的；
+ *   - **成功类自动消失**：`info` / `ok` 到 `BANNER_AUTO_DISMISS_MS` 自己走；
+ *     `warn` / `error`（降级 / 失败）永不自动消失，只能手动关。
+ *
+ * 本函数只碰 DOM：不读不写 `__arDebug`，也不改变调用方的任何语义。
+ */
 export function addBanner(container, text, state = 'warn') {
+  if (!container) return null;
+  const message = String(text == null ? '' : text);
+
+  const existing = findBannerByText(container, message);
+  if (existing) {
+    const repeats = Number(existing.dataset.repeats || '1') + 1;
+    existing.dataset.repeats = String(repeats);
+    const counter = existing.querySelector('[data-role="banner-repeat"]');
+    if (counter) {
+      counter.textContent = `（同一提示已出现 ${repeats} 次）`;
+      counter.hidden = false;
+    }
+    if (BANNER_AUTO_DISMISS_STATES.has(existing.dataset.state)) scheduleAutoDismiss(existing);
+    return existing;
+  }
+
   const el = document.createElement('div');
   el.className = 'banner';
   el.dataset.role = 'banner';
   el.dataset.state = state;
-  el.textContent = text;
+  el.dataset.text = message;   // 去重比的是这一条（textContent 里还有 `×` 与重复计数）
+  el.dataset.repeats = '1';
+
+  const body = document.createElement('span');
+  body.className = 'banner__text';
+  body.textContent = message;
+  el.appendChild(body);
+
+  const counter = document.createElement('span');
+  counter.className = 'banner__repeat';
+  counter.dataset.role = 'banner-repeat';
+  counter.hidden = true;
+  el.appendChild(counter);
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'banner__close';
+  close.dataset.role = 'banner-close';
+  close.setAttribute('aria-label', '关闭这条提示');
+  close.textContent = '×';
+  close.addEventListener('click', (event) => {
+    event.stopPropagation();
+    removeBanner(el);
+  });
+  el.appendChild(close);
+
   container.appendChild(el);
+  if (BANNER_AUTO_DISMISS_STATES.has(state)) scheduleAutoDismiss(el);
   return el;
 }
 

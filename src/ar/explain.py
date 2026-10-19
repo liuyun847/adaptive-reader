@@ -15,6 +15,10 @@
 **token 账**：成功调用时把原始 ``usage`` 原样带进 ``ExplainOutcome.usage``，HTTP 层以追加字段
 ``usage`` 暴露（含前缀缓存命中 ``prompt_tokens_details.cached_tokens``）——讲解每次都要真金白银，
 命中量必须看得见。``usage`` 里不含密钥、不含正文。
+
+**重试账**：``ExplainOutcome.attempts``（追加字段）是这次调用的逐次尝试账，HTTP 层以追加字段
+``attempts`` 在**成功与降级响应里都给**。讲解不落盘，这是它唯一能被看见的地方——重试花了几次
+必须在页面上留痕（结构 = 产物里的 ``meta.attempts``，见 ``ar.llm.attempt_records``）。
 """
 
 from __future__ import annotations
@@ -24,8 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import tools
 from .cache import ExplainCache, explain_cache_key
-from .errors import ModelUnavailable
 from .ingest import normalize_text
 from .jsonio import read_json_if_exists
 from .paths import DEFAULT_READER, doc_dir
@@ -36,7 +40,6 @@ from .prompts import (
     EXPLAIN_PROMPT_VERSION,
     SELECTION_MAX_CHARS,
     SELECTION_SOURCES,
-    build_explain_messages,
 )
 
 __all__ = [
@@ -104,6 +107,10 @@ class ExplainOutcome:
     cached: bool = False
     selection_truncated: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
+    #: 追加字段：这次调用的逐次尝试账（结构 = 产物里的 ``meta.attempts``）。
+    #: 没发请求时是空数组（未配置 / 缓存命中 / 材料或段落不存在），所以 ``[]`` 与「试了但都失败」
+    #: 分得开；HTTP 层把它作为 ``/api/explain`` 的追加响应字段 ``attempts`` 透出去。
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def find_paragraph(meta: dict[str, Any], paragraph_id: str) -> dict[str, Any] | None:
@@ -113,20 +120,25 @@ def find_paragraph(meta: dict[str, Any], paragraph_id: str) -> dict[str, Any] | 
     return None
 
 
-def _neighbors(meta: dict[str, Any], paragraph: dict[str, Any], span: int = 1) -> list[tuple[str, str]]:
+def _neighbor_params(meta: dict[str, Any], paragraph: dict[str, Any], span: int = 1) -> dict[str, str]:
+    """相邻段的正文与段 id（提示词里邻段行是 ``[段id] 正文``）。
+
+    缺哪一侧就不给哪一侧的键——与旧实现「只把确实存在的邻段拼进提示词」逐字一致；
+    文本由工具层的模板截到 200 字符（与迁移前同一处截断）。
+    """
     paragraphs = [p for p in (meta.get("paragraphs") or []) if isinstance(p, dict)]
     try:
         index = paragraphs.index(paragraph)
     except ValueError:
-        return []
-    picked: list[tuple[str, str]] = []
-    for offset in range(-span, span + 1):
-        if offset == 0:
-            continue
+        return {}
+    params: dict[str, str] = {}
+    for key, offset in (("prev", -span), ("next", span)):
         position = index + offset
         if 0 <= position < len(paragraphs):
-            picked.append((str(paragraphs[position].get("id")), str(paragraphs[position].get("text") or "")))
-    return picked
+            neighbor = paragraphs[position]
+            params[key] = str(neighbor.get("text") or "")
+            params[f"{key}_id"] = str(neighbor.get("id"))
+    return params
 
 
 async def aexplain(
@@ -148,6 +160,9 @@ async def aexplain(
     （``rewritten`` / ``source``）只影响提示词里对片段来源的标注，非法取值退回默认值——
     HTTP 层已经先做过一次严格校验（400）。
     ``cache`` 非空时优先查缓存（只缓存成功结果）。
+
+    模型调用经工具层 ``explain_paragraph``（拼提示词 / 重试 / 记账都在那边），并且**丢到线程里**跑：
+    工具的 ``execute`` 是同步入口（内部 ``asyncio.run``），在 HTTP 的事件循环里直接调会嵌套报错。
     """
     if kind not in EXPLAIN_KINDS:
         kind = "explain"
@@ -202,15 +217,16 @@ async def aexplain(
             )
 
     profile, _notes = load_profile(profiles_dir, reader)
-    messages = build_explain_messages(
-        kind=kind,
-        paragraph_id=paragraph_id,
-        paragraph_text=str(paragraph.get("text") or ""),
-        neighbors=_neighbors(meta, paragraph),
-        profile_hint=profile_hint(profile),
-        selection=prepared.text,
-        selection_from=selection_from,
-    )
+    params: dict[str, Any] = {
+        "paragraph": paragraph_id,
+        "kind": kind,
+        "text": str(paragraph.get("text") or ""),
+        "selection": prepared.text,
+        "selection_from": selection_from,
+        # 空画像时 profile_hint 是 None；工具入参按契约要字符串，空串与 None 在模板里同一条分支
+        "profile_hint": str(profile_hint(profile) or ""),
+        **_neighbor_params(meta, paragraph),
+    }
 
     if client is None or not getattr(client, "configured", False):
         return ExplainOutcome(
@@ -220,18 +236,31 @@ async def aexplain(
             scope=prepared.scope,
             selection_truncated=prepared.truncated,
         )
-    try:
-        reply = await client.achat(messages, max_tokens=None)
-    except ModelUnavailable as exc:
+    # 工具层 ``execute`` 是**同步**的（内部走 ``ar.llm.call`` = ``asyncio.run``）：
+    # 本函数跑在 HTTP 的事件循环里，直接调用会让 ``asyncio.run`` 嵌套报错，必须丢到线程里跑。
+    run = await asyncio.to_thread(tools.run_tool, "explain_paragraph", params, client=client)
+    if not run.ok:
+        message = run.failure_message()
+        if run.model_replied:
+            # HTTP 通了、正文却是空的（网关把空回复当成功回）：与迁移前同一条降级
+            return ExplainOutcome(
+                text="模型返回了空内容，未生成讲解。",
+                degraded=True,
+                reason="empty_reply",
+                scope=prepared.scope,
+                selection_truncated=prepared.truncated,
+                attempts=run.attempt_records,
+            )
         return ExplainOutcome(
-            text=f"模型调用失败，未能生成讲解：{exc}",
+            text=f"未能生成讲解：{message}",
             degraded=True,
             reason="model_error",
             scope=prepared.scope,
             selection_truncated=prepared.truncated,
+            attempts=run.attempt_records,
         )
-    text = (getattr(reply, "text", "") or "").strip()
-    usage = getattr(reply, "usage", None)
+    data = run.data if isinstance(run.data, dict) else {}
+    text = str(data.get("text") or "")
     if not text:
         return ExplainOutcome(
             text="模型返回了空内容，未生成讲解。",
@@ -239,14 +268,16 @@ async def aexplain(
             reason="empty_reply",
             scope=prepared.scope,
             selection_truncated=prepared.truncated,
+            attempts=run.attempt_records,
         )
     outcome = ExplainOutcome(
         text=text,
         degraded=False,
-        model=getattr(reply, "model", None),
+        model=run.model,
         scope=prepared.scope,
         selection_truncated=prepared.truncated,
-        usage=dict(usage) if isinstance(usage, dict) else {},
+        usage=dict(run.usage or {}),
+        attempts=run.attempt_records,
     )
     if cache is not None and key is not None:
         # 只缓存成功结果：上面每条降级路径都在 return 里走掉了，进不到这里来

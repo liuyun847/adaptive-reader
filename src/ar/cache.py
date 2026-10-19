@@ -1,8 +1,13 @@
-"""讲解缓存的进程内 LRU（**只缓存成功结果**）。
+"""讲解 / 在线压缩共用的进程内 LRU（**只缓存成功结果**）。
 
 缓存键（契约见 README §4）：
 
     (source_id, paragraph, kind, 规范化后的 selection, 画像指纹)
+
+``kind`` 一格把两类结果分开：讲解是 ``explain`` / ``simpler`` / ``detail``，
+在线压缩（PLAN-actions-feedback §5.2）是 :data:`COMPRESS_KIND` = ``compress``
+（``selection`` 一格固定空串——压缩永远以整段为单位），两边不可能撞键。
+键的组装分别由 :func:`explain_cache_key` 与 :func:`compress_cache_key` 负责。
 
 三条纪律：
 
@@ -11,6 +16,10 @@
   ``(路径, 字节数, mtime_ns)``——自评写回（``POST /api/profile/rating``）或手改
   ``overrides`` 都会换指纹，旧条目再也不会被取到；
 - **只缓存成功结果**（``degraded: false``）：失败与降级一律不进缓存，下一次请求照常重试。
+
+⚠ 指纹只看画像，**不看产物**：用 ``ar rewrite`` 整篇重跑过之后，压缩缓存里的旧条目
+仍然会被命中（文本是上一次压缩的产出）。所以命中响应里的 ``artifacts_updated`` 是
+``false``（这一次没有写盘、也不声称产物与缓存一致），要复核就跑 ``ar check``。
 
 线程安全：uvicorn 的线程池可能并发打同一个键，读写都走同一把 ``threading.Lock``。
 """
@@ -24,10 +33,21 @@ from typing import Any
 
 from .paths import DEFAULT_READER, profile_path
 
-__all__ = ["DEFAULT_CAPACITY", "CacheKey", "ExplainCache", "profile_fingerprint", "explain_cache_key"]
+__all__ = [
+    "DEFAULT_CAPACITY",
+    "COMPRESS_KIND",
+    "CacheKey",
+    "ExplainCache",
+    "profile_fingerprint",
+    "explain_cache_key",
+    "compress_cache_key",
+]
 
 # 契约容量：128 条（每条一次真实模型调用的产出，够一次阅读会话用）
 DEFAULT_CAPACITY = 128
+
+#: 在线压缩在缓存键 ``kind`` 一格的取值（与讲解的 explain / simpler / detail 区分开）
+COMPRESS_KIND = "compress"
 
 # 画像指纹：(profile.yaml 路径, 字节数, mtime_ns)；文件不在时后两项为 -1。
 ProfileFingerprint = tuple[str, int, int]
@@ -63,6 +83,22 @@ def explain_cache_key(
     这一段文字，超出 600 字符的部分本来就不进提示词，拿它当键的一部分只会白白降低命中率。
     """
     return (source_id, paragraph_id, kind, selection, profile_fingerprint(profiles_dir, reader))
+
+
+def compress_cache_key(
+    *,
+    source_id: str,
+    paragraph_id: str,
+    profiles_dir: Path | str,
+    reader: str = DEFAULT_READER,
+) -> CacheKey:
+    """组装**在线压缩**的缓存键（契约 §5.2）：``(source_id, paragraph, "compress", "", 画像指纹)``。
+
+    用满 5 格是为了与讲解共用同一个 :class:`ExplainCache`（它只认键、不认业务）：
+    ``kind`` 一格是 ``compress``、``selection`` 一格固定空串（压缩永远是整段），
+    与讲解的三种 kind 不可能撞键。重复点同一段 → 命中缓存、不再发请求。
+    """
+    return (source_id, paragraph_id, COMPRESS_KIND, "", profile_fingerprint(profiles_dir, reader))
 
 
 class ExplainCache:

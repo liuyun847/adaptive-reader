@@ -7,14 +7,16 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from ar.errors import EXIT_MODEL, EXIT_OK, EXIT_VALIDATION, EXIT_USAGE
+from ar.errors import EXIT_MODEL, EXIT_OK, EXIT_VALIDATION, EXIT_USAGE, WriteError
 from ar.ingest import (
     anchor_diff_warnings,
     ingest,
@@ -81,6 +83,83 @@ def test_ingest_writes_verbatim_source_and_meta(sample_md: Path, dirs: SimpleNam
         assert set(entry) == {"id", "index", "text", "text_hash"}  # DESIGN §4.1 的字段，逐字不改名
         assert entry["text_hash"] == text_hash(entry["text"])
     assert result.warnings == []
+
+
+def test_ingest_source_md_goes_through_the_shared_atomic_path(
+    sample_md: Path, dirs: SimpleNamespace
+) -> None:
+    """`source.md` 走 `ar.jsonio.write_bytes`（全项目唯一一份写盘实现）：逐字节 + 不留临时文件。
+
+    2026-10-14 复核补漏前，这里是本模块自己的 `tempfile.mkstemp` 循环（`_write_bytes`），
+    与 `jsonio` 那套「有界重试 + 坏路径快速失败」是两份逻辑——本用例钉住「只剩一份」：
+    临时文件命名 / 清理口径与 `ar.jsonio` 完全一致（`.tmp-*` 前缀），跑完目录里一个不剩。
+    """
+    target = dirs.data / "sample"
+    ingest(sample_md, "sample", dirs.data)
+
+    assert (target / "source.md").read_bytes() == sample_md.read_bytes()
+    assert (target / "source.meta.json").is_file()
+    leftovers = [p.name for p in target.iterdir() if p.name.startswith(".tmp-")]
+    assert leftovers == [], f"原子写不许留下候选临时文件：{leftovers}"
+
+
+def test_ingest_unwritable_dir_fails_fast_with_one_attempt_and_writes_no_meta(
+    sample_md: Path, dirs: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**坏目录快速失败**（2026-10-14 复核揪出的第二个漏网入口）：一次就失败、两份产物都不落。
+
+    打桩打在「系统在写的那一刻拒绝」这个真实失败点上（只拦目标目录里的候选临时文件，
+    其余路径转交真的 `os.open`），并**数尝试次数**——旧写法在真不可写目录上实测 1 秒里
+    试了 5000 多个候选名仍在循环（`tempfile.TMP_MAX = 2147483647`，近似无界）。
+    """
+    target = dirs.data / "sample"
+    target.mkdir(parents=True)  # 先备好产物目录（模拟「目录在、但不可写」）
+    real_open = os.open
+    attempts: list[str] = []
+
+    def fake_open(path, flags, mode=0o777):
+        if Path(path).parent == target:
+            attempts.append(str(path))
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr("ar.jsonio.os.open", fake_open)
+
+    with pytest.raises(WriteError) as excinfo:
+        ingest(sample_md, "sample", dirs.data)
+
+    message = str(excinfo.value)
+    assert str(target) in message, f"错误里必须点名是哪个目录：{message}"
+    assert f"errno {errno.EACCES}" in message, f"错误里必须带原始 errno：{message}"
+    assert len(attempts) == 1, f"目录不可写必须一次就失败，实测试了 {len(attempts)} 次"
+    assert excinfo.value.exit_code == EXIT_USAGE, "CLI 上归「用法 / 输入错误」那一档（退出码 2）"
+    assert not (target / "source.md").exists()
+    assert not (target / "source.meta.json").exists(), "第一份就写不进去：不许继续写第二份"
+    assert [p.name for p in target.iterdir() if p.name.startswith(".tmp-")] == []
+
+
+def test_ingest_cli_reports_the_unwritable_dir_and_exits_2(
+    sample_md: Path, dirs: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, run_cli
+) -> None:
+    """CLI 口径：坏目录上 `ar ingest` 打一句可读错误并以**退出码 2** 结束（不是卡住、不是 1）。"""
+    target = dirs.data / "sample"
+    target.mkdir(parents=True)
+    real_open = os.open
+
+    def fake_open(path, flags, mode=0o777):
+        if Path(path).parent == target:
+            raise PermissionError(errno.EACCES, "拒绝访问")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr("ar.jsonio.os.open", fake_open)
+
+    code, output = run_cli(
+        "ingest", str(sample_md), "--id", "sample", "--data-dir", str(dirs.data)
+    )
+
+    assert code == EXIT_USAGE, output
+    assert "不可写" in output and "errno 13" in output, output
+    assert "Traceback" not in output, "坏路径必须是可读错误，不是裸异常回溯"
 
 
 def test_ingest_is_stable_across_two_runs(sample_md: Path, dirs: SimpleNamespace) -> None:
@@ -258,9 +337,14 @@ def test_positive_check_passes_anchors_then_asks_for_rewrite(run_cli, sample_md:
     assert "rewritten.md" in output and "ar rewrite" in output
 
 
-def test_rewrite_requires_model_config(run_cli, dirs: SimpleNamespace) -> None:
-    """没有模型就不能改写：退出码 5 + 可见说明，且一个产物都不写。"""
-    code, output = run_cli("--data-dir", str(dirs.data), "rewrite", "sample", "--reader", "local-default")
+def test_rewrite_requires_model_config(run_cli, dirs: SimpleNamespace, nokey_config: Path) -> None:
+    """没有模型就不能改写：退出码 5 + 可见说明，且一个产物都不写。
+
+    `--config` 显式给一份空配置：这条断言要的是「模型未配置」，不能靠开发机的
+    `config.local.json` 恰好没有钥匙（见 conftest 的 `nokey_config`）。
+    """
+    code, output = run_cli("--data-dir", str(dirs.data), "--config", str(nokey_config),
+                           "rewrite", "sample", "--reader", "local-default")
     assert code == EXIT_MODEL, output
     assert "模型未配置" in output
     assert not (dirs.data / "sample" / "rewritten.md").exists()

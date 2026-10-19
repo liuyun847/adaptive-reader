@@ -60,7 +60,8 @@ def dbg(page) -> dict:
 
 
 def open_reader(page, ar_server, fixture_id: str = FIXTURE_ID, extra: str = "") -> str:
-    url = f"{ar_server}/web/index.html?fixture={fixture_id}{extra}"
+    """阅读器页：2026-10-15 拆页后是 `web/reader.html`（`web/index.html` 变成了启动页）。"""
+    url = f"{ar_server}/web/reader.html?fixture={fixture_id}{extra}"
     page.goto(url)
     wait_ready(page)
     return url
@@ -305,11 +306,43 @@ def test_marker_tooltip_shows_action_and_why(page, ar_server, changes):
         assert page.locator(f'#blk-{pid} [data-role="tip-note"]').text_content() \
             == changes[pid]["why"]["note"]
 
-    # compress 在本骨架里没实现，悬停必须显式说明，不能装作做了
-    assert changes["p024"]["action"] == "compress"
-    assert changes["p024"]["deferred"] is True
-    deferred_text = page.locator('#blk-p024 [data-role="tip-deferred"]').text_content()
+    # 2026-10-13 起 compress / illustrate 都实现了：夹具里不再有「未实现」那一行
+    assert changes["p024"]["action"] == "illustrate"
+    assert "deferred" not in changes["p024"]
+    assert page.locator('#blk-p024 [data-role="tip-deferred"]').count() == 0
+    # 配图段的图由前端就地插在正文之后（渲染细节见 test_figures.py）
+    assert page.locator('#blk-p024 [data-role="figure"]').count() == 1
+
+
+def test_deferred_note_still_shows_for_a_future_unimplemented_action(
+    page, ar_server, ar_inject, doc, changes,
+):
+    """`deferred`（枚举内、本期未实现）机制仍在 schema 里：真出现时必须显式说明，不许装作做了。
+
+    2026-10-13 之后 compress / illustrate 都实现了，夹具里已经没有这种段，
+    所以这里注入一份「将来新增了枚举成员但还没实现」的变更记录来守这一行显示。
+    """
+    payload = copy.deepcopy(doc)
+    for change in payload["changes"]["changes"]:
+        if change["paragraph"] == "p017":
+            change["action"] = "keep"
+            change["deferred"] = True
+            change["why"]["note"] = "将来某个新动作：本期未实现"
+    ar_inject.doc_payload = payload
+
+    open_reader(page, ar_server)
+    scroll_marker_to_center(page, "p017")
+    marker(page, "p017").hover()
+    expect(tip(page, "p017")).to_be_visible()
+
+    assert page.locator('#blk-p017 [data-role="tip-note"]').text_content() == "将来某个新动作：本期未实现"
+    deferred_text = page.locator('#blk-p017 [data-role="tip-deferred"]').text_content()
     assert "未实现" in deferred_text and "保持" in deferred_text
+
+    marker(page, "p017").click()
+    expect(page.locator('[data-role="card"]')).to_be_visible()
+    assert "未实现" in page.locator('[data-role="card-deferred"]').text_content()
+    assert changes["p017"].get("deferred") is None, "夹具本身不该再有 deferred（这条是注入的现场）"
 
 
 # ------------------------------- 6. 点标记出卡片；点外部关闭；不改正文
@@ -530,7 +563,7 @@ def test_backend_degraded_list_is_shown_and_no_rewrite_falls_back(
 
 def test_doc_load_failure_is_visible_and_page_still_ready(page, ar_server, ar_inject):
     ar_inject.fail_doc = True
-    page.goto(f"{ar_server}/web/index.html?fixture={FIXTURE_ID}")
+    page.goto(f"{ar_server}/web/reader.html?fixture={FIXTURE_ID}")
     debug = wait_ready(page)
 
     assert debug["fatal"] and "材料载入失败" in debug["fatal"]
@@ -540,8 +573,35 @@ def test_doc_load_failure_is_visible_and_page_still_ready(page, ar_server, ar_in
     assert page.locator("#rewritten .block").count() == 0
 
 
+def test_doc_load_failure_shows_the_backend_error_text(page, ar_server):
+    """正式模式载入失败：把后端 `error`（与 `hint`）原文显示出来，不是干巴巴的「HTTP 404」。
+
+    后端 `/api/doc/<id>` 的 404 / 500 一律是 JSON + 可读 `error`（契约），启动页那边早就把它
+    原样显示给读者了；这里对齐同一口径。
+    """
+    def fulfill(route):
+        route.fulfill(status=404, content_type="application/json; charset=utf-8",
+                      body=json.dumps({
+                          "error": "找不到材料 nope：source.meta.json 不存在",
+                          "hint": "先运行 `uv run ar ingest <文件> --id nope`",
+                          "degraded": ["材料 nope 尚未摄取"],
+                      }, ensure_ascii=False))
+
+    page.route("**/api/doc/**", fulfill)
+    page.goto(f"{ar_server}/web/reader.html?source=nope")
+    debug = wait_ready(page)
+
+    assert debug["fatal"] and "材料载入失败" in debug["fatal"]
+    assert "找不到材料 nope" in debug["fatal"], debug["fatal"]
+    assert "先运行" in debug["fatal"], debug["fatal"]
+    banner = page.locator('[data-role="banner"][data-state="error"]')
+    expect(banner.first).to_be_visible()
+    assert "找不到材料 nope" in banner.first.inner_text()
+
+
 def test_api_mode_without_source_id_says_what_is_missing(page, ar_server):
-    page.goto(f"{ar_server}/web/index.html")
+    """`/reader` 不带参数（= 静态站点上的 `web/reader.html`）：给可读提示，不白屏、不崩。"""
+    page.goto(f"{ar_server}/web/reader.html")
     debug = wait_ready(page)
 
     assert debug["mode"] == "api"

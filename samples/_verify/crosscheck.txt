@@ -1,6 +1,6 @@
 启动内核：msedge(channel) 154.0.4258.53
-折叠态截图：C:\Users\MLTZ\Desktop\code\working\adaptive-reader\samples\_verify\reader-fixture-collapsed.png
-展开态截图：C:\Users\MLTZ\Desktop\code\working\adaptive-reader\samples\_verify\reader-fixture.png
+折叠态截图：samples\_verify\reader-fixture-collapsed.png
+展开态截图：samples\_verify\reader-fixture.png
 {
   "paragraph": "p005",
   "changes.json": {

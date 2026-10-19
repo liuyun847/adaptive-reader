@@ -1,0 +1,476 @@
+{
+  "version": 1,
+  "questions": [
+    {
+      "id": "Q1",
+      "title": "受教育程度",
+      "kind": "single",
+      "options": [
+        {
+          "value": "junior_or_below",
+          "label": "初中及以下"
+        },
+        {
+          "value": "high_school",
+          "label": "高中（含中专、职高）"
+        },
+        {
+          "value": "college",
+          "label": "大专"
+        },
+        {
+          "value": "undergraduate",
+          "label": "本科"
+        },
+        {
+          "value": "master",
+          "label": "硕士"
+        },
+        {
+          "value": "doctor",
+          "label": "博士"
+        },
+        {
+          "value": "prefer_not",
+          "label": "不想说"
+        }
+      ],
+      "requires": [],
+      "answer_slot": "education",
+      "qid": "Q1",
+      "field": "education",
+      "label": "受教育程度",
+      "when": {
+        "kind": "always"
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [],
+      "maxLength": 0,
+      "placeholder": ""
+    },
+    {
+      "id": "Q2",
+      "title": "高中选考科目（六选三）",
+      "kind": "multi",
+      "options": [
+        {
+          "value": "physics",
+          "label": "物理"
+        },
+        {
+          "value": "chemistry",
+          "label": "化学"
+        },
+        {
+          "value": "biology",
+          "label": "生物"
+        },
+        {
+          "value": "politics",
+          "label": "政治"
+        },
+        {
+          "value": "history",
+          "label": "历史"
+        },
+        {
+          "value": "geography",
+          "label": "地理"
+        },
+        {
+          "value": "not_applicable",
+          "label": "没上过高中"
+        },
+        {
+          "value": "forgotten",
+          "label": "记不清"
+        }
+      ],
+      "requires": [
+        {
+          "question": "Q1",
+          "in": [
+            "high_school",
+            "college",
+            "undergraduate",
+            "master",
+            "doctor"
+          ]
+        }
+      ],
+      "answer_slot": "high_school_electives",
+      "note": "正好 3 项；没上过高中 / 记不清与多选互斥",
+      "qid": "Q2",
+      "field": "high_school_electives",
+      "label": "高中选考科目（六选三）",
+      "when": {
+        "kind": "equals",
+        "field": "education",
+        "values": [
+          "high_school",
+          "college",
+          "undergraduate",
+          "master",
+          "doctor"
+        ]
+      },
+      "exactly": 3,
+      "atLeast": 0,
+      "exclusive": [
+        "not_applicable",
+        "forgotten"
+      ],
+      "maxLength": 0,
+      "placeholder": "",
+      "hint": "正好选 3 项；也可以选「没上过高中」或「记不清」。"
+    },
+    {
+      "id": "Q3a",
+      "title": "大学学科门类",
+      "kind": "single",
+      "options": [
+        {
+          "value": "philosophy",
+          "label": "哲学"
+        },
+        {
+          "value": "economics",
+          "label": "经济学"
+        },
+        {
+          "value": "law",
+          "label": "法学"
+        },
+        {
+          "value": "education",
+          "label": "教育学"
+        },
+        {
+          "value": "literature",
+          "label": "文学"
+        },
+        {
+          "value": "history",
+          "label": "历史学"
+        },
+        {
+          "value": "science",
+          "label": "理学"
+        },
+        {
+          "value": "engineering",
+          "label": "工学"
+        },
+        {
+          "value": "agriculture",
+          "label": "农学"
+        },
+        {
+          "value": "medicine",
+          "label": "医学"
+        },
+        {
+          "value": "management",
+          "label": "管理学"
+        },
+        {
+          "value": "arts",
+          "label": "艺术学"
+        },
+        {
+          "value": "military_science",
+          "label": "军事学"
+        },
+        {
+          "value": "interdisciplinary",
+          "label": "交叉学科"
+        },
+        {
+          "value": "none",
+          "label": "没读大学"
+        },
+        {
+          "value": "unsure",
+          "label": "不确定"
+        }
+      ],
+      "requires": [
+        {
+          "question": "Q1",
+          "in": [
+            "college",
+            "undergraduate",
+            "master",
+            "doctor"
+          ]
+        }
+      ],
+      "answer_slot": "discipline",
+      "qid": "Q3a",
+      "field": "discipline",
+      "label": "大学学科门类",
+      "when": {
+        "kind": "equals",
+        "field": "education",
+        "values": [
+          "college",
+          "undergraduate",
+          "master",
+          "doctor"
+        ]
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [],
+      "maxLength": 0,
+      "placeholder": ""
+    },
+    {
+      "id": "Q3b",
+      "title": "具体专业",
+      "kind": "text",
+      "options": [],
+      "requires": [
+        {
+          "question": "Q1",
+          "in": [
+            "college",
+            "undergraduate",
+            "master",
+            "doctor"
+          ]
+        },
+        {
+          "question": "Q3a",
+          "not_in": [
+            "none",
+            "unsure"
+          ]
+        }
+      ],
+      "answer_slot": "major",
+      "max_chars": 60,
+      "note": "单行自由文本，可空",
+      "qid": "Q3b",
+      "field": "major",
+      "label": "具体专业",
+      "when": {
+        "kind": "equals",
+        "field": "education",
+        "values": [
+          "college",
+          "undergraduate",
+          "master",
+          "doctor"
+        ]
+      },
+      "alsoWhen": {
+        "kind": "notEquals",
+        "field": "discipline",
+        "value": "none",
+        "values": [
+          "none",
+          "unsure"
+        ],
+        "includeEmpty": true
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [],
+      "maxLength": 60,
+      "placeholder": "例：国际经济与贸易",
+      "hint": "没读大学或不确定时这一题不出现。"
+    },
+    {
+      "id": "Q4",
+      "title": "自报特长 / 熟悉领域",
+      "kind": "multi",
+      "options": [
+        {
+          "value": "economics_finance",
+          "label": "经济与金融"
+        },
+        {
+          "value": "math_stats",
+          "label": "数学与统计"
+        },
+        {
+          "value": "programming_computer",
+          "label": "编程与计算机"
+        },
+        {
+          "value": "natural_science",
+          "label": "自然科学"
+        },
+        {
+          "value": "medicine_health",
+          "label": "医学与健康"
+        },
+        {
+          "value": "history_humanities",
+          "label": "历史与人文"
+        },
+        {
+          "value": "philosophy_thought",
+          "label": "哲学与思想"
+        },
+        {
+          "value": "law",
+          "label": "法律"
+        },
+        {
+          "value": "engineering_tech",
+          "label": "工程技术"
+        },
+        {
+          "value": "art_design",
+          "label": "艺术与设计"
+        },
+        {
+          "value": "language_literature",
+          "label": "语言与文学"
+        },
+        {
+          "value": "education_psychology",
+          "label": "教育心理"
+        },
+        {
+          "value": "none",
+          "label": "都没有"
+        }
+      ],
+      "requires": [],
+      "answer_slot": "strengths",
+      "note": "可多选；「都没有」与多选互斥",
+      "qid": "Q4",
+      "field": "strengths",
+      "label": "自报特长 / 熟悉领域",
+      "when": {
+        "kind": "always"
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [
+        "none"
+      ],
+      "maxLength": 0,
+      "placeholder": "",
+      "hint": "可多选；也可以选「都没有」。"
+    },
+    {
+      "id": "Q4b",
+      "title": "补充说明",
+      "kind": "textarea",
+      "options": [],
+      "requires": [],
+      "answer_slot": "strengths_note",
+      "multiline": true,
+      "max_chars": 200,
+      "note": "多行自由文本，可空",
+      "qid": "Q4b",
+      "field": "strengths_note",
+      "label": "补充说明",
+      "when": {
+        "kind": "always"
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [],
+      "maxLength": 200,
+      "placeholder": "例：读过《资本论》第一卷前两章"
+    },
+    {
+      "id": "Q5",
+      "title": "常读材料类型",
+      "kind": "multi",
+      "options": [
+        {
+          "value": "textbook",
+          "label": "教材课本"
+        },
+        {
+          "value": "papers",
+          "label": "学术论文"
+        },
+        {
+          "value": "popular_news",
+          "label": "通俗读物与新闻评论"
+        },
+        {
+          "value": "tech_docs",
+          "label": "技术文档"
+        },
+        {
+          "value": "reports",
+          "label": "报告与公文"
+        },
+        {
+          "value": "fiction",
+          "label": "小说文学"
+        },
+        {
+          "value": "rarely",
+          "label": "很少读长文"
+        }
+      ],
+      "requires": [],
+      "answer_slot": "reading_materials",
+      "note": "可多选；「很少读长文」与多选互斥",
+      "qid": "Q5",
+      "field": "reading_materials",
+      "label": "常读材料类型",
+      "when": {
+        "kind": "always"
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [
+        "rarely"
+      ],
+      "maxLength": 0,
+      "placeholder": "",
+      "hint": "可多选；也可以选「很少读长文」。"
+    },
+    {
+      "id": "Q6",
+      "title": "遇到看不懂时更希望怎么讲",
+      "kind": "single",
+      "options": [
+        {
+          "value": "conclusion_first",
+          "label": "直接讲结论"
+        },
+        {
+          "value": "prerequisites",
+          "label": "补前置概念"
+        },
+        {
+          "value": "example",
+          "label": "举个例子"
+        },
+        {
+          "value": "simpler_wording",
+          "label": "换成更简单的话"
+        },
+        {
+          "value": "unsure",
+          "label": "说不清"
+        }
+      ],
+      "requires": [],
+      "answer_slot": "preference",
+      "qid": "Q6",
+      "field": "preference",
+      "label": "遇到看不懂时更希望怎么讲",
+      "when": {
+        "kind": "always"
+      },
+      "atLeast": 0,
+      "exactly": 0,
+      "exclusive": [],
+      "maxLength": 0,
+      "placeholder": ""
+    }
+  ]
+}

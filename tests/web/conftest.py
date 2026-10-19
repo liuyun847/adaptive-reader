@@ -2,8 +2,8 @@
 
 做法：
   - **自建静态服务**：把 `adaptive-reader/` 当根目录起一个 `http.server`，于是
-    `/web/index.html` 与 `/samples/<id>/*.json` 同源可达，正好复现「夹具模式读同源静态文件」
-    的条件，不需要 W1 的 `/api/*` 就能跑完整交互。
+    `web/reader.html`（拆页后是阅读器页，`web/index.html` 现在是启动页）与 `/samples/<id>/*.json`
+    同源可达，正好复现「夹具模式读同源静态文件」的条件，不需要 W1 的 `/api/*` 就能跑完整交互。
   - **本机浏览器**：先试 `channel="msedge"`（本机已装 Edge 154），失败再退到已缓存内核
     `chromium-1084`（playwright 1.39.0 自带）。**任何情况下都不触发内核下载。**
   - **就绪靠页面里的显式标志** `globalThis.__arDebug.ready`，不 sleep。

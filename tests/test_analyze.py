@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -17,12 +19,14 @@ from ar.analyze import (
     ILLUSTRATION_KINDS,
     check_inventory_file,
     extract_json_object,
+    format_illustration_block,
     normalize_inventory,
     run_analyze,
     validate_inventory,
 )
 from ar.errors import EXIT_MODEL, EXIT_OK, EXIT_VALIDATION, InputError, ModelUnavailable, ValidationFailed
 from ar.ingest import ingest
+from ar.llm import LlmFailure, LlmRequest, LlmResult, RetryPolicy
 
 GOOD_JSON = json.dumps(
     {
@@ -84,6 +88,33 @@ MESSY_JSON = json.dumps(
 
 def _meta(paragraph_count: int = 3) -> dict:
     return {"paragraphs": [{"id": f"p{i:03d}", "index": i} for i in range(1, paragraph_count + 1)]}
+
+
+@dataclass
+class _ScriptedClient:
+    """按脚本逐次回结果（第 N 次调用用第 N 条，用完了重复最后一条）。
+
+    一条脚本项要么是 ``LlmResult``（成功 / 失败都行），要么是字符串（= 一次成功的正文）。
+    ``max_retries=1`` + 退避 0 ms：能考出「第一次 500、第二次成功」，而用例不必真的等。
+    """
+
+    replies: list[Any]
+    policy: RetryPolicy = field(
+        default_factory=lambda: RetryPolicy(max_retries=1, initial_delay_ms=0, max_delay_ms=0)
+    )
+    configured: bool = True
+    calls: int = 0
+
+    def retry_policy(self) -> RetryPolicy:
+        return self.policy
+
+    async def arequest_once(self, request: LlmRequest) -> LlmResult:
+        index = min(self.calls, len(self.replies) - 1)
+        self.calls += 1
+        reply = self.replies[index]
+        if isinstance(reply, LlmResult):
+            return reply
+        return LlmResult(ok=True, text=str(reply), model="fake-model", finish_reason="stop")
 
 
 # ------------------------------------------------------------------ JSON 抽取 --
@@ -179,6 +210,47 @@ def test_validate_rejects_missing_fields_duplicates_and_prereq_dangling() -> Non
     assert "prereq 指向不存在的概念 'c09'" in joined
 
 
+# ---------------------------------------------------------------- 配图候选块 --
+def test_illustration_block_is_deterministic_and_uses_the_candidate_order() -> None:
+    """配图候选块是 ``rewrite-v4`` 提示词的固定块：**逐字稳定**，顺序照候选数组原序。
+
+    它进的是提示词前缀缓存覆盖的那一段，所以任何一个「每次都不一样」的字符都是事故。
+    """
+    inventory = {
+        "concepts": [],
+        "illustration_candidates": [
+            {"paragraph": "p003", "kind": "流程", "why": "三步递进，纯文字看不出先后"},
+            {"paragraph": "p001", "kind": "对比", "why": "两种口径并列更适合画图"},
+        ],
+    }
+    first = format_illustration_block(inventory)
+    assert first == "p003 流程：三步递进，纯文字看不出先后\np001 对比：两种口径并列更适合画图"
+    assert format_illustration_block(inventory) == first, "同一份清单两次调用必须同文本（否则前缀缓存每轮失效）"
+    assert format_illustration_block(json.loads(json.dumps(inventory))) == first, "经 JSON 往返后仍是同文本"
+
+
+def test_illustration_block_is_empty_when_there_is_nothing_to_show() -> None:
+    """没有候选（或没有清单）时是**空串**：提示词那一格一个字符都不出现（与 rewrite-v3 等价）。"""
+    assert format_illustration_block(None) == ""
+    assert format_illustration_block({}) == ""
+    assert format_illustration_block({"illustration_candidates": []}) == ""
+    assert format_illustration_block({"illustration_candidates": "不是数组"}) == ""
+    # 候选缺段 id 的一律跳过（落盘的清单不会有这种条目，这里守的是调用方直接喂脏数据的情形）
+    assert format_illustration_block({"illustration_candidates": [{"kind": "流程", "why": "没有段 id"}]}) == ""
+
+
+def test_illustration_block_caps_the_list_and_says_how_many_are_left() -> None:
+    """超过上限时截断**并说明还有多少条**（省 token，但不静默截断）。"""
+    inventory = {
+        "illustration_candidates": [
+            {"paragraph": f"p{index:03d}", "kind": "流程", "why": "理由"} for index in range(1, 26)
+        ]
+    }
+    block = format_illustration_block(inventory, limit=3)
+    assert block.splitlines()[:3] == ["p001 流程：理由", "p002 流程：理由", "p003 流程：理由"]
+    assert block.splitlines()[-1] == "…另有 22 条未列出"
+
+
 # -------------------------------------------------------------------- 主流程 --
 def test_run_analyze_writes_contract_file_and_passes_check(dirs: SimpleNamespace, sample_md: Path, fake_client) -> None:
     ingest(sample_md, "sample", dirs.data)
@@ -193,6 +265,17 @@ def test_run_analyze_writes_contract_file_and_passes_check(dirs: SimpleNamespace
     assert meta["prompt_version"] == "concepts-v2"
     assert meta["source_id"] == "sample" and meta["paragraph_count"] == 6
     assert meta["repairs"] == [] and meta["generated_at"]
+    # 记账（PLAN-llm-tools §3.4）：逐次尝试 + 整次调用一条汇总；原文只进 concepts.raw.txt，绝不进 meta
+    assert [item["try"] for item in meta["attempts"]] == [1]
+    assert meta["attempts"][0]["tool"] == "analyze_concepts"
+    assert meta["attempts"][0]["code"] is None
+    assert meta["retry_account"] == {
+        "tool": "analyze_concepts",
+        "requests": 1,
+        "retries": 0,
+        "codes": [],
+    }
+    assert "raw_text" not in meta
     for concept in payload["concepts"]:
         assert set(concept) == {
             "id",
@@ -226,9 +309,82 @@ def test_run_analyze_non_json_output_degrades_visibly(dirs: SimpleNamespace, sam
     assert not (dirs.data / "sample" / "concepts.json").exists()
 
 
+def test_run_analyze_prompt_is_byte_identical_to_the_direct_builder(
+    dirs: SimpleNamespace, sample_md: Path, fake_client
+) -> None:
+    """提示词**逐字不变**：迁移后发出的 messages == 迁移前 ``build_concepts_messages(meta)`` 的结果。
+
+    工具层只拿到契约形态的段落表（``id`` / ``text``），所以这里连原始 ``meta``（含 ``index`` /
+    ``text_hash``）一起比——模板本来只读那两个字段，多出来的键一个字符都不该进提示词。
+    """
+    from ar.jsonio import read_json
+    from ar.prompts import build_concepts_messages
+
+    ingest(sample_md, "sample", dirs.data)
+    fake = fake_client(text=GOOD_JSON)
+    run_analyze("sample", dirs.data, fake)
+
+    meta = read_json(dirs.data / "sample" / "source.meta.json")
+    assert fake.calls[0] == build_concepts_messages(meta)
+
+
 def test_run_analyze_requires_ingest_first(dirs: SimpleNamespace, fake_client) -> None:
     with pytest.raises(InputError, match="先运行"):
         run_analyze("nosuch", dirs.data, fake_client(text=GOOD_JSON))
+
+
+# ------------------------------------------------------------ 反向验证：重试账 --
+def test_run_analyze_retries_a_server_failure_and_records_both_attempts(
+    dirs: SimpleNamespace, sample_md: Path
+) -> None:
+    """反向验证：第一次 500（SERVER，可重试）、第二次成功 → ``attempts`` 两条、第二条成功。
+
+    同时断言产物**没被写坏**：``attempts`` 记在 meta 里，``concepts.json`` 照样过契约校验，
+    成功路径不落 ``concepts.raw.txt``（原文只在解析失败时落盘）。
+    """
+    ingest(sample_md, "sample", dirs.data)
+    client = _ScriptedClient(
+        [
+            LlmResult(ok=False, failure=LlmFailure(code="SERVER", message="HTTP 503：网关抖动", status=503)),
+            GOOD_JSON,
+        ]
+    )
+    result = run_analyze("sample", dirs.data, client)
+
+    assert client.calls == 2, "第一次失败就该再试一次（SERVER 在白名单里）"
+    assert result.concept_count == 2
+
+    payload = json.loads((dirs.data / "sample" / "concepts.json").read_text(encoding="utf-8"))
+    attempts = payload["meta"]["attempts"]
+    assert [item["try"] for item in attempts] == [1, 2], attempts
+    assert attempts[0]["code"] == "SERVER" and attempts[0]["delay_ms"] == 0
+    assert attempts[1]["code"] is None, "第二条必须是成功的那次"
+    assert payload["meta"]["retry_account"] == {
+        "tool": "analyze_concepts",
+        "requests": 2,
+        "retries": 1,
+        "codes": ["SERVER"],
+    }
+    # 产物没被写坏：契约校验通过、原文没有混进 meta、成功路径不留 raw 排查文件
+    assert check_inventory_file(dirs.data, "sample") == []
+    assert "raw_text" not in payload["meta"] and "HTTP 503" not in json.dumps(payload, ensure_ascii=False)
+    assert not (dirs.data / "sample" / "concepts.raw.txt").exists()
+
+
+def test_run_analyze_deterministic_failure_tries_once_and_leaves_no_raw_file(
+    dirs: SimpleNamespace, sample_md: Path
+) -> None:
+    """确定性错误（401 → ``AUTH``）只试一次，且与迁移前一致：**不落** ``concepts.raw.txt``。"""
+    ingest(sample_md, "sample", dirs.data)
+    client = _ScriptedClient(
+        [LlmResult(ok=False, failure=LlmFailure(code="AUTH", message="HTTP 401：密钥无效", status=401))]
+    )
+    with pytest.raises(ModelUnavailable, match="无画像"):
+        run_analyze("sample", dirs.data, client)
+
+    assert client.calls == 1, "AUTH 不在白名单里：不许白花第二次调用"
+    assert not (dirs.data / "sample" / "concepts.json").exists()
+    assert not (dirs.data / "sample" / "concepts.raw.txt").exists(), "调用失败没有原文可留"
 
 
 def test_validate_failure_does_not_write_file(dirs: SimpleNamespace, sample_md: Path, fake_client, monkeypatch) -> None:

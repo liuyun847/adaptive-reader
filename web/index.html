@@ -4,21 +4,31 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>自适应阅读器 · 改写稿</title>
+  <title>自适应阅读器 · 材料</title>
   <link rel="icon" href="data:,">
+  <!-- 与阅读器共用同一份样式与变量体系（--bg / --ink / --size … 都在这份里），
+       启动页自己的版面另有一层 css/launcher.css（阅读器页**不加载**它）。 -->
   <link rel="stylesheet" href="css/reader.css">
+  <link rel="stylesheet" href="css/launcher.css">
   <script>
     /*
-     * 显示设置的「渲染前应用」：在 body 解析之前、样式表之后同步执行，
-     * 按 localStorage["ar.settings.v1"] 给 <html> 打好属性 —— 刷新时不会先闪一下纸白底。
-     * 口径与 js/settings.js 的 normalizeSettings/initialSettings 一致（那边 bootstrap() 会再接管一次）。
+     * 显示设置的「渲染前应用」第一步（`<html>`）：在 body 解析之前、样式表之后同步执行，
+     * 按 localStorage["ar.settings.v1"] 打好属性，并把同一份结论留在
+     * `globalThis.__arApplyDisplaySettings` 上——`<body>` 一开头的第二步再把它打到 body 上。
+     *
+     * **为什么非要打到 body**：css/reader.css 末尾那三段主题覆盖的选择器是
+     * `body[data-bg] / body[data-ink] / body[data-size]`（阅读器页靠 js/main.js 的
+     * bootstrapSettings(document.body) 补上这一步），只打 `<html>` 等于白打：启动页会一直停在
+     * 标记里写死的纸白 16，同一份存档下与阅读器页两套底色（2026-10-15 复核实测修）。
+     *
+     * 口径与 js/settings.js 的 normalizeSettings/initialSettings 一致（boot 里 bootstrapSettings 再接管一次）。
+     * 阅读器页（web/reader.html）`<head>` 里那段是同一算法的另一份，那边由 main.js 打 body。
      */
     (function () {
       var KEY = 'ar.settings.v1';
       var BG = ['paper', 'warm', 'dark'];
       var INK = ['ink', 'light'];
       var SIZE = ['15', '16', '17', '19'];
-      var e = document.documentElement;
       var settings = null;
       try {
         var raw = localStorage.getItem(KEY);
@@ -38,115 +48,181 @@
       }
       var bg = BG.indexOf(settings.bg) !== -1 ? settings.bg : 'paper';
       var inkExplicit = settings.inkExplicit === true && INK.indexOf(settings.ink) !== -1;
-      e.dataset.bg = bg;
-      e.dataset.ink = inkExplicit ? settings.ink : (bg === 'dark' ? 'light' : 'ink');
-      e.dataset.size = SIZE.indexOf(String(settings.size)) !== -1 ? String(settings.size) : '16';
-      e.dataset.inkExplicit = String(inkExplicit);
-      e.dataset.settingsStored = String(stored);
+      var size = SIZE.indexOf(String(settings.size)) !== -1 ? String(settings.size) : '16';
+      // 同一份结论打两次：<head> 打 <html>，<body> 一开头打 body（两处必须一致，测试守着）
+      globalThis.__arApplyDisplaySettings = function (root) {
+        if (!root || !root.dataset) return;
+        root.dataset.bg = bg;
+        root.dataset.ink = inkExplicit ? settings.ink : (bg === 'dark' ? 'light' : 'ink');
+        root.dataset.size = size;
+        root.dataset.inkExplicit = String(inkExplicit);
+      };
+      globalThis.__arApplyDisplaySettings(document.documentElement);
+      document.documentElement.dataset.settingsStored = String(stored);
     })();
   </script>
 </head>
 
-<body data-drawer="collapsed" data-mode="unknown" data-current-paragraph=""
-  data-bg="paper" data-ink="ink" data-size="16" data-ink-explicit="false">
+<body data-page="launcher" data-bg="paper" data-ink="ink" data-size="16" data-ink-explicit="false">
+
+  <script>
+    // 显示设置的「渲染前应用」第二步（`<body>`）：主题选择器认的是 body[data-bg|data-ink|data-size]，
+    // 所以这一段必须放在 body 的**最开头**——它之后的内容还没解析、更没有渲染，不会先闪一下纸白底。
+    (function () {
+      if (typeof globalThis.__arApplyDisplaySettings === 'function') {
+        globalThis.__arApplyDisplaySettings(document.body);
+      }
+    })();
+  </script>
 
   <header class="topbar">
     <div class="topbar__brand">自适应阅读器</div>
     <div class="topbar__side">
-      <div class="topbar__meta">
-        <span class="badge" data-role="source-id">材料：—</span>
-        <span class="badge badge--mode" data-role="mode-badge">加载中</span>
-        <span class="badge" data-role="progress">第 — / — 段</span>
-      </div>
-      <!-- 阅读显示设置：背景 / 文字颜色 / 正文字号，落 localStorage，刷新后仍在 -->
-      <div class="topbar__settings">
-        <button class="settings-toggle" type="button" data-role="settings-toggle"
-          aria-expanded="false" aria-controls="settings-panel" title="阅读显示设置（背景 / 文字颜色 / 字号）">
-          <span class="settings-toggle__mark" aria-hidden="true">Aa</span>
-          <span class="settings-toggle__text">显示</span>
-        </button>
-        <div class="settings" id="settings-panel" data-role="settings-panel" data-state="closed" hidden
-          role="dialog" aria-label="阅读显示设置"></div>
-      </div>
+      <span class="badge" data-role="page-badge">启动页</span>
     </div>
   </header>
 
-  <!-- 全页级降级提示（模型不可用 / 段数对不上 / 概念清单缺失 等）都落在这里，不允许静默 -->
+  <!-- 全页级降级提示（接口不可用 / 结构不符 / 上传失败 / 问卷读不到 等）都落在这里，不允许静默 -->
   <div class="banners" data-role="banners" aria-live="polite"></div>
 
-  <div class="reader" data-role="reader">
-    <main class="main" data-role="main">
-      <article class="article" id="rewritten" data-role="rewritten" aria-label="改写稿主栏"></article>
-      <p class="article__end" data-role="end-mark">— 改写稿结束 —</p>
-      <!-- 读完才显示的哨兵：IntersectionObserver 一直盯着它，读完逻辑不改 -->
-      <div class="end-sentinel" data-role="end-sentinel" aria-hidden="true"></div>
-      <!--
-        读完提示：正文末尾的**流内块**（不是浮窗），初始 hidden，读完才显示。
-        必须在 #rewritten 之外（有测试在数 #rewritten .block），文字里保留「比原文短」与百分比。
-      -->
-      <div class="compression" data-role="compression" data-state="hidden" hidden></div>
-    </main>
-  </div>
+  <main class="launcher" data-role="launcher">
+    <p class="launcher__lead" data-role="launcher-lead">
+      四块都在这一页：先看①状态，做②读前背景问卷，在③历史记录里挑一份材料，或用④上传一份新的。
+    </p>
 
-  <!-- 原文抽屉：右侧窄边，默认折叠；点开滑出并跟随当前段 -->
-  <aside class="drawer" data-role="drawer" data-state="collapsed" aria-label="原文抽屉">
-    <button class="drawer__rail" type="button" data-role="drawer-toggle" aria-expanded="false"
-      aria-controls="drawer-body" title="展开/收起原文">
-      <span class="drawer__rail-chevron" aria-hidden="true">‹</span>
-      <span class="drawer__rail-text">原文</span>
-    </button>
-    <div class="drawer__body" id="drawer-body" data-role="drawer-body">
-      <div class="drawer__head">
-        <span class="drawer__title">原文（底本）</span>
-        <span class="drawer__current" data-role="drawer-current">当前段 —</span>
+    <!-- ① 状态：搬阅读器顶栏那个「状态」面板（js/status.js），数据源仍是同源静态文件 /status.json -->
+    <section class="lcard" data-role="launcher-block" data-block="status">
+      <h2 class="lcard__title">① 状态</h2>
+      <p class="lcard__lead">
+        两套测试的结论（后端 / 前端）与本次未提交的改动。报告由
+        <code>uv run python tools/gen_status.py</code> 生成，页面只负责显示，一个数字都不硬编码。
+      </p>
+      <div class="lcard__row">
+        <button class="status-toggle" type="button" data-role="status-toggle"
+          aria-expanded="false" aria-controls="status-host"
+          title="状态：两套测试的结论与本次未提交的改动">
+          <span class="status-toggle__text">状态</span>
+        </button>
+        <span class="lcard__note" data-role="launcher-status-note">
+          报告读不到时面板里会写「尚未生成」+ 生成命令（不空白、不假装成功）。
+        </span>
       </div>
-      <div class="drawer__list" data-role="drawer-list"></div>
-      <div class="drawer__empty" data-role="drawer-empty" hidden></div>
-    </div>
-  </aside>
+      <!-- 状态面板的宿主：卡片由 js/status.js 造，关闭后整层从这里移除（不留残影） -->
+      <div id="status-host" data-role="status-host"></div>
+    </section>
 
-  <!-- 选片讲解浮条：选中文字后出现在选区旁（内容由 main.js 装配） -->
-  <div class="select-bar" data-role="select-bar" data-state="hidden" hidden
-    role="toolbar" aria-label="选中片段的讲解动作"></div>
+    <!-- ② 做测试：读前背景问卷（与阅读器里 ?survey=1 打开的是同一张） -->
+    <section class="lcard" data-role="launcher-block" data-block="survey">
+      <h2 class="lcard__title">② 做测试</h2>
+      <p class="lcard__lead">
+        读前背景问卷：六道固定题（条件题联动、可整场跳过），答完还可以再让模型追问几个细节。
+        它<b>不会自动弹</b>——只有点下面那颗按钮才会打开。
+      </p>
+      <div class="lcard__row">
+        <span class="lcard__state" data-role="launcher-survey-state" data-state="loading">正在读取问卷状态…</span>
+        <span class="lcard__stamp" data-role="launcher-survey-when"></span>
+        <button class="lcard__btn" type="button" data-role="launcher-survey-open" disabled>填写问卷</button>
+      </div>
+      <ul class="lnotes" data-role="launcher-survey-degraded" hidden></ul>
+      <!-- 问卷的宿主：卡片由 js/survey.js 造（与阅读器同一份实现），关闭后整层从这里移除 -->
+      <div id="survey-host" data-role="survey-host"></div>
+    </section>
 
-  <!-- 讲解卡片层 -->
-  <div class="card-layer" data-role="card-layer"></div>
+    <!-- ③ 历史记录：GET /api/sources 的材料清单；点一条进 /reader?source=<id> -->
+    <section class="lcard" data-role="launcher-block" data-block="history">
+      <h2 class="lcard__title">③ 历史记录</h2>
+      <p class="lcard__lead">
+        <code>data/</code> 下已经摄取过的材料（清单由后端按「最后动过」倒序排好，页面不重排）。
+        每条显示段数、最后动过的时间、动作统计、事实锚校验状态，以及缺了哪份产物。
+      </p>
+      <div class="lcard__state" data-role="launcher-history-state" data-state="loading">正在读取材料清单…</div>
+      <ul class="hist" data-role="launcher-history-list"></ul>
+      <ul class="lnotes" data-role="launcher-history-degraded" hidden></ul>
+    </section>
+
+    <!-- ④ 输入文件：上传 UTF-8 的 .md / .txt → POST /api/ingest（只摄取，不调模型） -->
+    <section class="lcard" data-role="launcher-block" data-block="upload">
+      <h2 class="lcard__title">④ 输入文件</h2>
+      <p class="lcard__lead">
+        上传一份 Markdown / 纯文本（UTF-8）。摄取只写
+        <code>data/&lt;id&gt;/source.md</code> 与 <code>source.meta.json</code>：
+        <b>不调模型</b>，所以刚上传的材料在阅读器里显示的是原文 + 可见的「未改写」说明。
+      </p>
+      <div class="lcard__row">
+        <input class="lfield" type="file" accept=".md,.txt" data-role="upload-file" aria-label="选择要摄取的 .md / .txt 文件">
+        <input class="lfield" type="text" data-role="upload-source-id" maxlength="64"
+          placeholder="可选 source_id（默认从文件名派生）" aria-label="材料 id（可省略）">
+        <label class="lcheck">
+          <input type="checkbox" data-role="upload-overwrite"> 覆盖已存在的同名材料
+        </label>
+        <button class="lcard__btn" type="button" data-role="upload-submit" disabled>摄取</button>
+      </div>
+      <div class="lcard__state" data-role="upload-status" data-state="idle">
+        还没有选文件：先选一个 .md / .txt（UTF-8 文本）。
+      </div>
+      <div class="lcard__result" data-role="upload-result" hidden></div>
+    </section>
+  </main>
 
   <script>
     // 就绪标志：无头验证只依赖它，不靠 sleep。
     // 这段必须在模块之前同步执行，好让 ES 模块加载失败时也留下可读的 errors（而不是让测试干等超时）。
     globalThis.__arDebug = {
-      ready: false,
+      ready: false,               // 四块都到了确定状态（含各自的降级）之后置位
       jsLoaded: false,
-      mode: null,
-      sourceId: null,
-      docUrl: null,
+      page: 'launcher',
       errors: [],
-      fatal: null,
-      paragraphs: [],
-      rewrittenParagraphs: [],
-      unrewritten: [],
-      changes: {},
-      concepts: {},
-      drawerOpen: false,
-      currentParagraph: null,
-      cardOpen: false,
-      cards: [],
-      cardCloses: [],
-      lastCard: null,
-      compression: null,
-      degradations: [],
-      // 选片讲解 / 显示设置 / 会话缓存：无头验证断言这三块的状态
-      toolbarOpen: false,
-      selection: null,
-      settings: null,
-      settingsPanelOpen: false,
-      inkContrast: null,          // 正文栏实测对比度（手动组合读不清时 < 4.5）
-      inkContrastLow: false,
-      explainCache: null,
-      explainDeduped: 0,
-      pendingExplain: null,
-      profileSignal: '',          // 会话缓存键里的画像指纹（夹具模式为空串）
+      degradations: [],           // {kind, message}：与阅读器同一套可见降级记账
+      // ---- 启动页四块的可断言状态（无头验证只等这些显式字段，不 sleep）----
+      launcher: {
+        // ③ 历史记录（GET /api/sources）：state ∈ idle | loading | ok | empty | degraded
+        sources: { state: 'idle', url: null, count: null, error: null, degraded: [] },
+        // ④ 上传摄取（POST /api/ingest）：
+        //    state ∈ idle | ready | invalid | uploading | ok | error
+        //    invalid 档也带 `error`（原因），且上一轮的 sourceId / paragraphs / overwritten /
+        //    httpStatus / url / encoding / encodingNote 一律清成 null（2026-10-15 复核修）
+        //    `encoding ∈ utf-8 | utf-8-lossy | null`：正文里有 U+FFFD 或 NUL 时是 lossy
+        //    （非 UTF-8 照常摄取，但 `encodingNote` 在状态行 / 结果块 / 横幅里可见）
+        upload: {
+          state: 'idle', sourceId: null, paragraphs: null, overwritten: null,
+          error: null, hint: null, httpStatus: null, url: null,
+          encoding: null, encodingNote: null,
+        },
+        // ② 问卷卡（GET /api/survey）：
+        //    state ∈ idle | loading | answered | skipped | unanswered | degraded
+        survey: {
+          state: 'idle', answeredAt: null, answered: false, skipped: false,
+          error: null, url: null, version: null, answeredVersion: null, degraded: [],
+          openReason: null,           // 这次问卷是怎么打开的：launcher | no-questions | load-failed
+          lastOpen: null,             // 最近一次点「填写问卷」的结果 {opened, reason, at}
+        },
+      },
+      // ---- 状态块（js/status.js 写这一组；数据源是同源静态文件 /status.json）----
+      statusOpen: false,
+      statusState: 'closed',      // closed | loading | ok | error | degraded
+      statusUrl: null,            // /status.json 实际打到的地址
+      statusPayload: null,        // 读到的报告（降级时为 null）
+      statusError: null,          // 报告用不了的原因（可读文案）
+      statusDegraded: [],
+      statusEvents: [],           // open / render / degrade / close
+      // ---- 问卷（js/survey.js 写这一组；字段与阅读器那份同口径）----
+      survey: null,
+      surveyUrl: null,
+      surveyQuestionSource: null,
+      surveyQuestionsRaw: [],
+      surveyPhase: null,          // questions | done | followup
+      surveyFollowup: null,
+      surveyFollowupQuestions: [],
+      surveyOpen: false,
+      surveyState: 'closed',      // closed | open | submitting
+      surveyVisible: {},
+      surveySeen: [],
+      surveyAnswers: {},
+      surveyAnswerCount: 0,
+      surveyDegraded: [],
+      surveyEvents: [],
+      surveyBootReason: null,
+      surveyFixtureResponse: null,
     };
     globalThis.addEventListener('error', function (e) {
       globalThis.__arDebug.errors.push({
@@ -162,7 +238,7 @@
       });
     });
   </script>
-  <script type="module" src="js/main.js"></script>
+  <script type="module" src="js/launcher.js"></script>
 </body>
 
 </html>

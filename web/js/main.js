@@ -16,18 +16,47 @@
  *   - 显示设置改完就量一次正文栏对比度，读不清时在设置面板里出可见告警（手动组合不拦，但要说）；
  *   - 会话缓存键补上画像指纹（每次讲解前刷一次 `GET /api/profile` 的摘要，画像一变键就变）；
  *   - 卡片状态区挪到底部固定区（view.js），长答案下也看得见。
+ *
+ * 2026-10-08 第二批（读前背景问卷，PLAN-background-survey.md §7 / §9）：
+ *   正文渲染完成、`__arDebug.ready` 置位**之后**才问一句服务端画像要不要弹问卷——
+ *   不挡阅读，正文渲染失败时压根不弹；「首次打开」的判定取 `GET /api/survey` 的
+ *   `answers` / `skipped`（不读 localStorage，那个键是显示设置）。界面本身在 js/survey.js。
+ *
+ * 2026-10-09（横幅的显示层纪律）：横幅改由 `view.js` 的 `addBanner` 统一管——同文本只留一条、
+ * 每条带 `×` 可手动关、成功类（`info`）到点自动消失、降级类（`warn`/`error`）只能手动关。
+ * 这里只负责把 `kind` 映射成 `data-state`（`bannerState`）：横幅是显示层，
+ * `__arDebug` 的标志与语义一个字没动。
+ *
+ * 2026-10-09 第二批（顶栏「状态」入口）：界面在 `js/status.js`（数据源＝同源静态文件 `/status.json`，
+ * 由 `tools/gen_status.py` 生成）。2026-10-15 起这个入口**搬到了启动页**（`web/index.html` +
+ * `web/js/launcher.js`）：阅读器页（`web/reader.html`）里既没有那个按钮也没有 `#status-host`，
+ * 这一页也不再 import `status.js`——原先 `Esc` 里那句 `isStatusOpen()` 让路判定随之删掉
+ * （恒为 false 的死判定），阅读器页的 `Esc` 现在只让路给问卷（`isSurveyOpen()`）。
+ *
+ * 2026-10-13（PLAN-actions-feedback.md 的 W 路，三件事都在这里接线）：
+ *   ① **就地配图**：`changes[i].figure` / `figure_error` 交给 `js/figures.js` 在段落容器内画
+ *      （mermaid 懒加载、SVG 走 DOMParser，都绕开 `md.js` 的转义；失败退回文字并降级可见）；
+ *   ② **「太啰嗦」当场压缩**：段落标记区的那个标记 → `POST /api/compress` → 成功刷新该段正文与
+ *      动作标记并提示「已压缩，请重跑 ar check」；降级（`ok:false`）正文一个字符都不动；
+ *   ③ **行为埋点**：`js/events.js`（缓冲 + 阈值/定时 flush + `visibilitychange`/`pagehide` 强刷）。
+ *      埋点只上报 `POST /api/events`，**不触发任何讲解 / 压缩请求**；夹具模式不发请求但留可见说明。
  */
 
 import {
-  DataError, loadDoc, loadProfileSignal, readContext, requestExplain,
+  DataError, loadDoc, loadProfileSignal, postEvents, readContext, requestCompress, requestExplain,
 } from './api.js';
 import { createExplainCache } from './cache.js';
+import { armFigures, buildFigure } from './figures.js';
 import {
-  addBanner, buildCard, buildParagraphBlock, buildSelectBar, buildSourceParagraph, fillCard,
-  layoutCard, layoutCardFixed, repositionCard, setCardAnswer, setCardMeta, setCardStatus,
-  setExplainButtonsDisabled, setSelectBarInfo,
+  FLUSH_INTERVAL_MS, initEvents, emitEvent, eventsSnapshot, flushEvents, setReadComplete,
+} from './events.js';
+import {
+  addBanner, applyChangeToBlock, buildCard, buildParagraphBlock, buildSelectBar,
+  buildSourceParagraph, fillCard, layoutCard, layoutCardFixed, renderCardDeclaration, renderCardProfile,
+  repositionCard, setBlockText, setCardAnswer, setCardMeta, setCardStatus, setExplainButtonsDisabled,
+  setGutterAction, setSelectBarInfo,
 } from './view.js';
-import { asArray, splitRewritten } from './schema.js';
+import { asArray, actionLabel, splitRewritten } from './schema.js';
 import {
   cacheKey, describeSelection, findSelectionScope, normalizeSelection, selectionRect, toolbarPosition,
 } from './selection.js';
@@ -35,6 +64,7 @@ import {
   MIN_CONTRAST, bootstrapSettings, buildSettingsPanel, measureInkContrast, resetSettings,
   setSettingsPanelOpen, syncSettingsPanel, updateSettings,
 } from './settings.js';
+import { bootSurvey, isSurveyOpen } from './survey.js';
 
 const D = globalThis.__arDebug;
 D.jsLoaded = true;
@@ -55,6 +85,8 @@ const dom = {
   selectBar: document.querySelector('[data-role="select-bar"]'),
   settingsToggle: document.querySelector('[data-role="settings-toggle"]'),
   settingsPanel: document.querySelector('[data-role="settings-panel"]'),
+  // 状态面板的入口与宿主**不在这里**：2026-10-15 起它搬到了启动页（web/index.html +
+  // web/js/launcher.js），阅读器页（web/reader.html）里既没有那个按钮也没有 #status-host。
   sourceBadge: document.querySelector('[data-role="source-id"]'),
   modeBadge: document.querySelector('[data-role="mode-badge"]'),
   progress: document.querySelector('[data-role="progress"]'),
@@ -67,6 +99,8 @@ const state = {
   sourceNodes: new Map(),   // paragraphId -> 抽屉元素
   changes: new Map(),
   concepts: new Map(),
+  // 事实锚校验块（§14.1）：整份产物只此一份，`fidelity.waived` 按段查（放行标记要显示在卡片与悬停里）
+  fidelity: null,
   card: null,
   current: null,
   readComplete: false,
@@ -81,11 +115,58 @@ const state = {
   inflight: new Map(),      // tokenKey -> seq（同一张卡片同时在飞的请求）
   seq: 0,
   pending: null,            // 当前卡片请求的 token，用来丢弃迟到的响应
+  currentSince: null,       // 进入当前段的时刻（用来结算这一段的 dwell）
+  compressPending: null,    // 正在压缩的段 id（一次只跑一个）
+  readElapsedFrom: null,    // 第一次进入某一段的时刻（read_abandon 的 ms 用）
 };
 
 function degrade(kind, message) {
   D.degradations.push({ kind, message });
-  return addBanner(dom.banners, message, kind === 'fatal' ? 'error' : 'warn');
+  return addBanner(dom.banners, message, bannerState(kind));
+}
+
+/* ------------------------------------------------------------ 行为埋点（③） */
+
+/** 结算当前段的停留：把 `ms` 记成一条 `dwell`（切换段、读完、离场时各调用一次）。 */
+function settleDwell() {
+  const paragraph = state.current;
+  if (!paragraph || !state.currentSince) return null;
+  const ms = Math.max(0, Date.now() - state.currentSince);
+  state.currentSince = Date.now();
+  return emitEvent('dwell', { paragraph, ms });
+}
+
+/**
+ * 强制 flush（`pagehide` / `visibilitychange`）之前先把现场结算掉：
+ * 最后一段的停留时间不能因为「还没切段」就丢掉；真正离开页面（`pagehide`）且没读完时，
+ * 记一条 `read_abandon`。切标签页（`visibilitychange`）**不算**放弃——读者会回来。
+ *
+ * 只在**离场**这两种时机结算：阈值 / 定时的 flush 只是把缓冲倒出去，
+ * 不该凭空把一次停留切成几段（`dwell` 的口径是「换了段或离开了才结算」）。
+ */
+function settleBeforeFlush(reason) {
+  if (reason !== 'pagehide' && reason !== 'visibilitychange') return;
+  settleDwell();
+  if (reason !== 'pagehide' || state.readComplete) return;
+  const index = state.current ? D.paragraphs.indexOf(state.current) + 1 : 0;
+  emitEvent('read_abandon', {
+    paragraph: state.current || null,
+    ms: state.readElapsedFrom ? Math.max(0, Date.now() - state.readElapsedFrom) : 0,
+    read_paragraphs: Math.max(0, index),
+  });
+}
+
+/**
+ * 横幅的 `data-state`：只有「失败」染红、「做成了」染绿，其余（降级 / 说明）一律黄。
+ *
+ * 2026-10-09 修「横幅不消失、还会重复堆叠」时补的：这里原先把所有非 error 的 kind 都压成
+ * `warn`，于是「背景已保存」（survey.js 用 `info` 发出来）在页面上与降级混在一起，
+ * 成功类也就无从区分、更谈不上自动消失。**只做状态映射，不改 `__arDebug` 的任何语义。**
+ */
+function bannerState(kind) {
+  if (kind === 'error' || kind === 'fatal') return 'error';
+  if (kind === 'info' || kind === 'ok') return 'info';
+  return 'warn';
 }
 
 function fatal(err) {
@@ -117,6 +198,10 @@ function renderDoc(doc, docUrl) {
   D.paragraphs = paragraphs.map((p) => p.id);
   D.docUrl = docUrl;
   D.sourceId = meta.source_id || state.ctx.sourceId;
+  // 事实锚校验块（§14.1）：`fidelity.waived` 是「哪几段申报后放行了」的唯一依据，
+  // 卡片与悬停都要显示这条标记，所以整份留一份在 state 里
+  state.fidelity = (doc.changes && doc.changes.fidelity) || null;
+  D.fidelity = state.fidelity;
 
   dom.sourceBadge.textContent = `材料：${D.sourceId || '—'}`;
 
@@ -133,17 +218,25 @@ function renderDoc(doc, docUrl) {
   paragraphs.forEach((paragraph, index) => {
     const text = blocks[index];
     const hasRewrite = typeof text === 'string' && text.length > 0;
+    const change = state.changes.get(paragraph.id) || null;
     const node = buildParagraphBlock({
       paragraphId: paragraph.id,
       text: hasRewrite ? text : paragraph.text,
-      change: state.changes.get(paragraph.id) || null,
+      change,
       unrewritten: !hasRewrite,
       sourceText: paragraph.text,
+      fidelity: state.fidelity,
     });
     dom.article.appendChild(node);
     state.blocks.set(paragraph.id, node);
     (hasRewrite ? rewrittenIds : unrewrittenIds).push(paragraph.id);
+    // ---- 配图：图容器在段落内、**正文之后**（§4.3）。图不进 rewritten.md，由前端就地插。
+    //      `degrade` 是 main.js 的可见降级出口：画不出来就在原位置留字 + 横幅（不留空白、不留破图）。
+    const figureNode = buildFigure(change, { degrade });
+    if (figureNode) node.appendChild(figureNode);
   });
+  // 图容器已经全部进 DOM 了，这时候才把 mermaid 图交给观察器（懒加载，见 figures.js 的 armFigures）
+  armFigures();
 
   D.rewrittenParagraphs = rewrittenIds;
   D.unrewritten = unrewrittenIds;
@@ -239,6 +332,21 @@ function markReadComplete() {
   state.readComplete = true;
   const stats = D.compression
     || { srcChars: 0, rwChars: 0, pct: 0, direction: 'same' };
+  renderReadNotice(stats);
+  // 读完＝正信号（§7.3 的「读完且该概念无任何求助 +0.25」）：记一条行为事件；
+  // 之后离场就不再记 read_abandon（`setReadComplete` 就是那条开关）。
+  emitEvent('read_complete', {
+    ms: state.readElapsedFrom ? Math.max(0, Date.now() - state.readElapsedFrom) : 0,
+  });
+  setReadComplete(true);
+}
+
+/**
+ * 按当前统计写读完块。
+ * 单独抽出来是因为**压缩之后正文变了**：统计要重算，已经显示出来的那句也要跟着刷新
+ * （否则页面上的字数与正文对不上——那是静默的不一致）。
+ */
+function renderReadNotice(stats) {
   const notice = dom.compression;
   notice.textContent = '';
   const lead = document.createTextNode('读完：本次改写比原文');
@@ -261,7 +369,11 @@ function markReadComplete() {
 
 function setCurrent(paragraphId) {
   if (!paragraphId || state.current === paragraphId) return;
+  // 换段之前先把上一段的停留时间结算掉（`dwell` 的 ms 就是这么来的）
+  settleDwell();
   state.current = paragraphId;
+  state.currentSince = Date.now();
+  if (!state.readElapsedFrom) state.readElapsedFrom = state.currentSince;
   D.currentParagraph = paragraphId;
   dom.body.dataset.currentParagraph = paragraphId;
 
@@ -291,7 +403,11 @@ function setDrawer(open) {
   dom.drawerToggle.setAttribute('aria-expanded', String(open));
   D.drawerOpen = open;
   hideSelectBar();
-  if (open) scrollDrawerToCurrent();
+  if (open) {
+    scrollDrawerToCurrent();
+    // 打开原文抽屉＝读者要看底本对照，记一条行为事件（`drawer_open`，§7.1）
+    emitEvent('drawer_open', { paragraph: state.current || null });
+  }
 }
 
 /* --------------------------------------------------- 阅读显示设置（②） */
@@ -409,11 +525,18 @@ function openCard(paragraphId, anchor, selection = null) {
     change: state.changes.get(paragraphId) || null,
     conceptsById: D.concepts,
     selection,
+    // 事实锚申报的「已放行」标记要看 fidelity.waived（§14.1），所以整份校验块一起交进去
+    fidelity: state.fidelity,
   });
   card.dataset.cardState = 'open';
   if (selection) layoutCardFixed(card);
   else layoutCard(card, anchor);
   D.cardOpen = true;
+  // 卡片开关**不进行为流**（§7.1 的 kind 白名单里没有这一类，见 web/README 的「行为埋点」段）：
+  // 它只落在这个可断言的调试面上，免得臆造一个服务端会丢掉的新 kind。
+  D.cardOpens = (D.cardOpens || []).concat([{
+    paragraph: paragraphId, scope: selection ? 'selection' : 'paragraph', at: Date.now(),
+  }]);
   D.lastCard = {
     paragraph: paragraphId,
     action: (state.changes.get(paragraphId) || {}).action || null,
@@ -531,6 +654,11 @@ async function requestCardExplain(paragraphId, kind, selection = null) {
     if (!done.live) summary.stale = true;
     D.lastCard = summary;
     D.cards.push({ ...summary });
+    const payload = (result && result.entry && result.entry.payload) || {};
+    noteExplainEvent(paragraphId, kind, selectionText, selectionFrom, {
+      cached: Boolean(fromCache || payload.cached === true),
+      degraded: done.state !== 'ok',
+    });
   };
 
   if (outcome.status === 'cached') {
@@ -560,6 +688,7 @@ async function requestCardExplain(paragraphId, kind, selection = null) {
       }
       D.cards.push({ ...D.lastCard });
       degrade('explain-error', `讲解请求失败（${paragraphId}）：${err.message}`);
+      noteExplainEvent(paragraphId, kind, selectionText, selectionFrom, { cached: false, degraded: true });
     }
   }
 
@@ -633,6 +762,238 @@ function renderExplainResult(card, { paragraphId, kind, selectionText, selection
   return { state: nextState, text: copy, url, live };
 }
 
+/**
+ * 讲解结果的行为事件（§7.1 的 `explain`）：只记「这次讲解是怎么来的」，**不触发任何请求**。
+ *
+ * `degraded` 的口径：只要这次不是「正常拿到了一段讲解」（后端降级 / 空回复 / 请求失败）就是 true
+ * ——行为流要能分辨「读者求助且得到了答案」与「求助没得到答案」。
+ */
+function noteExplainEvent(paragraphId, kind, selectionText, selectionFrom, { cached, degraded: isDegraded }) {
+  const payload = {
+    paragraph: paragraphId,
+    explain_kind: kind,
+    scope: selectionText ? 'selection' : 'paragraph',
+    selection_chars: selectionText ? selectionText.length : 0,
+    cached: Boolean(cached),
+    degraded: Boolean(isDegraded),
+  };
+  if (selectionText) payload.selection_from = selectionFrom;
+  return emitEvent('explain', payload);
+}
+
+/* ------------------------------------- 读中「太啰嗦」当场压缩（②，§5 / §12 第 12 条） */
+
+/** 请求里的 `reason`（契约 §5.2 的默认值）。 */
+const COMPRESS_REASON = 'too_verbose';
+
+/** 压缩成功之后这一段的新依据文案（悬停与卡片都用它，说明「为什么正文和刚才不一样了」）。 */
+const COMPRESS_NOTE = '读者点了「太啰嗦」，这一段已当场压缩：只删冗余，事实锚（数字 / 引文 / 书名号）'
+  + '一个不少。产物已写回、fidelity 已重置，请重跑 `ar check`。';
+
+/**
+ * 点「太啰嗦」→ 当场压缩这一段（契约 §5.2）。
+ *
+ * - 成功：用返回的 `text` 刷新该段正文 + 动作标记 + 悬停依据，横幅写「已压缩，请重跑 ar check」；
+ *   成功响应里 `degraded` 若非空**照样打一条 warn 横幅**（两种来源，都不影响 `ok` 与写盘：
+ *   ① 这一段没有事实锚 ⇒ 本次压缩**未经事实锚校验**；② 那条行为事件没记上）——降级必须看得见
+ *   （`degrade()` 的既有用法，正文与产物不受影响）；
+ * - 降级（`ok:false`）与请求失败：**正文一个字符都不动**，只留可见横幅与 `__arDebug.compress`；
+ * - 夹具模式：没有这个后端，说清楚而不是假装压了；
+ * - 无论哪条路都写一条行为事件（`kind: compress`，带 `ok` / `reason`），而**埋点本身不发模型请求**。
+ * - 一次只压一段（连点不会变成两次计费）；压成功那一段的标记转 `done` 且不可再点。
+ */
+async function requestParagraphCompress(paragraphId) {
+  if (state.compressPending) return null;
+  const block = state.blocks.get(paragraphId);
+  if (!block) return null;
+  // 已经压过的段不再压（标记是 disabled 的，但脚本仍可能触发 click）——同一段不重复付费
+  const button = block.querySelector('[data-role="too-verbose"]');
+  if (button && button.dataset.state === 'done') return null;
+
+  const started = Date.now();
+  D.compressEvents = (D.compressEvents || []).concat([{ type: 'compress-request', paragraph: paragraphId, at: started }]);
+  const record = {
+    paragraph: paragraphId, at: started, state: 'request', ok: null, reason: null, text: '', url: null,
+  };
+  D.compress = record;
+
+  if (!state.ctx || state.ctx.mode !== 'api') {
+    const copy = '这一段没能压缩：夹具模式没有压缩后端（POST /api/compress 只在正式模式可用），正文保持原样。';
+    degrade('compress-fixture', copy);
+    emitEvent('compress', { paragraph: paragraphId, ok: false, reason: 'fixture' });
+    D.compress = { ...record, state: 'fixture', ok: false, reason: 'fixture' };
+    D.compressEvents = D.compressEvents.concat([{ type: 'compress-done', paragraph: paragraphId, state: 'fixture' }]);
+    return D.compress;
+  }
+
+  state.compressPending = paragraphId;
+  setGutterAction(block, 'pending', '压缩中…');
+  try {
+    const { payload, url } = await requestCompress(state.ctx, { paragraph: paragraphId, reason: COMPRESS_REASON });
+    const text = payload && typeof payload.text === 'string' ? payload.text.trim() : '';
+    if (payload && payload.ok === true && text) {
+      applyCompressedParagraph(block, paragraphId, text, payload);
+      const hint = typeof payload.hint === 'string' && payload.hint.trim()
+        ? payload.hint.trim()
+        : '已压缩，请重跑 ar check。';
+      addBanner(dom.banners, hint, 'info');
+      // 成功路径也可能带降级（这一段没有事实锚 ⇒ 未经校验；或行为事件没记上）：都不影响压缩与正文，
+      // 但必须可见 —— 走 degrade() 的 warn 横幅，不藏在调试面里。
+      const notes = Array.isArray(payload.degraded) ? payload.degraded.filter(Boolean) : [];
+      if (notes.length) {
+        degrade('compress-degraded-notes', `这一段已压缩，但后端有降级说明（${paragraphId}）：${notes.join('；')}`);
+      }
+      emitEvent('compress', { paragraph: paragraphId, ok: true });
+      setGutterAction(block, 'done', '已压缩');
+      D.compress = {
+        ...record, state: 'ok', ok: true, text, url, hint,
+        cached: payload.cached === true,
+        model: payload.model || null,
+        artifactsUpdated: payload.artifacts_updated === true,
+        degraded: notes,
+        // 事实锚申报的可见面（§14.1）：这次压缩申报了什么、按哪一档口径放行了哪几项（没放行就是 []）
+        factDeclarations: (payload.fact_declarations && typeof payload.fact_declarations === 'object')
+          ? payload.fact_declarations : {},
+        waived: Array.isArray(payload.waived) ? payload.waived : [],
+        overDeclared: Array.isArray(payload.over_declared) ? payload.over_declared : [],
+        factAnchorPolicy: typeof payload.fact_anchor_policy === 'string' ? payload.fact_anchor_policy : '',
+      };
+    } else {
+      const reason = (payload && payload.reason) || 'unknown';
+      const seen = Array.isArray(payload && payload.degraded) ? payload.degraded.filter(Boolean) : [];
+      const copy = `这一段没能压缩（${reason}）：正文保持原样${seen.length ? `；后端说明：${seen.join('；')}` : ''}。`;
+      degrade('compress-degraded', `压缩降级（${paragraphId}）：${copy}`);
+      emitEvent('compress', { paragraph: paragraphId, ok: false, reason });
+      setGutterAction(block, 'idle');
+      D.compress = { ...record, state: 'degraded', ok: false, reason, url, text, degraded: seen };
+    }
+  } catch (err) {
+    const message = (err && err.message) || String(err);
+    degrade('compress-error', `压缩请求失败（${paragraphId}）：${message}。正文保持原样。`);
+    emitEvent('compress', { paragraph: paragraphId, ok: false, reason: 'request_failed' });
+    setGutterAction(block, 'idle');
+    D.compress = { ...record, state: 'error', ok: false, reason: 'request_failed', message };
+  } finally {
+    state.compressPending = null;
+    D.compressEvents = D.compressEvents.concat([{
+      type: 'compress-done', paragraph: paragraphId, state: D.compress ? D.compress.state : null, at: Date.now(),
+    }]);
+  }
+  return D.compress;
+}
+
+/**
+ * 把压缩稿落进页面：换正文、换动作标记与依据、重算压缩统计、必要时刷新读完块。
+ *
+ * 只碰**页面状态**：产物落盘是后端的事（`artifacts_updated`），前端不写文件。
+ * 图那一块特殊：压缩之后正文与原来的配图不再配套，就地把它摘掉并在 `__arDebug.figures` 里留痕。
+ *
+ * 事实锚申报（§14.1）：`compress-v2` 起在线压缩也有申报通道，所以这一段要按**本次压缩**的结果重画——
+ * 后端响应带回 `fact_declarations`（这次申报了什么）/ `waived`（按读者口径放行了哪几项）/
+ * `over_declared`（多申报了几项）/ `fact_anchor_policy`（哪一档口径），
+ * 同一份数据也已经写进 `changes[i].fact_declarations`（重跑 `ar check` 后进 `fidelity.waived`）。
+ * 页面上就地补一层 `fidelity` 覆盖（只影响**这一段**的显示，不改产物），
+ * 免得到重跑 `ar check` 之前一直显示「未放行」——那与后端刚做的判定自相矛盾。
+ *
+ * 依据画像（2026-10-14）：后端压缩那一段走的是**全新**的变更记录（`why.profile` 清空、
+ * `why.note` 换成压缩说明），所以产物里已经没有 `profile_refs_filled` 了。本函数于是把
+ * 那个键一并摘掉（与 `deferred` / `figure` / `fact_declarations` 同一条口径），
+ * 卡片开着时也把「依据画像」那一块就地重画——**不许留一枚产物里已经不在的徽标**。
+ */
+function applyCompressedParagraph(block, paragraphId, text, payload) {
+  setBlockText(block, text);
+
+  const previous = state.changes.get(paragraphId) || null;
+  const previousWhy = (previous && previous.why) || {};
+  const next = {
+    ...(previous || {}),
+    paragraph: paragraphId,
+    action: 'compress',
+    why: {
+      profile: Array.isArray(previousWhy.profile) ? previousWhy.profile.slice() : [],
+      note: COMPRESS_NOTE,
+    },
+    confidence: previous && typeof previous.confidence === 'number' ? previous.confidence : null,
+    facts: (previous && previous.facts) || { numbers: [], quotes: [] },
+  };
+  // 这一段现在是「真压过了」：deferred（枚举内未实现）与配图标记都不再成立；
+  // 申报换成**本次压缩**的那一份（后端在响应里带回，与写进产物的是同一份数据）：
+  // 本次没有申报 ⇒ 整键不出现（照「为真才出现」的先例），旧的那份不能留（它说的是上一次的账）。
+  delete next.deferred;
+  delete next.figure;
+  delete next.figure_error;
+  delete next.fact_declarations;
+  // 兜底补齐标记同理要摘掉（2026-10-14）：后端压缩那一段走的是**全新**的变更记录
+  // （`why.profile` 清空、`why.note` 换成压缩说明），产物里已经**没有** `profile_refs_filled`
+  // 这个键了——本地重画若沿用压前那一份，页面就会挂着「产物已无标记」的过期徽标。
+  delete next.profile_refs_filled;
+  const declared = payload && payload.fact_declarations;
+  if (declared && typeof declared === 'object' && !Array.isArray(declared) && Object.keys(declared).length) {
+    next.fact_declarations = declared;
+  }
+  applyCompressFidelity(paragraphId, payload);
+  state.changes.set(paragraphId, next);
+  D.changes = Object.fromEntries(state.changes);
+  applyChangeToBlock(block, next, { fidelity: state.fidelity });
+
+  const figureNode = block.querySelector('[data-role="figure"]');
+  if (figureNode) {
+    if (Array.isArray(D.figures)) {
+      D.figures.forEach((item) => {
+        if (item.paragraph === paragraphId) item.state = 'removed';
+      });
+    }
+    figureNode.remove();
+  }
+
+  // 卡片正开着这一段：把「动作 + 依据」就地换成新的（答案与缓存不动，别把读者正在看的东西抹掉），
+  // 申报那一块按本次压缩的结果重画（原来是整块摘掉——那时压缩路径还没有申报通道）
+  if (D.cardOpen && state.card && state.card.dataset.paragraph === paragraphId) {
+    const actionEl = state.card.querySelector('[data-role="card-action"]');
+    if (actionEl) {
+      actionEl.textContent = actionLabel('compress');
+      actionEl.dataset.action = 'compress';
+    }
+    const whyEl = state.card.querySelector('[data-role="card-why"]');
+    if (whyEl) whyEl.textContent = next.why.note;
+    renderCardDeclaration(state.card, next, state.fidelity);
+    // 「依据画像」那一块也要重画：这一段原来的 `profile_refs_filled` 标记已经作废
+    // （产物里压缩写的是全新一条记录，没有这个键），不重画就会留着过期的「兜底补齐」徽标。
+    renderCardProfile(state.card, next);
+  }
+
+  const noticeShown = Boolean(D.compression && D.compression.shown);
+  computeCompression(state.paragraphs);
+  if (noticeShown) renderReadNotice(D.compression);
+}
+
+/**
+ * 把一次在线压缩的申报结果并进页面上的 `fidelity`（§14.1，**只影响显示**）。
+ *
+ * 产物的 `fidelity` 在每次合并之后都被**重置为未校验**（`waived: []`，这是既有契约：
+ * 校验结论不能跨重跑复用），所以刚压完这段时间里页面若只看产物，会把「已按口径放行」显示成
+ * 「未放行」。这里按本次响应的 `waived` / `over_declared` / `fact_anchor_policy` 给这一段落补一层
+ * 覆盖：先把这一段在旧列表里的行摘掉（重压过一次，旧账作废），再并进本次的条目。
+ * 重跑 `ar check` 后产物里的 `fidelity` 才是权威（那时刷新页面即可）。
+ */
+function applyCompressFidelity(paragraphId, payload) {
+  const rowsOf = (value) => (Array.isArray(value) ? value.filter((row) => row && typeof row === 'object') : []);
+  const waived = rowsOf(payload && payload.waived);
+  const overDeclared = rowsOf(payload && payload.over_declared);
+  const policy = payload && typeof payload.fact_anchor_policy === 'string' ? payload.fact_anchor_policy : '';
+  const current = (state.fidelity && typeof state.fidelity === 'object') ? state.fidelity : null;
+  if (!current && !waived.length && !overDeclared.length && !policy) return;
+  const base = current || {};
+  const keepOthers = (key) => rowsOf(base[key]).filter((row) => row.paragraph !== paragraphId);
+  state.fidelity = {
+    ...base,
+    fact_anchor_policy: policy || base.fact_anchor_policy || '',
+    waived: [...keepOthers('waived'), ...waived],
+    over_declared: [...keepOthers('over_declared'), ...overDeclared],
+  };
+  D.fidelity = state.fidelity;
+}
+
 /* --------------------------------------------------- 选片讲解浮条（①） */
 
 function currentBrowserSelection() {
@@ -688,6 +1049,13 @@ function showSelectBar(desc) {
   // 页面内部状态与调试面同源：点浮条按钮时读的就是这一份
   state.selection = snapshot;
   D.selection = { ...snapshot };
+  // 选了一段文字＝「选片求助」的入口（§7.1 的 `selection`：chars / spans / from）
+  emitEvent('selection', {
+    paragraph: desc.paragraphId,
+    chars: desc.chars,
+    spans: desc.spans,
+    from: desc.from,
+  });
 }
 
 /**
@@ -764,7 +1132,7 @@ function debugSelect({ paragraph, from = 'rewritten', start = 0, length = 8 }) {
 
 /* ------------------------------------------------------------ 交互接线 */
 function wireInteractions() {
-  // 段落标记：悬停显示动作与依据；点击弹卡片
+  // 段落标记：悬停显示动作与依据；点击弹卡片；同一条标记槽里还有「太啰嗦」（当场压缩这一段）
   state.blocks.forEach((block, paragraphId) => {
     const gutter = block.querySelector('.block__gutter');
     const marker = block.querySelector('[data-role="marker"]');
@@ -774,6 +1142,13 @@ function wireInteractions() {
       event.stopPropagation();
       openCard(paragraphId, marker);
     });
+    const verbose = block.querySelector('[data-role="too-verbose"]');
+    if (verbose) {
+      verbose.addEventListener('click', (event) => {
+        event.stopPropagation();
+        requestParagraphCompress(paragraphId);
+      });
+    }
   });
 
   // 点外部关闭卡片；Esc 也关（顺带收浮条与设置面板）
@@ -790,6 +1165,11 @@ function wireInteractions() {
   });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    // 问卷优先：Esc 与问卷的「跳过」同效，由 js/survey.js 自己处理（那里还会问一次确认）。
+    // 这里直接让路，免得同一个 Esc 顺带把讲解卡片也关掉。
+    // （状态面板那条让路判定 2026-10-15 删掉了：面板搬到了启动页，阅读器页没有 `#status-host`，
+    //   `status.js` 也压根不在这页挂上，`isStatusOpen()` 在这里恒为 false —— 死判定。）
+    if (isSurveyOpen()) return;
     closeCard('escape');
     setSettingsPanelOpen_(false);
     hideSelectBar();
@@ -885,11 +1265,43 @@ function updateCurrentFromScroll() {
   setCurrent(readingLineParagraph(state.paragraphs, state.blocks));
 }
 
+/* ------------------------------------------------------------ 读前背景问卷 */
+
+/**
+ * 问一句服务端画像要不要弹问卷（PLAN-background-survey §7/§9）。
+ *
+ * 四条纪律：
+ *   - **放在正文之后**：`finishReady()` 已置位、正文已可读；这里失败也不影响阅读；
+ *   - **判定只看服务端画像**：`answers` 非空或 `skipped` 为真就不弹（不看 localStorage）；
+ *   - **不打扰就是页面上一个字都不多**：`already-answered` / `skipped-before` 这一档
+ *     **不弹横幅**（2026-10-15 起那条「已答过 / 已跳过」的说明横幅整条去掉），
+ *     原因只落在 `__arDebug.surveyBootReason` 上供无头验证断言；`?survey=1` 这条出路
+ *     写在 `web/README.md` 的交互段里，不靠横幅提醒读者；
+ *   - **不 await**：问卷取数是异步的，`ready` 不等它（等它就等于让阅读等问卷）。
+ *     无头验证等的是 `__arDebug.surveyOpen` / `surveyEvents` 这些问卷自己的显式状态。
+ */
+function bootSurvey_() {
+  bootSurvey({
+    ctx: state.ctx,
+    banner: (text, kind) => addBanner(dom.banners, text, bannerState(kind)),
+    degrade,
+  }).then((result) => {
+    // 只记原因（无头验证断言它），不弹横幅：已有背景 / 此前跳过时问卷不弹
+    D.surveyBootReason = result && result.reason ? result.reason : null;
+  }).catch((err) => {
+    // bootSurvey 内部已把失败转成可见降级；这里只兜底「连它自己都炸了」的情况
+    D.errors.push({ kind: 'survey-boot', message: String((err && err.message) || err) });
+    degrade('survey-boot', `背景问卷没能启动（${err && err.message ? err.message : err}）：本次按「未提供背景」处理，阅读照常。`);
+  });
+}
+
 /* ------------------------------------------------------------ 启动 */
 
 async function boot() {
   // 无头验证入口（同 __arDebug 的其它字段：可断言的显式状态，不是业务逻辑）
   D.debugSelect = debugSelect;
+  D.debugEvent = (kind, payload) => emitEvent(kind, payload || {});
+  D.debugFlush = (reason) => flushEvents(reason || 'manual');
 
   // ① 选片讲解浮条：先造出来（无头验证要能查到 [data-role="select-bar"]），选区变化时才显示
   const bar = buildSelectBar();
@@ -917,6 +1329,19 @@ async function boot() {
       `夹具模式：数据来自静态文件 samples/${state.ctx.sourceId}/doc.json，不是后端 /api/*，也不是模型实时产出。`);
   }
 
+  // ④ 行为埋点（PLAN-actions-feedback §7.1/§7.2）：缓冲 + 阈值/定时 flush + 离场强刷。
+  //    放在取正文之前挂：正文渲染本身也产生信号（dwell / 读完 / 讲解）。
+  //    `api` 只给 `postEvents`——埋点这条路**碰不到**讲解 / 压缩（§9 的纪律）。
+  initEvents({
+    ctx: state.ctx,
+    api: postEvents,
+    sourceId: state.ctx.sourceId,
+    banner: (text, kind) => addBanner(dom.banners, text, bannerState(kind)),
+    degrade,
+    preFlush: settleBeforeFlush,
+  });
+  D.eventsFlushIntervalMs = FLUSH_INTERVAL_MS;
+
   try {
     const { doc, url } = await loadDoc(state.ctx);
     renderDoc(doc, url);
@@ -927,6 +1352,9 @@ async function boot() {
     return;
   }
   finishReady();
+
+  // ③ 正文就绪之后才问「要不要弹背景问卷」：不挡阅读；正文渲染失败时压根走不到这里（PLAN §7）
+  bootSurvey_();
 }
 
 boot();

@@ -9,8 +9,10 @@
 3. **缓存**：同键第二次调用不再碰模型且 ``cached: true``；换 kind / 换片段 / 换材料不串味；
    画像文件一变即失效；失败与降级一律不进缓存；LRU 容量与线程安全；
 4. **向后兼容**：旧请求体（没有 selection）正常；三条既有降级路径（``paragraph_not_found`` /
-   ``model_not_configured`` / ``model_error``）的原因枚举不变、旧键一个不少（只多一个请求侧的 ``scope``）；
-   成功响应另追加 ``usage``（本次调用的原始 token 账，含 ``prompt_tokens_details.cached_tokens``）。
+   ``model_not_configured`` / ``model_error``）的原因枚举不变、旧键一个不少（只多请求侧的 ``scope``
+   与逐次账 ``attempts``）；
+   成功响应另追加 ``usage``（本次调用的原始 token 账，含 ``prompt_tokens_details.cached_tokens``）与
+   ``attempts``（逐次尝试账，结构 = 产物里的 ``meta.attempts``；讲解不落盘，这是它唯一的出口）。
 
 所有模型调用都注入假客户端（``fake_client``），不发真实网络请求。
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
@@ -28,6 +31,7 @@ from ar.cache import DEFAULT_CAPACITY, ExplainCache, explain_cache_key
 from ar.config import Config
 from ar.explain import prepare_selection
 from ar.ingest import ingest
+from ar.llm import LlmFailure, LlmResult, RetryPolicy
 from ar.model import ModelCallFailed
 from ar.server import build_app
 
@@ -82,10 +86,13 @@ def test_selection_absent_keeps_legacy_shape_and_paragraph_scope(
 
     assert payload["degraded"] is False
     assert payload["scope"] == "paragraph"
-    # 成功响应 = 旧四键 + 追加的 scope 与 usage（reason / cached / selection_truncated 都不该出现）。
-    # usage（2026-10-08）是**追加**字段：原有键逐字不变，这里把键集写全（不是放宽，是加了一项）。
-    assert set(payload) == {"text", "degraded", "model", "prompt_version", "scope", "usage"}
+    # 成功响应 = 旧四键 + 追加的 scope / usage / attempts
+    # （reason / cached / selection_truncated 都不该出现）。
+    # usage（2026-10-08）与 attempts（2026-10-13）都是**追加**字段：原有键逐字不变，
+    # 这里把键集写全（不是放宽，是加了两项）。
+    assert set(payload) == {"text", "degraded", "model", "prompt_version", "scope", "usage", "attempts"}
     assert "cached" not in payload and "selection_truncated" not in payload
+    assert [item["try"] for item in payload["attempts"]] == [1], "成功也是逐次账（这里只试了一次）"
 
     assert len(fake.calls) == 1
     sent = fake.calls[0][1]["content"]
@@ -109,9 +116,10 @@ def test_explain_success_response_exposes_usage_with_cached_tokens(
             self.usage = usage
             self.calls: list[list[dict[str, str]]] = []
 
-        async def achat(self, messages, **kwargs):  # noqa: ANN001, ANN003
-            self.calls.append(list(messages))
-            return SimpleNamespace(text="按画像讲解。", model="fake-model", usage=self.usage)
+        async def arequest_once(self, request: Any) -> LlmResult:
+            """统一调用层的唯一入口（``ar.explain`` 经工具层调它）。"""
+            self.calls.append([dict(message) for message in request.messages])
+            return LlmResult(ok=True, text="按画像讲解。", model="fake-model", usage=dict(self.usage))
 
     usage = {
         "prompt_tokens": 1200,
@@ -150,6 +158,7 @@ def test_selection_scope_puts_fragment_in_messages_and_keeps_context(
     assert "选中的片段" in sent and "讲解重点" in sent
     assert "第一段：带" in sent, "整段原文仍在（只作上下文）"
     assert "[p003]" in sent and "[p005]" in sent, "邻段上下文照旧"
+    assert "[prev]" not in sent and "[next]" not in sent, "邻段行必须带**真实段 id**（工具层的 prev_id / next_id）"
     assert "来自改写稿" in sent
     # system 提示词也点明了「重点是选中的片段」
     assert "选中的片段" in fake.calls[0][0]["content"]
@@ -236,6 +245,63 @@ def test_selection_truncation_is_reported_even_when_degraded(ingested: SimpleNam
 
 
 # ------------------------------------------------------------ selection_from --
+def test_explain_prompt_is_byte_identical_to_the_direct_builder(
+    ingested: SimpleNamespace, fake_client
+) -> None:
+    """提示词**逐字不变**：经工具层拼出来的 messages 与业务侧直接拼的逐字相同。
+
+    邻段行在模板里是 ``[段id] 正文``，而 §3.3 给工具层的只有 ``prev`` / ``next`` 两个字符串；
+    所以工具层追加了可选入参 ``prev_id`` / ``next_id``（业务侧传真实段 id）——少了它们，
+    提示词会退化成 ``[prev]`` / ``[next]``，前缀缓存与回归基线都会跟着变。
+    """
+    from ar.jsonio import read_json
+    from ar.prompts import build_explain_messages
+
+    fake = fake_client(text="讲解。")
+    client = make_client(ingested, api_key=FAKE_KEY, client_factory=lambda: fake)
+    client.post("/api/explain", json=explain_body(selection="连续空白"))  # p004，前后各一段
+
+    paragraphs = read_json(ingested.data / "sample" / "source.meta.json")["paragraphs"]
+    index = [p["id"] for p in paragraphs].index("p004")
+    expected = build_explain_messages(
+        kind="explain",
+        paragraph_id="p004",
+        paragraph_text=paragraphs[index]["text"],
+        neighbors=[
+            (paragraphs[index - 1]["id"], paragraphs[index - 1]["text"]),
+            (paragraphs[index + 1]["id"], paragraphs[index + 1]["text"]),
+        ],
+        profile_hint=None,  # 空画像：None 与空串在模板里同一条分支
+        selection="连续空白",
+        selection_from="rewritten",
+    )
+    assert fake.calls[0] == expected, "迁移后提示词不再与业务侧直接拼的逐字相同"
+
+
+def test_out_of_enum_kind_falls_back_softly_instead_of_400(
+    ingested: SimpleNamespace, fake_client
+) -> None:
+    """枚举外的 ``kind``：既有行为是**软回落**到 ``explain``（HTTP 200），迁移后必须逐字不变。
+
+    工具层的 ``kind`` 是**强校验**（JSON Schema 的 ``enum``），直接把它丢进工具会变成
+    入参错误（400）——所以业务侧仍要先归一化；这条用例守住那一步不被删掉。
+    """
+    fake = fake_client(text="兜底讲解。")
+    client = make_client(ingested, api_key=FAKE_KEY, client_factory=lambda: fake)
+
+    response = client.post("/api/explain", json=explain_body(kind="frobnicate"))
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["degraded"] is False and payload["text"] == "兜底讲解。"
+    # 回落成 explain：提示词里写的是 explain 的讲法
+    assert "把这个段落讲清楚" in fake.calls[0][1]["content"]
+
+    # 非字符串仍是 400（HTTP 层先校验），绝不是 500
+    bad = client.post("/api/explain", json=explain_body(paragraph="p005", kind=5))
+    assert bad.status_code == 400, bad.text
+    assert "kind" in bad.json()["error"]
+
+
 def test_selection_from_labels_provenance_and_rejects_bad_values(
     ingested: SimpleNamespace, fake_client
 ) -> None:
@@ -408,27 +474,79 @@ def test_failures_and_degradations_are_never_cached(ingested: SimpleNamespace, f
 def test_degraded_explain_responses_keep_the_legacy_keys_and_reasons(
     ingested: SimpleNamespace, fake_client
 ) -> None:
-    """三条既有降级路径：原因枚举不变、旧键一个不少；只多一个请求侧的 scope。"""
+    """三条既有降级路径：原因枚举不变、旧键一个不少；只多请求侧的 scope 与逐次账 attempts。"""
+    legacy_keys = {"text", "degraded", "reason", "scope", "attempts"}
     missing_source = make_client(ingested).post(
         "/api/explain", json={"source_id": "nosuchdoc", "paragraph": "p001"}
     ).json()
     assert missing_source["reason"] == "source_not_found"
-    assert set(missing_source) == {"text", "degraded", "reason", "scope"}
+    assert set(missing_source) == legacy_keys
     assert missing_source["scope"] == "paragraph"
+    assert missing_source["attempts"] == [], "材料不存在：一次请求都没发"
 
     not_configured = make_client(ingested).post("/api/explain", json=explain_body()).json()
     assert not_configured["reason"] == "model_not_configured"
-    assert set(not_configured) == {"text", "degraded", "reason", "scope"}
+    assert set(not_configured) == legacy_keys
+    assert not_configured["attempts"] == [], "未配置：一次请求都没发"
 
     not_found = make_client(ingested).post("/api/explain", json=explain_body(paragraph="p404")).json()
     assert not_found["reason"] == "paragraph_not_found" and "p404" in not_found["text"]
-    assert set(not_found) == {"text", "degraded", "reason", "scope"}
+    assert set(not_found) == legacy_keys
+    assert not_found["attempts"] == [], "段落不存在：一次请求都没发"
 
     failing = fake_client(error=ModelCallFailed("模型调用失败（已试 2 次）：HTTP 503"))
     broken = make_client(ingested, api_key=FAKE_KEY, client_factory=lambda: failing)
     model_error = broken.post("/api/explain", json=explain_body()).json()
     assert model_error["reason"] == "model_error" and "503" in model_error["text"]
-    assert set(model_error) == {"text", "degraded", "reason", "scope"}
+    assert set(model_error) == legacy_keys
+    # 模型失败：账目留在响应里，看得见「试了几次、末次什么码」
+    assert len(model_error["attempts"]) == 1 and model_error["attempts"][0]["code"] == "UNKNOWN"
+    assert "已试 1 次，末次 UNKNOWN" in model_error["text"]
+    assert FAKE_KEY not in model_error["text"], "失败文案不许带密钥"
+
+
+def test_explain_attempts_record_every_retry_on_success_and_degradation(
+    ingested: SimpleNamespace,
+) -> None:
+    """``attempts``（2026-10-13 追加字段）：首发失败 + 重试成功 → 两条账，成功响应也给。
+
+    讲解**不落盘**，所以这是它的重试账唯一能被看见的地方；结构 = 产物里的 ``meta.attempts``。
+    """
+
+    class _FlakyOnceClient:
+        """只实现统一调用层要的三个成员：第一次 503、第二次成功。"""
+
+        configured = True
+
+        def __init__(self) -> None:
+            self.requests = 0
+            self.messages: list[list[dict[str, str]]] = []
+
+        def retry_policy(self) -> RetryPolicy:
+            # 退避 0 秒：用例不该真的等 500 ms
+            return RetryPolicy(max_retries=1, initial_delay_ms=0, max_delay_ms=0)
+
+        async def arequest_once(self, request: Any) -> LlmResult:
+            self.requests += 1
+            self.messages.append([dict(message) for message in request.messages])
+            if self.requests == 1:
+                return LlmResult(
+                    ok=False, failure=LlmFailure(code="SERVER", message="HTTP 503：网关抖动", status=503)
+                )
+            return LlmResult(ok=True, text="重试后的讲解。", model="fake-model", usage={"total_tokens": 3})
+
+    flaky = _FlakyOnceClient()
+    client = make_client(ingested, api_key=FAKE_KEY, client_factory=lambda: flaky)
+    payload = client.post("/api/explain", json=explain_body()).json()
+
+    assert payload["degraded"] is False and payload["text"] == "重试后的讲解。"
+    assert flaky.requests == 2, "重试真的发了第二次请求（真实 HTTP 次数 = 2）"
+    assert [item["try"] for item in payload["attempts"]] == [1, 2]
+    assert set(payload["attempts"][0]) == {"tool", "try", "elapsed_ms", "code", "delay_ms", "retry_after_used"}
+    assert payload["attempts"][0]["tool"] == "explain_paragraph"
+    assert payload["attempts"][0]["code"] == "SERVER" and payload["attempts"][1]["code"] is None
+    # 第二次尝试的提示词与第一次逐字相同（重试不带上一次的残留）
+    assert flaky.messages[0] == flaky.messages[1]
 
 
 def test_paragraph_not_found_is_not_cached_and_never_calls_the_model(
