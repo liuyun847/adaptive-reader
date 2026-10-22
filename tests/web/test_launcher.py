@@ -3,14 +3,16 @@
 🔁 2026-10-15 拆页：阅读器页从 `web/index.html` 改名为 `web/reader.html`，`web/index.html` 变成**启动页**。
 本文件是新页面的用例（阅读器那几套见 `test_reader_ui.py` / `test_reader_features.py` 等）。
 
-覆盖**启动页四块**（顺序即页面顺序，见 `data-block`）：
+覆盖**启动页四块**（DOM 顺序见 `data-block`；**视觉版面**另有两列网格：历史记录 / 输入文件并排、
+背景测评整行，未答时在第一行、有记录时在最后一行 —— 见「主栏版面」那一节）：
 
-1. ① 状态：只验「四块都在 + 入口在①块里」（面板自己的行为在 `test_status_panel.py` 里逐条测）；
-2. ② 做测试（读前背景问卷）：卡片三态（未答 / 已答 / 已跳过）+ 读不到时的可见降级；
+1. 测试和修改（**在顶栏里**，2026-10-20 从主栏那张卡搬上去）：只验「四块都在 + 入口在顶栏那颗块里」
+   （面板自己的行为在 `test_status_panel.py` 里逐条测）；
+2. 背景测评（读前背景问卷）：卡片三态（未答 / 已答 / 已跳过）+ 读不到时的可见降级；
    **默认绝不自动弹**；点「填写问卷」就地打开**同一张**问卷，答完 / 关闭后卡片状态刷新；
-3. ③ 历史记录：有材料 / 空列表 / 接口 404 / 结构不符四种现场；每条显示 source_id、段数、
+3. 历史记录：有材料 / 空列表 / 接口 404 / 结构不符四种现场；每条显示 source_id、段数、
    最后动过的时间（本地可读格式）、动作统计、校验状态、缺哪份产物；点一条进 `/reader?source=<id>`；
-4. ④ 输入文件：上传成功 / 400 / 409 三条路径的文案与按钮状态；前端粗判挡住明显的错（不发请求）。
+4. 输入文件：上传成功 / 400 / 409 三条路径的文案与按钮状态；前端粗判挡住明显的错（不发请求）。
 
 假后端沿用 `tests/web/ar_backend.py` 那套写法（`page.route` 路由级拦截 + 记请求清单 + 固定 JSON），
 **零真实模型调用**；就绪只等页面里的显式状态（`__arDebug.ready`），不 sleep。
@@ -362,7 +364,12 @@ def seed_settings(page, ar_server, payload: dict) -> None:
 # =================================================== 1. 四块都在、无 JS 报错
 
 def test_launcher_has_four_blocks_and_no_js_errors(page, ar_server):
-    """四块按 ①状态 ②做测试 ③历史记录 ④输入文件 的顺序渲染；页面没有 JS 报错。"""
+    """四块按「测试和修改（顶栏）→ 背景测评 → 历史记录 → 输入文件」的 **DOM 顺序**渲染
+    （视觉版面见「主栏版面」一节，那里靠 flex `order` 摆，与这里的 DOM 次序无关）；页面没有 JS 报错。
+
+    2026-10-20：状态那块搬进顶栏（只剩一颗「测试和修改」按钮，主栏不再有它），
+    主栏三块的标题去掉了编号。
+    """
     api = LauncherApi(page, sources=sources_payload([MATERIAL_ENTRY]),
                       survey=survey_payload())
     open_launcher(page, ar_server)
@@ -373,10 +380,18 @@ def test_launcher_has_four_blocks_and_no_js_errors(page, ar_server):
         "els => els.map(el => el.dataset.block)"
     ) == ["status", "survey", "history", "upload"]
 
-    for name, title in (("status", "① 状态"), ("survey", "② 做测试"),
-                        ("history", "③ 历史记录"), ("upload", "④ 输入文件")):
+    for name, title in (("status", "测试和修改"), ("survey", "背景测评"),
+                        ("history", "历史记录"), ("upload", "输入文件")):
         expect(block(page, name)).to_be_visible()
         assert title in block(page, name).inner_text(), f"{name} 块的标题不对"
+
+    # 状态那块搬进了顶栏：它不是主栏里的卡片，而是顶栏里的一颗按钮
+    assert page.evaluate(
+        "() => Boolean(document.querySelector('.topbar [data-role=\"launcher-block\"]"
+        "[data-block=\"status\"]'))"
+    ), "「测试和修改」入口不在顶栏里"
+    assert page.locator("main.launcher [data-role=\"launcher-block\"][data-block=\"status\"]").count() == 0, \
+        "主栏不该再有状态那块"
 
     debug = dbg(page)
     assert debug["page"] == "launcher"
@@ -393,7 +408,7 @@ def test_launcher_has_four_blocks_and_no_js_errors(page, ar_server):
 
 
 def test_status_entry_lives_in_the_first_block(page, ar_server):
-    """① 状态块里就是原来阅读器顶栏那个入口（面板行为由 test_status_panel.py 逐条测）。"""
+    """「测试和修改」那块（`data-block="status"`）里就是原来阅读器顶栏那个入口（面板行为由 test_status_panel.py 逐条测）。"""
     LauncherApi(page, sources=sources_payload([]), survey=survey_payload())
     open_launcher(page, ar_server)
 
@@ -408,7 +423,68 @@ def test_status_entry_lives_in_the_first_block(page, ar_server):
     assert page.locator('[data-role="status-card"]').count() == 0, "启动页不该自动弹出状态面板"
 
 
-# =================================================== 2. ③ 历史记录
+# ---------------------------------------------------------------- 主栏版面
+
+def block_boxes(page) -> dict:
+    """主栏三块卡片的文档坐标（`getBoundingClientRect` + 滚动量）——按 `data-block` 取名。
+
+    版面断言读**算好的几何**（不是把 CSS 抄一遍）：`x / y / w / h` 都是渲染结果。
+    DOM 顺序（`data-role="launcher-block"` 的次序）仍是 status→survey→history→upload，
+    视觉顺序靠 flex `order` 摆，所以只在这里读坐标才能验出来。
+    """
+    return page.evaluate(
+        """() => {
+             const out = {};
+             document.querySelectorAll('main.launcher [data-role="launcher-block"]').forEach((el) => {
+               const r = el.getBoundingClientRect();
+               out[el.dataset.block] = {
+                 x: r.x + window.scrollX, y: r.y + window.scrollY, w: r.width, h: r.height,
+               };
+             });
+             return out;
+           }"""
+    )
+
+
+def test_layout_puts_upload_left_of_history_on_one_row(page, ar_server):
+    """历史记录 / 输入文件**并排一行**：输入文件在左、历史记录在右（主栏两列弹性网格）。"""
+    LauncherApi(page, sources=sources_payload([MATERIAL_ENTRY]), survey=survey_payload())
+    open_launcher(page, ar_server)
+
+    box = block_boxes(page)
+    upload, history = box["upload"], box["history"]
+    assert upload["y"] == pytest.approx(history["y"], abs=1), "两块不在同一行"
+    assert upload["x"] + upload["w"] <= history["x"] + 1, "输入文件不在历史记录左边"
+    assert upload["w"] > 0 and history["w"] > 0
+
+
+@pytest.mark.parametrize("kind,payload,layout", [
+    ("unanswered", survey_payload(), "empty"),                                  # 未答（空）
+    ("answered", survey_payload(answered={"education": "undergraduate"}), "record"),   # 已答
+    ("skipped", survey_payload(skipped=True), "record"),                        # 已跳过
+])
+def test_survey_row_follows_its_state(page, ar_server, kind, payload, layout):
+    """背景测评**空（未答）时在第一行**、**有记录（已答 / 已跳过）时挪到最后一行**；
+    两种情形下背景测评都**整行铺满**。开关是 `.launcher` 上的 `data-survey`（见 web/css/launcher.css）。"""
+    LauncherApi(page, sources=sources_payload([MATERIAL_ENTRY]), survey=payload)
+    open_launcher(page, ar_server)
+
+    assert page.evaluate(
+        "() => document.querySelector('[data-role=\"launcher\"]').dataset.survey"
+    ) == layout, kind
+
+    box = block_boxes(page)
+    survey, upload, history = box["survey"], box["upload"], box["history"]
+    # 整行铺满：比并排的两块都宽（且与两块的可见宽度之和相当）
+    assert survey["w"] > upload["w"] and survey["w"] > history["w"], "背景测评没有整行铺满"
+    assert survey["w"] >= upload["w"] + history["w"], "背景测评没有铺满这一行"
+    if layout == "empty":
+        assert survey["y"] < upload["y"], "未答时背景测评应在第一行（在两块之前）"
+    else:
+        assert survey["y"] > history["y"], "有记录时背景测评应在最后一行（在两块之后）"
+
+
+# =================================================== 2. 历史记录
 
 def test_history_renders_every_field_for_each_material(page, ar_server):
     """有材料：source_id / 段数 / mtime（本地可读）/ 动作统计 / 校验状态 / 缺哪份产物，逐条都在。"""
@@ -529,7 +605,7 @@ def test_history_shape_mismatch_is_visible_and_broken_rows_are_named(page, ar_se
     assert api.calls("/api/sources")
 
 
-# =================================================== 3. ④ 输入文件
+# =================================================== 3. 输入文件
 
 def test_upload_button_is_disabled_until_a_whitelisted_file_is_chosen(page, ar_server):
     """未选文件 / 扩展名不在白名单 / source_id 非法：按钮禁用 + 可读提示，且**一个请求都不发**。"""
@@ -720,7 +796,7 @@ def test_upload_button_is_disabled_while_the_request_is_in_flight(page, ar_serve
     assert not page.locator('[data-role="upload-submit"]').is_disabled()
 
 
-# =================================================== 4. ② 做测试（问卷）
+# =================================================== 4. 背景测评（问卷）
 
 @pytest.mark.parametrize("kind,payload,expected_state,expected_text,button_label", [
     ("unanswered", survey_payload(), "unanswered", "还没答过", "填写问卷"),

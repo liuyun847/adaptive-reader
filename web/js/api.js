@@ -145,6 +145,70 @@ export async function loadProfileSignal(ctx) {
   return profileSignalOf(data);
 }
 
+/* ------------------------------------------- 读者画像的读与写（2026-10-22） */
+
+export const PROFILE_RATING_URL = '/api/profile/rating';
+export const PROFILE_PREFERENCE_URL = '/api/profile/preference';
+
+function requireApiMode(ctx, url, what) {
+  if (!ctx || ctx.mode !== 'api') {
+    throw new DataError(`夹具模式没有画像后端（${what} 只在正式模式可用）`, {
+      url, kind: 'fixture', status: null,
+    });
+  }
+}
+
+function profilePayloadOf(data, url) {
+  if (!data || typeof data !== 'object' || typeof data.profile !== 'object' || data.profile === null) {
+    throw new DataError('响应里没有 profile 对象，不是合法的画像响应体', { url, kind: 'shape' });
+  }
+  return data;
+}
+
+/** `GET /api/profile`：`{profile, degraded[]}`（默认读者 `local-default`）。 */
+export async function fetchProfile(ctx) {
+  requireApiMode(ctx, PROFILE_URL, 'GET /api/profile');
+  const { data, url } = await firstOk([PROFILE_URL]);
+  return { payload: profilePayloadOf(data, url), url, mode: 'api' };
+}
+
+/**
+ * `POST /api/profile/rating`：写一条概念自评。
+ *
+ * 请求 `{concept_id, state, note?}`（`state ∈ known/partial/unknown`）；
+ * 响应 `{ok, profile, degraded[]}`——**profile 是写回后的整份画像**，页面据此就地刷新，
+ * 不必再读一次。写盘失败时后端回 500 + 可读 `error`，调用方只显示失败、不先改界面。
+ */
+export async function postRating(ctx, { conceptId, state, note } = {}) {
+  requireApiMode(ctx, PROFILE_RATING_URL, 'POST /api/profile/rating');
+  const body = { concept_id: conceptId, state };
+  if (typeof note === 'string' && note.trim()) body.note = note.trim();
+  const { data, url } = await firstOk([PROFILE_RATING_URL], {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { payload: profilePayloadOf(data, url), url, mode: 'api' };
+}
+
+/**
+ * `POST /api/profile/preference`：写一条偏好（目前可写的只有 `pref_fact_anchor`）。
+ *
+ * 请求 `{id, value, note?}`；响应 `{ok, profile, degraded[]}`。
+ * 同 id 同取值幂等：后端不追加证据、不写盘，画像指纹不变（讲解缓存不会白失效）。
+ */
+export async function postPreference(ctx, { id, value, note } = {}) {
+  requireApiMode(ctx, PROFILE_PREFERENCE_URL, 'POST /api/profile/preference');
+  const body = { id, value };
+  if (typeof note === 'string' && note.trim()) body.note = note.trim();
+  const { data, url } = await firstOk([PROFILE_PREFERENCE_URL], {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { payload: profilePayloadOf(data, url), url, mode: 'api' };
+}
+
 /**
  * 候选地址用相对路径打头（../samples/...）：既能在「项目根目录起静态服务」下命中，
  * 也能在服务端把 web/ 挂到 /web/ 之外的子路径时命中；再加一条根相对路径兜底。

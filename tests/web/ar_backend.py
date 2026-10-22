@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from urllib.parse import urlparse
@@ -106,7 +107,9 @@ class FakeApi:
     """一层路由级的假后端；`requests` 记下前端到底发了什么（断言用）。"""
 
     def __init__(self, page, doc=None, *, compress=None, compress_status: int = 200,
-                 events=None, events_status: int = 200, profile=None, explain=None):
+                 events=None, events_status: int = 200, profile=None, explain=None,
+                 profile_status: int = 200, rating_status: int = 200,
+                 preference_status: int = 200):
         self.page = page
         self.doc = doc if doc is not None else fixture_doc()
         self.compress_payload = compress          # None = 成功响应（回显段号 + COMPRESSED_TEXT）
@@ -114,10 +117,16 @@ class FakeApi:
         self.events_payload = events              # None = {"ok": True, ...}
         self.events_status = events_status
         self.explain_payload = explain            # None = 一段固定的假讲解
-        self.profile = profile
+        # 画像：GET /api/profile 回它，写端点会就地改它再回整份（模拟后端写回后的画像）
+        self.profile = copy.deepcopy(profile) if profile is not None else None
+        self.profile_status = profile_status
+        self.rating_status = rating_status
+        self.preference_status = preference_status
         self.requests: list = []                  # {url, method, path, body, json}
         self.compress_calls: list = []
         self.event_batches: list = []
+        self.rating_calls: list = []              # POST /api/profile/rating 的请求体
+        self.preference_calls: list = []          # POST /api/profile/preference 的请求体
         page.route("**/api/**", self._handle)
 
     # ---------------------------------------------------------------- 内部分流
@@ -137,10 +146,32 @@ class FakeApi:
                           body=json.dumps(self.doc, ensure_ascii=False))
             return
         if path == "/api/profile":
+            if self.profile_status != 200:
+                route.fulfill(status=self.profile_status, content_type="application/json",
+                              body=json.dumps({"error": "画像读不出来（假后端注入）"}, ensure_ascii=False))
+                return
             route.fulfill(status=200, content_type="application/json",
                           body=json.dumps(self.profile
                                           or {"profile": {"reader": "local-default"}, "degraded": []},
                                           ensure_ascii=False))
+            return
+        if path == "/api/profile/rating":
+            self.rating_calls.append(parsed or {})
+            if self.rating_status != 200:
+                route.fulfill(status=self.rating_status, content_type="application/json",
+                              body=json.dumps({"error": "画像写不进去（假后端注入）"}, ensure_ascii=False))
+                return
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(self._apply_rating(parsed or {}), ensure_ascii=False))
+            return
+        if path == "/api/profile/preference":
+            self.preference_calls.append(parsed or {})
+            if self.preference_status != 200:
+                route.fulfill(status=self.preference_status, content_type="application/json",
+                              body=json.dumps({"error": "偏好写不进去（假后端注入）"}, ensure_ascii=False))
+                return
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(self._apply_preference(parsed or {}), ensure_ascii=False))
             return
         if path == "/api/survey":
             # 读者此前跳过过：问卷不再弹（这批用例的对象不是问卷）
@@ -206,6 +237,41 @@ class FakeApi:
                           body=json.dumps(payload, ensure_ascii=False))
             return
         route.fulfill(status=404, content_type="application/json", body="{}")
+
+    # ------------------------------------------------------- 画像写回（模拟后端）
+    def _profile_payload(self) -> dict:
+        if self.profile is None:
+            self.profile = {"profile": {"reader": "local-default", "concepts": {},
+                                        "preferences": [], "overrides": []}, "degraded": []}
+        return self.profile
+
+    def _apply_rating(self, body: dict) -> dict:
+        payload = self._profile_payload()
+        profile = payload.setdefault("profile", {})
+        concepts = profile.setdefault("concepts", {})
+        cid = body.get("concept_id")
+        state = body.get("state")
+        concepts[cid] = {**(concepts.get(cid) or {}), "state": state}
+        profile.setdefault("overrides", []).append({"concept": cid, "state": state})
+        return {"ok": True, "profile": profile, "degraded": []}
+
+    def _apply_preference(self, body: dict) -> dict:
+        payload = self._profile_payload()
+        profile = payload.setdefault("profile", {})
+        preferences = profile.setdefault("preferences", [])
+        pid = body.get("id")
+        value = body.get("value")
+        entry = next((item for item in preferences
+                      if isinstance(item, dict) and item.get("id") == pid), None)
+        if entry is None:
+            entry = {"id": pid, "confidence": 0.7, "evidence": [], "value": value}
+            preferences.append(entry)
+        entry["value"] = value
+        entry["statement"] = {
+            "keep_all": "事实锚全保留（要素材）：数字 / 引号引文 / 书名号一个都不许少",
+            "allow_declared_drops": "要结论：允许在申报后丢掉纯举例性的数据、把引文改成转述",
+        }.get(value, "")
+        return {"ok": True, "profile": profile, "degraded": []}
 
     # ---------------------------------------------------------------- 断言助手
     def calls(self, path: str) -> list:

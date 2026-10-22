@@ -2,9 +2,10 @@
  * 启动页装配（2026-10-15）：`web/index.html` —— 「启动页 + 阅读器页」拆页之后新增的那一页。
  *
  * 四块（顺序就是页面上的顺序，见 `web/index.html` 的 `data-block`）：
- *   ① **状态**：搬来阅读器顶栏那个面板（`js/status.js` 的 `mountStatus`，数据源＝同源静态文件
- *      `/status.json`）；这里只做接线，面板自己的行为一个字没改。
- *   ② **做测试**：读前背景问卷。卡片先显示现状（`GET /api/survey`：已答 / 已跳过 / 未答 / 读不到），
+ *   ① **测试和修改**（在顶栏里，2026-10-20 从主栏那张卡搬上去）：那是阅读器顶栏那个面板
+ *      （`js/status.js` 的 `mountStatus`，数据源＝同源静态文件 `/status.json`）；
+ *      这里只做接线，面板自己的行为一个字没改。
+ *   ② **背景测评**：读前背景问卷。卡片先显示现状（`GET /api/survey`：已答 / 已跳过 / 未答 / 读不到），
  *      点「填写 / 重填问卷」才打开问卷（`js/survey.js` 的 `openSurveyManually`）——
  *      **绝不自动弹**（2026-10-15 读者刚要求删掉自动打扰的横幅，这里不再加一个自动弹窗）。
  *   ③ **历史记录**：`GET /api/sources` 的材料清单；点一条进 `/reader?source=<id>`。
@@ -14,7 +15,7 @@
  *   - **任何失败都要看得见**：接口不可用 / 结构不符 / 上传失败 / 问卷读不到，一律在这两处留字——
  *     块内那条 `data-state` 状态行（带原因）**和** `__arDebug.degradations`（配套的全局横幅）；
  *     全文件没有一处 `.catch(() => {})` 式的静默。
- *   - **就绪只靠显式状态**：`globalThis.__arDebug.ready` 在四块都到了确定状态（含各自的降级）之后
+ *   - **就绪只靠显式状态**：`globalThis.__arDebug.ready` 在主栏三块都到了确定状态（含各自的降级）之后
  *     才置位；无头验证只等它，不 sleep（与 `js/main.js` 同一口径）。
  *   - **零构建**：不引外部 CDN、不加打包器、不用框架；横幅复用 `js/view.js` 的 `addBanner`
  *     （同文本去重 / 可手动关 / 成功类自动消失这四条显示层纪律只有那一份实现，不另写第二份）。
@@ -53,6 +54,7 @@ const ACTION_ORDER = ['expand', 'keep', 'compress', 'illustrate'];
 
 const dom = {
   banners: document.querySelector('[data-role="banners"]'),
+  launcher: document.querySelector('[data-role="launcher"]'),
   statusToggle: document.querySelector('[data-role="status-toggle"]'),
   statusHost: document.querySelector('[data-role="status-host"]'),
   surveyState: document.querySelector('[data-role="launcher-survey-state"]'),
@@ -141,7 +143,7 @@ export function readerHref(sourceId) {
   return `/reader?source=${encodeURIComponent(String(sourceId))}`;
 }
 
-/* ------------------------------------------------------------ ③ 历史记录 */
+/* ------------------------------------------------------------ 历史记录 */
 
 /**
  * 动作统计那行：`展开 10 / 保持 15`；读不出来就说读不出来（不写 0 冒充）。
@@ -337,7 +339,7 @@ async function refreshSources() {
   }
 }
 
-/* ------------------------------------------------------------ ④ 输入文件 */
+/* ------------------------------------------------------------ 输入文件 */
 
 function extensionOf(name) {
   const text = String(name || '');
@@ -582,7 +584,7 @@ async function runUpload() {
       degrade('upload-encoding',
         `上传的 ${check.file.name} 不是 UTF-8 文本：${encoding.note}（已照常摄取，后端是权威。）`);
     }
-    await refreshSources();      // 新材料要立刻出现在③里（历史列表自己的失败也可见）
+    await refreshSources();      // 新材料要立刻出现在历史记录里（历史列表自己的失败也可见）
   } catch (err) {
     renderUploadFailure(err);
   } finally {
@@ -592,7 +594,7 @@ async function runUpload() {
   return D.launcher.upload;
 }
 
-/* ------------------------------------------------------------ ② 做测试（问卷） */
+/* ------------------------------------------------------------ 背景测评（问卷） */
 
 /** 后端若给了作答时间就显示它（`answered_at` 在顶层，或藏在 `answers` 里，两种都认）。 */
 function answeredAtOf(payload) {
@@ -601,6 +603,16 @@ function answeredAtOf(payload) {
   if (direct) return direct;
   const nested = payload.answers && typeof payload.answers === 'object' ? payload.answers.answered_at : null;
   return formatLocalStamp(nested);
+}
+
+/**
+ * 版面开关：把问卷状态映射到 `.launcher` 的 `data-survey`（CSS 见 `web/css/launcher.css`）——
+ * 未答（空）→ `empty`，背景测评排在第一行；答过 / 跳过（有记录）→ `record`，挪到最后一行。
+ * 读不到（degraded）与读取中（loading）都当「空」处理：这时还没有记录，排在第一行。
+ */
+function setSurveyLayout(stateName) {
+  if (!dom.launcher) return;
+  dom.launcher.dataset.survey = (stateName === 'answered' || stateName === 'skipped') ? 'record' : 'empty';
 }
 
 /** 版本提示（与 `js/survey.js` 的 `versionNote` 同一判据）：回答版本与当前版本不一致时说出来。 */
@@ -640,6 +652,7 @@ function renderSurveyStatus(payload, url) {
 
   dom.surveyState.dataset.state = stateName;
   dom.surveyState.textContent = text;
+  setSurveyLayout(stateName);
   dom.surveyWhen.textContent = '';
   dom.surveyOpen.disabled = false;
   dom.surveyOpen.textContent = answered || skipped ? '重填问卷' : '填写问卷';
@@ -663,6 +676,7 @@ function renderSurveyStatus(payload, url) {
 async function refreshSurveyStatus() {
   dom.surveyState.dataset.state = 'loading';
   dom.surveyState.textContent = '正在读取问卷状态…';
+  setSurveyLayout('loading');   // 读取中还没有记录，先按「空」排在第一行
   setDebug('survey', { state: 'loading', error: null });
   try {
     const { payload, url } = await fetchSurvey(API_CTX);
@@ -675,6 +689,7 @@ async function refreshSurveyStatus() {
     const message = (err && err.message) || String(err);
     dom.surveyState.dataset.state = 'degraded';
     dom.surveyState.textContent = `问卷状态读不到：${message}`;
+    setSurveyLayout('degraded');   // 读不到就当「空」：排在第一行
     dom.surveyWhen.textContent = '';
     dom.surveyOpen.disabled = false;
     renderNotes(dom.surveyDegraded, []);
@@ -712,8 +727,8 @@ async function openSurveyFromCard() {
 /* ------------------------------------------------------------ 接线与启动 */
 
 function wireStatus() {
-  // ① 状态：面板自己那一套（打开 / 关闭 / Esc / 滚轮归属 / 降级文案）全在 js/status.js 里，
-  //    这里只把入口与宿主接上——与阅读器改造前的那一次接线逐字同源。
+  // 测试和修改（顶栏那颗按钮）：面板自己那一套（打开 / 关闭 / Esc / 滚轮归属 / 降级文案）
+  //    全在 js/status.js 里，这里只把入口与宿主接上——与阅读器改造前的那一次接线逐字同源。
   mountStatus({ host: dom.statusHost, toggle: dom.statusToggle });
 }
 
@@ -739,7 +754,7 @@ function wireUpload() {
 }
 
 /**
- * 启动：先挂状态块与两块交互（同步、不可能失败），再并发取两份数据，
+ * 启动：先挂顶栏那颗「测试和修改」入口与主栏三块的交互（同步、不可能失败），再并发取两份数据，
  * 两份都到确定状态之后才置 `ready`（无头验证只等它）。
  *
  * **第一件事是吃显示设置**（`bootstrapSettings(document.body)`，与阅读器页 boot 里同一句）：

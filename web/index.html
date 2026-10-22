@@ -78,42 +78,37 @@
   <header class="topbar">
     <div class="topbar__brand">自适应阅读器</div>
     <div class="topbar__side">
+      <!-- 「测试和修改」入口（2026-10-20 从主栏那块状态卡搬进顶栏）：
+           点开仍是同一张状态面板（js/status.js），面板里两块 = ① 测试结论 ② 本次修改。
+           原来的说明文字与「读不到时怎么办」那句都并进面板内部了，顶栏只留这一颗按钮。 -->
+      <section class="lcard lcard--bar" data-role="launcher-block" data-block="status" aria-label="测试和修改">
+        <button class="status-toggle" type="button" data-role="status-toggle"
+          aria-expanded="false" aria-controls="status-host"
+          title="测试和修改：两套测试的结论（后端 / 前端）与本次未提交的改动">
+          <span class="status-toggle__text">测试和修改</span>
+        </button>
+      </section>
       <span class="badge" data-role="page-badge">启动页</span>
     </div>
   </header>
+
+  <!-- 状态面板的宿主：卡片由 js/status.js 造，关闭后整层从这里移除（不留残影）。
+       它留在 body 层、**不放顶栏里**：面板是 position: fixed 的浮层，而顶栏有 backdrop-filter
+       （那会让 fixed 后代改以顶栏为包含块），放进去会被裁在顶栏那一行里。 -->
+  <div id="status-host" data-role="status-host"></div>
 
   <!-- 全页级降级提示（接口不可用 / 结构不符 / 上传失败 / 问卷读不到 等）都落在这里，不允许静默 -->
   <div class="banners" data-role="banners" aria-live="polite"></div>
 
   <main class="launcher" data-role="launcher">
     <p class="launcher__lead" data-role="launcher-lead">
-      四块都在这一页：先看①状态，做②读前背景问卷，在③历史记录里挑一份材料，或用④上传一份新的。
+      三块都在这一页：先做背景测评（读前背景问卷），在历史记录里挑一份材料，或用输入文件上传一份新的。
+      两套测试的结论与本次未提交的改动在顶栏那颗「测试和修改」里。
     </p>
 
-    <!-- ① 状态：搬阅读器顶栏那个「状态」面板（js/status.js），数据源仍是同源静态文件 /status.json -->
-    <section class="lcard" data-role="launcher-block" data-block="status">
-      <h2 class="lcard__title">① 状态</h2>
-      <p class="lcard__lead">
-        两套测试的结论（后端 / 前端）与本次未提交的改动。报告由
-        <code>uv run python tools/gen_status.py</code> 生成，页面只负责显示，一个数字都不硬编码。
-      </p>
-      <div class="lcard__row">
-        <button class="status-toggle" type="button" data-role="status-toggle"
-          aria-expanded="false" aria-controls="status-host"
-          title="状态：两套测试的结论与本次未提交的改动">
-          <span class="status-toggle__text">状态</span>
-        </button>
-        <span class="lcard__note" data-role="launcher-status-note">
-          报告读不到时面板里会写「尚未生成」+ 生成命令（不空白、不假装成功）。
-        </span>
-      </div>
-      <!-- 状态面板的宿主：卡片由 js/status.js 造，关闭后整层从这里移除（不留残影） -->
-      <div id="status-host" data-role="status-host"></div>
-    </section>
-
-    <!-- ② 做测试：读前背景问卷（与阅读器里 ?survey=1 打开的是同一张） -->
+    <!-- 背景测评：读前背景问卷（与阅读器里 ?survey=1 打开的是同一张） -->
     <section class="lcard" data-role="launcher-block" data-block="survey">
-      <h2 class="lcard__title">② 做测试</h2>
+      <h2 class="lcard__title">背景测评</h2>
       <p class="lcard__lead">
         读前背景问卷：六道固定题（条件题联动、可整场跳过），答完还可以再让模型追问几个细节。
         它<b>不会自动弹</b>——只有点下面那颗按钮才会打开。
@@ -128,9 +123,9 @@
       <div id="survey-host" data-role="survey-host"></div>
     </section>
 
-    <!-- ③ 历史记录：GET /api/sources 的材料清单；点一条进 /reader?source=<id> -->
+    <!-- 历史记录：GET /api/sources 的材料清单；点一条进 /reader?source=<id> -->
     <section class="lcard" data-role="launcher-block" data-block="history">
-      <h2 class="lcard__title">③ 历史记录</h2>
+      <h2 class="lcard__title">历史记录</h2>
       <p class="lcard__lead">
         <code>data/</code> 下已经摄取过的材料（清单由后端按「最后动过」倒序排好，页面不重排）。
         每条显示段数、最后动过的时间、动作统计、事实锚校验状态，以及缺了哪份产物。
@@ -140,9 +135,9 @@
       <ul class="lnotes" data-role="launcher-history-degraded" hidden></ul>
     </section>
 
-    <!-- ④ 输入文件：上传 UTF-8 的 .md / .txt → POST /api/ingest（只摄取，不调模型） -->
+    <!-- 输入文件：上传 UTF-8 的 .md / .txt → POST /api/ingest（只摄取，不调模型） -->
     <section class="lcard" data-role="launcher-block" data-block="upload">
-      <h2 class="lcard__title">④ 输入文件</h2>
+      <h2 class="lcard__title">输入文件</h2>
       <p class="lcard__lead">
         上传一份 Markdown / 纯文本（UTF-8）。摄取只写
         <code>data/&lt;id&gt;/source.md</code> 与 <code>source.meta.json</code>：
@@ -168,16 +163,16 @@
     // 就绪标志：无头验证只依赖它，不靠 sleep。
     // 这段必须在模块之前同步执行，好让 ES 模块加载失败时也留下可读的 errors（而不是让测试干等超时）。
     globalThis.__arDebug = {
-      ready: false,               // 四块都到了确定状态（含各自的降级）之后置位
+      ready: false,               // 主栏三块都到了确定状态（含各自的降级）之后置位
       jsLoaded: false,
       page: 'launcher',
       errors: [],
       degradations: [],           // {kind, message}：与阅读器同一套可见降级记账
-      // ---- 启动页四块的可断言状态（无头验证只等这些显式字段，不 sleep）----
+      // ---- 启动页各块的可断言状态（无头验证只等这些显式字段，不 sleep）----
       launcher: {
-        // ③ 历史记录（GET /api/sources）：state ∈ idle | loading | ok | empty | degraded
+        // 历史记录（GET /api/sources）：state ∈ idle | loading | ok | empty | degraded
         sources: { state: 'idle', url: null, count: null, error: null, degraded: [] },
-        // ④ 上传摄取（POST /api/ingest）：
+        // 上传摄取（POST /api/ingest）：
         //    state ∈ idle | ready | invalid | uploading | ok | error
         //    invalid 档也带 `error`（原因），且上一轮的 sourceId / paragraphs / overwritten /
         //    httpStatus / url / encoding / encodingNote 一律清成 null（2026-10-15 复核修）
@@ -188,7 +183,7 @@
           error: null, hint: null, httpStatus: null, url: null,
           encoding: null, encodingNote: null,
         },
-        // ② 问卷卡（GET /api/survey）：
+        // 问卷卡（GET /api/survey）：
         //    state ∈ idle | loading | answered | skipped | unanswered | degraded
         survey: {
           state: 'idle', answeredAt: null, answered: false, skipped: false,
@@ -197,7 +192,7 @@
           lastOpen: null,             // 最近一次点「填写问卷」的结果 {opened, reason, at}
         },
       },
-      // ---- 状态块（js/status.js 写这一组；数据源是同源静态文件 /status.json）----
+      // ---- 「测试和修改」面板（js/status.js 写这一组；数据源是同源静态文件 /status.json）----
       statusOpen: false,
       statusState: 'closed',      // closed | loading | ok | error | degraded
       statusUrl: null,            // /status.json 实际打到的地址

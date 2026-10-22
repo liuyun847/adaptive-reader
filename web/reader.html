@@ -51,12 +51,26 @@
   data-bg="paper" data-ink="ink" data-size="16" data-ink-explicit="false">
 
   <header class="topbar">
-    <div class="topbar__brand">自适应阅读器</div>
+    <!-- 品牌名本身就是「回启动页」的链接（2026-10-20）：拆页后两页之间原先只有启动页 → 阅读器单向那条路，
+         阅读器页没有任何出口；这里补一条回 GET /（背景测评 / 历史记录 / 输入文件那三块的入口页）。
+         启动页 `index.html` 里同一处仍是 `<div>`（它自己就是启动页，指回自己没有意义）。 -->
+    <a class="topbar__brand" href="/" title="回到启动页（背景测评 / 历史记录 / 输入文件）">自适应阅读器</a>
     <div class="topbar__side">
       <div class="topbar__meta">
         <span class="badge" data-role="source-id">材料：—</span>
         <span class="badge badge--mode" data-role="mode-badge">加载中</span>
         <span class="badge" data-role="progress">第 — / — 段</span>
+      </div>
+      <!-- 读者画像（2026-10-22）：概念自评 + 事实锚口径。此前这两件事只能命令行 / URL /
+           手改 profile.yaml，这一版把它们搬到页面上；面板内容由 js/profile.js 造、main.js 接数据。 -->
+      <div class="topbar__profile">
+        <button class="settings-toggle" type="button" data-role="profile-toggle"
+          aria-expanded="false" aria-controls="profile-panel" title="读者画像（概念自评 / 事实锚口径）">
+          <span class="settings-toggle__mark" aria-hidden="true">◉</span>
+          <span class="settings-toggle__text">画像</span>
+        </button>
+        <div class="profile" id="profile-panel" data-role="profile-panel" data-state="closed" hidden
+          role="dialog" aria-label="读者画像"></div>
       </div>
       <!-- 阅读显示设置：背景 / 文字颜色 / 正文字号，落 localStorage，刷新后仍在 -->
       <div class="topbar__settings">
@@ -182,6 +196,19 @@
       statusError: null,          // 报告用不了的原因（可读文案）
       statusDegraded: [],         // 状态面板里出现过的降级清单
       statusEvents: [],           // open / render / degrade / close
+      // 读者画像面板（js/profile.js + main.js 写这些字段；2026-10-22）
+      profilePanel: {
+        open: false,
+        state: 'closed',          // closed | loading | ready | pending | write-error | error | fixture
+        mode: null,               // api | fixture
+        url: null,                // 最近一次 GET/POST 画像端点实际打到的地址
+        concepts: [],             // [{id,name,state}]；state 含页面自己的 unrated 档
+        preference: null,         // {id,value,explicit,invalid,raw,statement}
+        degraded: [],             // 读 / 写画像时后端给的说明（不静默）
+        events: [],               // open / close / load / rating-ok / rating-error / preference-ok / preference-error
+        lastWrite: null,          // {kind:'rating'|'preference', ...}（只记成功写回）
+        error: null,              // 最近一次读 / 写失败的原始消息
+      },
       // 配图（js/figures.js 写这些字段；PLAN-actions-feedback §4.3）
       figures: [],                // 本次渲染的图：{paragraph, kind, caption, state, reason, where, sourceChars}
                                   //   state: pending | loading | ready | fallback | removed

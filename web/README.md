@@ -3,8 +3,9 @@
 HTML + CSS + 原生 ES 模块，没有打包器、没有 npm 依赖、不联网取任何东西。
 由服务端静态托管（W1 的 `uv run ar serve` 把 `/` 指向本目录），也可以直接起一个静态服务打开。
 
-**2026-10-15 拆页**：`GET /` 是**启动页**（`web/index.html` + `js/launcher.js`：①状态 ②做测试
-③历史记录 ④输入文件四块），`GET /reader` 是**阅读器页**（`web/reader.html` + `js/main.js`，
+**2026-10-15 拆页**：`GET /` 是**启动页**（`web/index.html` + `js/launcher.js`：顶栏一颗
+「测试和修改」按钮 + 主栏三块「背景测评 / 历史记录 / 输入文件」），`GET /reader` 是**阅读器页**
+（`web/reader.html` + `js/main.js`，
 就是拆页前那个 `index.html`，2026-10-15 只删掉了顶栏的状态入口与 `#status-host` 两块）。
 带页面参数（`source` / `fixture` **这两个键存在**就走，空值也算存在；别的 query 一概不影响托管）
 打开 `/` 时后端 **302** 到 `/reader?<原样 query>`（顺序与编码都不动），老链接 `/?source=<id>` 照旧能用；
@@ -20,15 +21,15 @@ HTML + CSS + 原生 ES 模块，没有打包器、没有 npm 依赖、不联网�
 | 模式 | 触发 | 请求 |
 |---|---|---|
 | 夹具模式 | URL 带 `?fixture=<source_id>` | `../samples/<source_id>/doc.json`、`explain.json`（同源静态文件，失败时回退 `/samples/...`）。**没有** `/api/compress` 与 `/api/events`：点「太啰嗦」会说明「夹具模式没有压缩后端」，行为事件只在本地攒着并留一句「夹具模式不记行为信号」 |
-| 正式模式 | 不带 `fixture` | `GET /api/doc/<source_id>`、`POST /api/explain`、`GET /api/profile`（只取画像指纹当会话缓存键；夹具模式不请求它）、`POST /api/compress`（读中点「太啰嗦」）、`POST /api/events`（行为事件，攒够 10 条或 15 秒一批） |
+| 正式模式 | 不带 `fixture` | `GET /api/doc/<source_id>`、`POST /api/explain`、`GET /api/profile`（画像指纹 + 画像面板的当前值；夹具模式不请求它）、`POST /api/profile/rating` / `POST /api/profile/preference`（画像面板写回，2026-10-22）、`POST /api/compress`（读中点「太啰嗦」）、`POST /api/events`（行为事件，攒够 10 条或 15 秒一批） |
 
 正式模式还需要材料 id：`?source=<source_id>`；没给就在页面上明说缺什么（不静默）。
 
 例：`web/reader.html?fixture=capital-v1-ch01`（真服务上带 `?fixture=` 打开 `/` 会被 302 到
 `/reader?fixture=capital-v1-ch01`）。
 
-**启动页（2026-10-15）恒按正式模式取数**：③历史记录的 `GET /api/sources`、④输入文件的
-`POST /api/ingest`、②做测试的 `GET /api/survey` 三件都是后端接口，**没有夹具版本**
+**启动页（2026-10-15）恒按正式模式取数**：历史记录的 `GET /api/sources`、输入文件的
+`POST /api/ingest`、背景测评的 `GET /api/survey` 三件都是后端接口，**没有夹具版本**
 （夹具那条路属于阅读器页的 `?fixture=`）。带 `?source=` / `?fixture=` 打开 `/` 反正会被 302 到
 阅读器页，所以这一页根本不该出现那两个参数；真出现了也不改这里的取数口径（页面照常能用，
 只是不认它们）。
@@ -36,17 +37,25 @@ HTML + CSS + 原生 ES 模块，没有打包器、没有 npm 依赖、不联网�
 ## 文件
 
 ```
-index.html        启动页（2026-10-15）：四块卡片（[data-role="launcher-block"] + data-block=
-                  status|survey|history|upload）+ 渲染前应用显示设置的同步脚本 + 就绪标志
+index.html        启动页（2026-10-15）：四块（[data-role="launcher-block"] + data-block=
+                  status|survey|history|upload；status 那一块 2026-10-20 起在**顶栏里**，只留一颗
+                  「测试和修改」按钮，宿主 #status-host 不在顶栏里——顶栏有 backdrop-filter，
+                  会把 position: fixed 的浮层裁在顶栏那一行）+ 渲染前应用显示设置的同步脚本 + 就绪标志
                   globalThis.__arDebug（含 page 与 launcher.{sources,upload,survey}，在模块之前同步建好）
 reader.html       阅读器页：拆页前那个 index.html，2026-10-15 只删了顶栏 `data-role="status-toggle"`
                   按钮块与 `#status-host` 宿主块，其余（主栏 / 抽屉 / 卡片层 / `#survey-host` / 调试面）都在
-                  （`__arDebug` 里 `status*` 那一组声明还留着，只是阅读器页不挂 status.js、不会去取 /status.json）
+                  （`__arDebug` 里 `status*` 那一组声明还留着，只是阅读器页不挂 status.js、不会去取 /status.json）；
+                  2026-10-20 顶栏品牌名从 `<div class="topbar__brand">` 改成 `a.topbar__brand[href="/"]`
+                  （回启动页，见下面「两页之间的路」；启动页 `index.html` 那处仍是 `div`，指回自己没有意义）
 css/reader.css    两页共用的全部样式（变量体系 + 三档背景 × 两档文字 × 四档字号的主题覆盖 + 背景问卷卡片
                   + 状态面板 + 段落标记区的「太啰嗦」+ 就地配图容器）
 css/launcher.css  启动页版面（2026-10-15，**只服务 index.html**，阅读器页不加载它）：**颜色**全部走
                   reader.css 的变量（本文件不留一个硬编码颜色）；**字号是例外**，逐条写死的 rem
-                  （没走 `--reading-size`，那是正文栏专用档）。只管四块卡片与两个宿主不占位、不留框
+                  （没走 `--reading-size`，那是正文栏专用档）。只管主栏三块卡片、顶栏那颗「测试和修改」
+                  入口（.lcard--bar：去掉卡片外观，只留按钮）与两个宿主不占位、不留框。
+                  **主栏版面**（2026-10-20）：两列弹性网格 —— 历史记录 / 输入文件并排（输入文件在左）、
+                  背景测评整行铺满且**未答时在第一行、有记录时在最后一行**（开关是 `.launcher` 上的
+                  `data-survey`，由 js/launcher.js 按问卷状态打；视觉顺序靠 flex `order`，DOM 次序不变）
 js/api.js         双模式取数 + 读者画像指纹（会话缓存键的第五段，见 loadProfileSignal / profileSignalOf）
                   + 读前背景问卷的四个调用（fetchSurvey / submitSurvey / requestSurveyFollowups / 夹具加载）
                   + 当场压缩 requestCompress（POST /api/compress）+ 行为事件上报 postEvents（POST /api/events）
@@ -67,22 +76,28 @@ js/figures.js     **就地配图**（PLAN-actions-feedback.md §4.3）：段落�
 js/events.js      **行为埋点**（§7.1/§7.2）：缓冲 + ≥10 条或 ≥15 s flush + visibilitychange/pagehide 强刷，
                   夹具模式不发请求（一次性可见降级）
 js/selection.js   选区工具：规范化（与后端缓存键同口径）、选区归属（锚点所在段）、浮条定位
+js/profile.js     读者画像面板（2026-10-22）：概念自评（知道 / 知道一点 / 不知道）+ 事实锚口径
+                  （全保留 / 要结论）；只造界面，取数与写盘在 main.js，口径见下面「读者画像面板」段
 js/settings.js    阅读显示设置：三档背景 × 两档文字 × 四档字号 + localStorage + 正文对比度实测告警
 js/cache.js       会话内讲解缓存 + 在飞去重 + 请求序号（防重复付费与迟到响应覆盖）
 js/survey.js      读前背景问卷：造表单 / 条件题联动 / 校验 / 提交与跳过 / 模型追问入口 / 版本提示；
                   2026-10-15 起多两个出口**给启动页用**——openSurveyManually（由按钮显式打开，
                   重填也走它；已答也照开，无条件）与 setSurveyLifecycleHooks（答完 / 关闭后刷新
                   启动页那张卡片；阅读器不设钩子，那边行为一个字没变）
-js/status.js      状态面板：读同源静态文件 /status.json（由 tools/gen_status.py 生成），
+js/status.js      「测试和修改」面板：读同源静态文件 /status.json（由 tools/gen_status.py 生成），
                   渲染①测试结论②本次修改；读不到 / 坏了就在面板里写「尚未生成」（不硬编码任何数字）。
-                  2026-10-15 起入口与宿主都在**启动页①块**（mountStatus 原样复用，面板行为一个字没改）
-js/launcher.js    启动页装配（2026-10-15）：四块接线（①mountStatus ②问卷卡 ③材料清单 ④上传摄取）
+                  2026-10-15 起入口与宿主都在**启动页**（mountStatus 原样复用，面板行为一个字没改）；
+                  2026-10-20 入口从主栏那张卡搬进**顶栏**（按钮文字「测试和修改」），卡片里的说明文字
+                  与备注并进了面板内部（lead），主栏不再有状态那一块
+js/launcher.js    启动页装配（2026-10-15）：四块接线（mountStatus / 问卷卡 / 材料清单 / 上传摄取）
                   + 启动页自己的可见降级出口（横幅复用 view.js 的 addBanner：同文本去重 / 手动关 /
-                  成功类自动消失那四条显示层纪律只有那一份实现，不另写第二份）；`ready` 在②③两块
-                  取数都落定（含各自的降级）之后才置位（①同步挂载不可能失败、④等读者交互；
+                  成功类自动消失那四条显示层纪律只有那一份实现，不另写第二份）；`ready` 在问卷卡与
+                  材料清单两块取数都落定（含各自的降级）之后才置位（状态入口同步挂载不可能失败、
+                  上传等读者交互；
                   两份里真有 Promise 被 reject 的意外也逐条走 degrade，不静默）
 js/main.js        装配与交互：当前段、抽屉、卡片、选片浮条、显示设置、读完块、降级、画像指纹刷新、
-                  问卷挂接、配图挂接、「太啰嗦」压链接线、行为埋点接线；
+                  读者画像面板（取数 / 写回 / 错误与降级，2026-10-22）、问卷挂接、配图挂接、
+                  「太啰嗦」压链接线、行为埋点接线；
                   2026-10-15 起**不再挂状态入口**（删掉 mountStatus 挂载与 `dom.statusToggle` /
                   `dom.statusHost`，也不再 import `status.js`——`Esc` 里那句 `isStatusOpen()` 让路判定
                   随之删掉，那一页它恒为 false；阅读器页的 `Esc` 只让路给问卷）
@@ -91,14 +106,14 @@ vendor/mermaid.min.js  **离线构建的 mermaid 12.0.0（5,575,485 B ≈ 5.3 Mi
                   **它不在首屏**：`reader.html` 里没有它的 `<script>`，由 js/figures.js 在
                   「真有 mermaid 图滚进视口」时注入一次（每页最多一次），详见下面的「就地配图」段
 status.json       **机器生成的产物，不入库**（见 .gitignore）：`uv run python tools/gen_status.py` 写它，
-                  页面只在读者点开「状态」时读一次（`cache: "no-store"`，重新生成后点一下就是新数字）；
-                  2026-10-15 起那个入口在启动页①块（阅读器页没有入口，也不再请求它）
+                  页面只在读者点开「测试和修改」时读一次（`cache: "no-store"`，重新生成后点一下就是新数字）；
+                  2026-10-20 起那个入口在启动页**顶栏**里（阅读器页没有入口，也不再请求它）
 ```
 
 ## 交互（DESIGN §5 骨架档）
 
-下面这些默认说的是**阅读器页**（`web/reader.html`）；标了「启动页」的那两条（①状态块、
-②做测试的问卷卡）在启动页上，四块的逐条说明见本节末尾的「启动页四块」，两页的其余交互互不影响。
+下面这些默认说的是**阅读器页**（`web/reader.html`）；标了「启动页」的那两条（顶栏的「测试和修改」入口、
+背景测评的问卷卡）在启动页上，四块的逐条说明见本节末尾的「启动页四块」，两页的其余交互互不影响。
 
 - **主栏**是唯一常驻内容。改写稿按空行切段，第 N 段对应原文第 N 段（契约要求段数/段序一致），
   每段带 `data-paragraph="pNNN"` 作联动锚点。
@@ -167,6 +182,35 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
   深色 8.64:1（同一档背景配上两档文字颜色结果一样，因为这条颜色只跟 `data-bg` 走），
   **不借**跟 `data-ink` 走的 `--muted`——启动页没有设置面板可以放告警，
   「纸白背景 + 浅灰文字」这种手动组合下 `--muted` 只剩 1.84:1（暖黄 + 浅灰 1.64:1、深色 + 深墨 2.94:1）。
+- **读者画像面板（2026-10-22，阅读器页顶栏「画像」）**：把此前只能命令行 / URL / 手改
+  `profiles/<reader>/profile.yaml` 的两件事搬到页面上——**概念自评**（`POST /api/profile/rating`）
+  与**事实锚口径**（`POST /api/profile/preference`）。入口是 `[data-role="profile-toggle"]`，
+  宿主 `[data-role="profile-panel"]`；面板结构在 `js/profile.js`，取数 / 写盘 / 横幅 / 降级在 `js/main.js`。
+  - **只在点开时读** `GET /api/profile`（不挡正文）；概念列表**只列当前材料** `concepts.json` 里的概念，
+    每行 `[data-role="profile-concept"][data-concept][data-state]`（`data-state` ∈ `known` / `partial` /
+    `unknown` / 页面自己的 `unrated`），旁边一行「知道 / 知道一点 / 不知道 / 未自评」，
+    三个按钮 `[data-role="profile-rate"][data-concept][data-state]`，当前档带 `aria-pressed="true"`。
+  - **事实锚口径**是两条单选 `[data-role="profile-preference"][value]`（`keep_all` / `allow_declared_drops`），
+    当前值照画像里的 `pref_fact_anchor` 选中；没有这条偏好时选中严口径并注明「按默认 `keep_all` 处理」，
+    取值写坏了（拼错 / 没有 `value`）**明说后端按严口径处理**（`invalid`，不静默显示成读者选过）。
+    只暴露这一条偏好：后端 `PREFERENCE_VALUES` 目前也只接受它。
+  - **写回**：点自评发 `{concept_id, state}`，改口径发 `{id: "pref_fact_anchor", value}`（都不带 `note`）。
+    成功时用响应里的**整份画像**就地重画（不额外再读一次），横幅写「已记下自评：商品 = 知道…」/
+    「事实锚口径已改为…」；**同一档重复点不发请求**（自评端点不幂等，白写会再追一条 evidence
+    并换画像指纹）；画像指纹**当场重算**（`profileSignalOf`），会话讲解缓存随之换键
+    ——后端 LRU 的键里也有画像指纹，下一次讲解自然不再命中旧答案。自评写的是手动结论（`overrides`），
+    行为信号回流不会覆盖它；口径写回后**下一次 `ar check` / `ar rewrite`** 才按新值判（已有产物不变）。
+  - **失败不装成功**：读失败 → 状态行 `data-state="error"` + 横幅，且**手上没有旧画像时不列概念**
+    （列出来会像「都没自评过」；空态文案写明「画像没读到」），控件禁用；
+    写失败 → `data-state="write-error"` + 横幅，**该行仍是写之前那一档**、`lastWrite` 不出现，
+    控件**保持可用**（画像没变，可以重试）。
+  - **夹具模式**（`?fixture=`）**一个 `/api/*` 都不请求**：状态行 `data-state="fixture"` 写明
+    「没有画像后端，自评与偏好都不能保存」，自评按钮与口径单选一律 `disabled`（概念照常列出——
+    那是夹具 doc 里的概念清单，不是画像）。
+  - 与设置面板**互斥**（开一个就关另一个）、点外部 / `Esc` / `×` 关闭。
+    可断言状态全在 `__arDebug.profilePanel`：`open` / `state` / `mode` / `url` / `concepts` /
+    `preference` / `degraded` / `events` / `lastWrite` / `error` / `locked`。
+    **不记行为事件**（`§7.1` 的白名单里没有「自评」这一类；这一批不扩事件种类）。
 - **读完提示（2026-10-08）**：从底部浮窗改成正文末尾「— 改写稿结束 —」**之后**的流内块
   （分隔线 + 弱化文字），读完（IntersectionObserver 盯 `end-sentinel`）才显示。
   语义与调试面沿用旧口径：初始 `hidden`、`data-state`、`__arDebug.compression.shown/text` 一个不少。
@@ -184,7 +228,7 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
   由 `main.js` 的 `bootSurvey_()` 挂 warn 横幅）**整条去掉**，原因只落在 `__arDebug.surveyBootReason`
   （`already-answered` / `skipped-before`）上供无头验证断言；想重填走 `?survey=1`。
   **不复用 `localStorage["ar.settings.v1"]`**（那是显示设置的键，与画像无关）。
-  - **由按钮显式打开（2026-10-15 拆页后新增的这一档，启动页②做测试）**：启动页那张卡片先显示
+  - **由按钮显式打开（2026-10-15 拆页后新增的这一档，启动页的背景测评卡）**：启动页那张卡片先显示
     现状（`GET /api/survey`：未答 / 已答 / 已跳过 / 读不到，状态行 `[data-role="launcher-survey-state"]`
     的 `data-state ∈ unanswered|answered|skipped|loading|degraded`，初始 `idle`），点「填写问卷 / 重填问卷」
     （`[data-role="launcher-survey-open"]`）才调 `survey.js` 的 `openSurveyManually()` 打开**同一张**问卷
@@ -239,12 +283,15 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
     两个值都取 `GET /api/survey` 顶层，**不从浏览器本地存储读版本号**。
   - 夹具模式：默认不弹；`?survey=1` 可看可填，提交后写明「夹具模式不保存」；
     `?survey=fixture` 连响应形状一起夹具化（读 `samples/<id>/survey.json`），覆盖回填与版本提示两条分支。
-- **启动页①「状态」块（2026-10-09 新增，2026-10-15 从阅读器顶栏搬到启动页）**：启动页第一块里那颗
-  「状态」按钮（`data-role="status-toggle"`，宿主 `#status-host`，与阅读器原来的那两颗逐字同源），
+- **启动页顶栏的「测试和修改」入口（2026-10-09 新增，2026-10-15 从阅读器顶栏搬到启动页，
+  2026-10-20 从主栏那张卡搬进顶栏）**：顶栏里那颗「测试和修改」按钮
+  （`data-role="status-toggle"`，宿主 `#status-host`，与阅读器原来的那两颗逐字同源），
   点开显示两块：**① 测试结论**（后端 `uv run pytest tests -q` 与前端 `python -m pytest tests/web -q`
   两套的 passed / failed / skipped + 各自耗时 + pytest 的原始摘要行 + 报告生成时间）、
   **② 本次修改**（`--note` 给的一句话 + 汇总「N 个文件 / +X −Y」+ 文件清单：git 状态码、名字、路径、
   增删行数；未跟踪文件标「新文件」并按实际行数计入）。
+  - **面板内部自带说明**（2026-10-20）：原来主栏那张卡里的说明文字与「报告读不到时…」那句备注
+    都并进了面板的 lead，主栏不再有那一块（顶栏里只留这一颗按钮）。
   - **数据源只有一个**：同源静态文件 `GET /status.json`（正式服务把 `web/` 挂在 `/` 上，与 `/api/*` 同源，
     启动页就是 `/`）。**前端一个数字都不硬编码**——报告里没有的就不显示，读不到就写「尚未生成」。
   - 每次打开都重新取一次（`cache: "no-store"`）：重新生成报告后点一下按钮就是新数字，不用刷新页面。
@@ -263,11 +310,11 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
     （原先 `Esc` 里那句 `isStatusOpen()` 让路判定随之删掉——那一页它恒为 false，是死判定；
     `test_status_panel.py::test_reader_page_has_no_status_entry` 守着拆页纪律）。
 
-### 启动页四块（`web/index.html` + `js/launcher.js`，2026-10-15）
+### 启动页四块（`web/index.html` + `js/launcher.js`，2026-10-15；2026-10-20 状态那块搬进顶栏）
 
-- **① 状态**：见上面那条（面板搬到了这里，数据源仍是 `/status.json`）。
-- **② 做测试**：见上面「读前背景问卷」里的「由按钮显式打开」那一条。
-- **③ 历史记录**：`GET /api/sources` 渲染材料清单，**顺序照后端给的**（mtime 倒序、同一时刻按
+- **测试和修改（在顶栏里）**：见上面那条（面板在这里，数据源仍是 `/status.json`；主栏里没有这一块）。
+- **背景测评**：见上面「读前背景问卷」里的「由按钮显式打开」那一条。
+- **历史记录**：`GET /api/sources` 渲染材料清单，**顺序照后端给的**（mtime 倒序、同一时刻按
   `source_id` 升序）——前端**不重排**（重排会让「两次调用结果稳定」这条契约在页面上失真）。
   每行是**整块可点的 `<a href="/reader?source=<id>">`**（点哪都进阅读器，键盘也能 Tab 到、回车即进），
   内含 `[data-role="history-id" | history-paragraphs | history-mtime | history-actions |
@@ -275,7 +322,7 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
   动作统计（只列非 0）、校验状态四档、缺哪份产物（三块都缺写「只摄取…」）。
   空列表写「data/ 下还没有材料，先在下面上传一个。」；404 / 非 JSON / 结构不符都写进块内状态行
   （坏条目**逐条点名**，不静默跳过）；后端 `degraded[]` 渲染成块内说明列表（`[data-role="launcher-note"]`）。
-- **④ 输入文件**：`input[type=file][accept=".md,.txt"]` + 可选 `source_id` + 「覆盖已存在的同名材料」
+- **输入文件**：`input[type=file][accept=".md,.txt"]` + 可选 `source_id` + 「覆盖已存在的同名材料」
   勾选 + 「摄取」按钮 → `POST /api/ingest`。选完（或改完 `source_id`）按钮才可用，粗判不合格时
   状态行写原因（见「降级纪律」末尾那条）；**上传中按钮禁用**（一次只跑一个摄取请求）。
   2026-10-15 复核修的两条：
@@ -285,16 +332,18 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
     页面最后红字写「摄取失败（HTTP 409）…已经存在」——**页面在说假话**；
   - **非 UTF-8 也看得见**：`file.text()` 按 UTF-8 解码，坏字节只会变成 `U+FFFD`、**永不 reject**，
     所以读完正文要嗅一下（`encodingNoteOf()`：出现 `U+FFFD` 即算，另加「有 NUL 字节＝像是二进制」）：
-    命中就**照常摄取**（后端是权威，前端不拦），但在四处留字——④块状态行、结果块里一条
+    命中就**照常摄取**（后端是权威，前端不拦），但在四处留字——输入文件块状态行、结果块里一条
     `[data-role="upload-encoding-note"]`、warn 横幅、`__arDebug.degradations`（`kind: upload-encoding`），
     文案是「这份文件不是 UTF-8 文本（…）：已按替换字符摄取，正文可能乱码。」，
     `launcher.upload.encoding = "utf-8-lossy"` + `.encodingNote` 备查。
     修前一份 GBK 文件会显示成「已摄取：xxx（2 段，新建）」、一个提示都没有，而盘上 `source.md` 全是替换字符。
   成功在结果块里显示 source_id / 段数 / 是否覆盖 / 摄取时间 + 一颗「去阅读」（`/reader?source=<id>`），
-  并**立刻重取③**（新材料的段数与时间由后端算，前端不自己拼一条）；失败显示后端 `error`
+  并**立刻重取历史记录**（新材料的段数与时间由后端算，前端不自己拼一条）；失败显示后端 `error`
   （409 另显示 `hint`），结果块整块收起来。
-- **两页之间只有这一条路**：③与④的链接都指向 `/reader?source=<id>`（`js/launcher.js` 的
-  `readerHref` 统一拼），启动页自己不渲染任何阅读界面。
+- **两页之间的路**：启动页 → 阅读器**只这一条**——历史记录与输入文件的链接都指向 `/reader?source=<id>`
+  （`js/launcher.js` 的 `readerHref` 统一拼），启动页自己不渲染任何阅读界面；反向那条 2026-10-20 才补上：
+  阅读器页**顶栏品牌名**是 `<a class="topbar__brand" href="/">`（悬停变 `--accent`、键盘可 Tab 到，
+  样式见 `css/reader.css`；在那之前阅读器页一个出口都没有）。
 - **已知小瑕疵（拆页前就有，本次未修）**：状态面板与背景问卷**各自**挂 `document` 级 `Esc` 监听、
   各自只看自己的 `state.open`，所以两层同时开着时**一个 `Esc` 会把两层一起关掉**。2026-10-15 拆页后
   这两层的宿主都在**启动页**上（阅读器页只挂问卷，`main.js` 里那句 `isStatusOpen()` 让路判定已随之删掉
@@ -537,13 +586,13 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 | **多申报**（锚点一个没少却申报放弃了某项；`fidelity.over_declared` 里有这一段） | 卡片改挂「本段一个锚点都没少：模型多申报了（不影响校验结论）」，悬停那一行写「（多申报：本段一个都没少）」——**不是「未放行」**（没有缺失可放行，退出码照旧 0） | `card-declaration-over` chip、`tip-declared[data-over-declared="true"]` |
 | **行为事件送不出去 / 后端没写成功** | 横幅「行为信号没能送出去 / 没能记下（N 条）…」，**阅读照常**、缓冲继续攒 | `events.failed`、`events.flushes[].status = "error" \| "failed"`、`degradations[]`（`kind: events`） |
 | **夹具模式的行为事件**（`?fixture=` 没有 `/api/events`） | **一次性**横幅「夹具模式不记行为信号：…」（再来几批也只留这一条），事件照样进 `__arDebug` | `events.fixtureNoted = true`、`events.dropped`、`degradations[]`（`kind: events-fixture`） |
-| **启动页 · 材料清单读不到**（`GET /api/sources` 网络 / HTTP / 非 JSON 失败） | ③块内状态行「材料清单没能读到：…」（`data-state="degraded"`）+ 横幅「读不到材料清单…历史记录这一块空着，上传不受影响」；响应是**合法 JSON `null`** 时按实说「响应是 JSON \`null\`：结构不认识」（2026-10-15 修：原来把这句写成「响应不是合法 JSON（未知原因）」，是假话） | `launcher.sources.state = "degraded"`、`.error`、`.url`、`degradations[]`（`kind: sources-load`） |
-| **启动页 · 材料清单结构不符**（响应不是 JSON 对象 / `sources` 不是数组 / 某条没有可用的 `source_id`） | ③块内状态行写明结构不认识，坏条目**逐条点名**「清单第 N 条没有可用的 source_id（结构不符），已跳过」+ 横幅 | `launcher.sources.state = "degraded"`、`.error`、**`.url`（＝实际打到的 `/api/sources`，2026-10-15 修：原来这两条留在 `null`）**、`.degraded[]`、`degradations[]`（`kind: sources-shape`） |
-| **启动页 · 清单是空的但后端带说明**（如 `data/` 目录不存在） | ③块内状态行「data/ 下还没有材料，先在下面上传一个。」+ 块内说明列表 + 横幅「材料清单：…」 | `launcher.sources.state = "empty"`、`.count = 0`、`.degraded[]`、`degradations[]`（`kind: sources-degraded`） |
-| **启动页 · 上传读不出文件内容**（`file.text()` 抛错） | ④块内状态行红字「读不出这个文件的内容（…）：换一份 UTF-8 文本再试。」+ 横幅 | `launcher.upload.state = "error"`、`.error`、`degradations[]`（`kind: upload-read`） |
-| **启动页 · 摄取**的是**非 UTF-8 文本**（正文里有 `U+FFFD` 替换字符，或有 NUL 字节像是二进制） | 照常摄取（后端是权威，前端不拦），但四处留字：④块状态行追加「这份文件不是 UTF-8 文本（…）：已按替换字符摄取，正文可能乱码。」、结果块里一条 `[data-role="upload-encoding-note"]`、warn 横幅、`degradations[]` | `launcher.upload.state = "ok"`（摄取确实成功了）、`.encoding = "utf-8-lossy"`、`.encodingNote`、`degradations[]`（`kind: upload-encoding`） |
-| **启动页 · 摄取失败**（400 / 409 / 500 或网络失败） | ④块内状态行「摄取失败（HTTP 409）：后端 `error` 原文 —— 后端 `hint`」，结果块整块收起来 + 横幅 | `launcher.upload.state = "error"`、`.error`（后端 `error`）、`.hint`（409 的出路说明，没有就是 `null`）、`.httpStatus`、`degradations[]`（`kind: upload-error`） |
-| **启动页 · 问卷状态读不到**（`GET /api/survey` 失败 / 结构不认识） | ②块内状态行「问卷状态读不到：…」（`data-state="degraded"`），**按钮照旧可点**（读者能再试）+ 横幅 | `launcher.survey.state = "degraded"`、`.error`、`degradations[]`（`kind: survey-status`） |
+| **启动页 · 材料清单读不到**（`GET /api/sources` 网络 / HTTP / 非 JSON 失败） | 历史记录块内状态行「材料清单没能读到：…」（`data-state="degraded"`）+ 横幅「读不到材料清单…历史记录这一块空着，上传不受影响」；响应是**合法 JSON `null`** 时按实说「响应是 JSON \`null\`：结构不认识」（2026-10-15 修：原来把这句写成「响应不是合法 JSON（未知原因）」，是假话） | `launcher.sources.state = "degraded"`、`.error`、`.url`、`degradations[]`（`kind: sources-load`） |
+| **启动页 · 材料清单结构不符**（响应不是 JSON 对象 / `sources` 不是数组 / 某条没有可用的 `source_id`） | 历史记录块内状态行写明结构不认识，坏条目**逐条点名**「清单第 N 条没有可用的 source_id（结构不符），已跳过」+ 横幅 | `launcher.sources.state = "degraded"`、`.error`、**`.url`（＝实际打到的 `/api/sources`，2026-10-15 修：原来这两条留在 `null`）**、`.degraded[]`、`degradations[]`（`kind: sources-shape`） |
+| **启动页 · 清单是空的但后端带说明**（如 `data/` 目录不存在） | 历史记录块内状态行「data/ 下还没有材料，先在下面上传一个。」+ 块内说明列表 + 横幅「材料清单：…」 | `launcher.sources.state = "empty"`、`.count = 0`、`.degraded[]`、`degradations[]`（`kind: sources-degraded`） |
+| **启动页 · 上传读不出文件内容**（`file.text()` 抛错） | 输入文件块内状态行红字「读不出这个文件的内容（…）：换一份 UTF-8 文本再试。」+ 横幅 | `launcher.upload.state = "error"`、`.error`、`degradations[]`（`kind: upload-read`） |
+| **启动页 · 摄取**的是**非 UTF-8 文本**（正文里有 `U+FFFD` 替换字符，或有 NUL 字节像是二进制） | 照常摄取（后端是权威，前端不拦），但四处留字：输入文件块状态行追加「这份文件不是 UTF-8 文本（…）：已按替换字符摄取，正文可能乱码。」、结果块里一条 `[data-role="upload-encoding-note"]`、warn 横幅、`degradations[]` | `launcher.upload.state = "ok"`（摄取确实成功了）、`.encoding = "utf-8-lossy"`、`.encodingNote`、`degradations[]`（`kind: upload-encoding`） |
+| **启动页 · 摄取失败**（400 / 409 / 500 或网络失败） | 输入文件块内状态行「摄取失败（HTTP 409）：后端 `error` 原文 —— 后端 `hint`」，结果块整块收起来 + 横幅 | `launcher.upload.state = "error"`、`.error`（后端 `error`）、`.hint`（409 的出路说明，没有就是 `null`）、`.httpStatus`、`degradations[]`（`kind: upload-error`） |
+| **启动页 · 问卷状态读不到**（`GET /api/survey` 失败 / 结构不认识） | 背景测评块内状态行「问卷状态读不到：…」（`data-state="degraded"`），**按钮照旧可点**（读者能再试）+ 横幅 | `launcher.survey.state = "degraded"`、`.error`、`degradations[]`（`kind: survey-status`） |
 | **启动页 · 点「填写问卷」但后端没给题目**（`questions[]` 为空） | 横幅「问卷打不开（页面上不会出现一张空表单）…可以稍后再点一次，或直接在阅读器里用 `?survey=1` 打开」，**不开空壳** | `launcher.survey.lastOpen = {opened:false, reason:"no-questions"}`、`degradations[]`（`kind: survey-questions-empty`） |
 | **启动页 · 某块连初始化都炸了**（取数 Promise 被 reject 这类意外） | 横幅「启动页第 N 块没能初始化（…）：那一块会显示成失败状态」 | 那一组停在失败态、`degradations[]`（`kind: launcher-boot`） |
 
@@ -551,7 +600,7 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 `__arDebug.degradations`、一边按 `bannerState(kind)` 挂横幅（口径与 `main.js` 逐字一致）。
 **前端粗判不算降级**：没选文件 / 扩展名不在白名单（只收 `.md` / `.txt`，大小写不敏感）/
 `source_id` 形状不合法（`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` 且不含 `..`）/ 文件是空的
-只在④块内写状态行（`data-state="invalid"` / `"ready"`），**不发请求也不打横幅**——权威判定在后端。
+只在输入文件块内写状态行（`data-state="invalid"` / `"ready"`），**不发请求也不打横幅**——权威判定在后端。
 这一档 2026-10-15 复核修了两处：①`invalid` 时 `launcher.upload.error` 要写**原因**（原来恒为 `null`），
 并且 `sourceId / paragraphs / overwritten / httpStatus / url / hint / encoding / encodingNote`
 一律清成 `null`（原来上一轮的 `httpStatus: 200`、`paragraphs: 3` 会留在调试面上——调试面在说假话）；
@@ -631,17 +680,17 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 声明没有 `page` 与 `launcher` 这两个键）：
 
 - `page`：`"launcher"`（拆页的页面标识，真服务上打开 `/` 的断言就看它）；
-- `launcher.sources`（③历史记录）：`{state, url, count, error, degraded[]}`，
+- `launcher.sources`（历史记录）：`{state, url, count, error, degraded[]}`，
   `state ∈ idle | loading | ok | empty | degraded`；`count` 是**真正渲染出来的行数**
   （空列表是 `0`，读不到是 `null`——不拿 0 冒充「读到空清单」）；
-- `launcher.upload`（④输入文件）：`{state, sourceId, paragraphs, overwritten, error, hint, httpStatus, url,
+- `launcher.upload`（输入文件）：`{state, sourceId, paragraphs, overwritten, error, hint, httpStatus, url,
   encoding, encodingNote}`，`state ∈ idle | ready | invalid | uploading | ok | error`；`error` / `hint`
   是后端那两句话的原文（成功路径上都被清成 `null`）；**`invalid` 档也带 `error`**（＝状态行那句原因，
   2026-10-15 复核修：原来恒为 `null`），且每次进新状态都把上一轮的结果字段
   （`sourceId / paragraphs / overwritten / httpStatus / url / encoding / encodingNote`）清成 `null`；
   `encoding ∈ "utf-8" | "utf-8-lossy" | null`——`lossy` 表示正文里嗅到了 `U+FFFD` 或 NUL 字节
   （非 UTF-8：照常摄取，但 `encodingNote` 在四个出口都可见）；
-- `launcher.survey`（②做测试）：`{state, answeredAt, answered, skipped, error, url, version,
+- `launcher.survey`（背景测评）：`{state, answeredAt, answered, skipped, error, url, version,
   answeredVersion, degraded[], openReason, lastOpen}`，
   `state ∈ idle | loading | answered | skipped | unanswered | degraded`；
   `openReason ∈ launcher | no-questions | load-failed`（这次是怎么打开的），
@@ -769,18 +818,18 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
                            "counts": {"paragraphs": 25, "compared": 25, "numbers": 34, "quotes": 11, "books": 13}}}],
  "degraded": []}
 
-// POST /api/ingest ← ④输入文件（只摄取，不调模型、不跑 analyze / rewrite / check）
+// POST /api/ingest ← 输入文件（只摄取，不调模型、不跑 analyze / rewrite / check）
 {"filename": "notes.md", "content": "正文…", "source_id": "draft-notes", "overwrite": false}
 // → 200 {"source_id": "draft-notes", "paragraphs": 4, "ingested_at": "2026-10-15T21:40:00+08:00",
 //        "anchors_stable": true, "overwritten": false, "degraded": []}
 ```
 
 - **缺产物 = 那一块 `null` + 顶层 `degraded` 一条可读说明**（不是缺键、也不是编造的 `0` / `[]`）：
-  ③块据此逐项点名「概念清单未抽取 / 逐段改写还没跑 / 事实锚还没校验」，三块都缺时写「只摄取…」。
+  历史记录块据此逐项点名「概念清单未抽取 / 逐段改写还没跑 / 事实锚还没校验」，三块都缺时写「只摄取…」。
 - `mtime` 与 `ingested_at` 都是**本地时区**的 ISO 8601；前端**原样保留钟点与偏移**
   （`2026-10-13 12:27:42 +08:00`），**不**用 `new Date()` 按浏览器时区再转一次——
   那样跨时区访问会把同一个瞬间显示成另一个钟点，和 `data/` 目录里的文件时间对不上。
-- ③块的动作统计**只列非 0 的动作**（`展开 10 / 保持 15`）：真实产物四个键都在，
+- 历史记录块的动作统计**只列非 0 的动作**（`展开 10 / 保持 15`）：真实产物四个键都在，
   把「压缩 0 / 配图 0」也打出来只会淹掉关键数字；全是 0 时明写「动作统计为空（各动作都是 0）」。
   后端将来加了新动作，照原键名打出来（不静默丢）。
 - 校验状态四档：`checked === true` 且 `mismatch_count === 0` → 「已校验通过」（`ok`）；
@@ -792,7 +841,7 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
   没带 `overwrite: true`，另给 `hint` 说明怎么覆盖）、500（磁盘写不进去）。
   前端把 `error` 当消息、`hint` 放进 `DataError.detail`，两条都显示出来
   （`fetchJsonExplained`，见 `js/api.js`）。成功后前端**不自己拼一条清单**，而是重新 `GET /api/sources`。
-- 成功响应里 `anchors_stable === false`（这次摄取与上一次的段锚点对不上）时，④块的成功文案里
+- 成功响应里 `anchors_stable === false`（这次摄取与上一次的段锚点对不上）时，输入文件块的成功文案里
   **另加一句**「注意：段锚点与上一次摄取不一致（覆盖后既有产物可能对不上，需要重跑
   analyze / rewrite / check）」——降级说明与 `error` / `hint` 一样都要看得见。
 - 两个端点都**没有夹具版本**（启动页恒正式模式），也没有模型调用。
@@ -800,13 +849,16 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 ## 无头验证
 
 ```bash
-python -m pytest tests/web -q          # 在本项目根目录跑（184 passed + 1 skipped, 0 failed；185 collected）
+python -m pytest tests/web -q          # 在本项目根目录跑（195 passed + 1 skipped, 0 failed；196 collected）
 ```
 
-上面那行是 **2026-10-15 复核修复当天**的实测口径（系统 Python、`ar serve --port 8765` 在跑、
-`web/status.json` 已生成）：**184 passed + 1 skipped（185 collected）**，唯一那个 skip 是默认不跑的
+上面那行是 **2026-10-22 画像面板当天**的实测口径（系统 Python；`ar serve --port 8765` 在跑、
+`web/status.json` 已生成）：**195 passed + 1 skipped（196 collected）**，唯一那个 skip 是默认不跑的
 真实计费用例 `test_real_service_explain_end_to_end_is_billable`。
-相对拆页当天的 171 passed + 1 skipped（172 collected）**多 13 条**，就是本次复核修复的用例：
+= 工作区现状的 **189 passed + 1 skipped**（2026-10-22 实测；旧账面 184 之后已有的未提交启动页改动
+另多 5 条，不是这一批加的）+ 本批 `test_profile_ui.py` **6 条**。
+更早的账：2026-10-15 复核修复当天实测 184 passed + 1 skipped（185 collected），
+相对拆页当天的 171 passed + 1 skipped（172 collected）**多 13 条**，就是那次复核修复的用例：
 `test_launcher.py` 12 条（B1 显示设置 4：存档吃到 body / 系统深色首访 / 两页底色一致 /
 六种组合下导语读得清；B2 连点只发一个请求 1；B3 非 UTF-8 与二进制各 1；B4 invalid 三档 3；
 C2 结构不符带真实 url 1；C1 JSON `null` 如实说 1）+ `test_reader_ui.py` 1 条
@@ -817,7 +869,7 @@ C2 结构不符带真实 url 1；C1 JSON `null` 如实说 1）+ `test_reader_ui.
 不是任何一个现行口径。
 **服务没起时**另有两条真服务用例会 skip（`test_reader_features.py` 的
 `test_real_service_page_and_explain_payload_without_calling_the_model` 与
-`test_status_panel.py` 的真服务孪生用例），按同一个 185 条口径推算约 182 passed + 3 skipped
+`test_status_panel.py` 的真服务孪生用例），按同一个 196 条口径推算约 193 passed + 3 skipped
 ——**这一档没有实测**，需要引用就先自己跑一遍。
 
 **必须用系统 Python 跑**（`python -m pytest tests/web -q`，不是 `uv run pytest`）：
@@ -838,18 +890,23 @@ C2 结构不符带真实 url 1；C1 JSON `null` 如实说 1）+ `test_reader_ui.
 失败），**不依赖磁盘上那份产物**；2026-10-15 拆页后这套用例（`test_status_panel.py`）一律打开**启动页**
 （面板的入口在那里），并多一条 `test_reader_page_has_no_status_entry` 守拆页纪律；
 2026-10-13 新增的三套（`test_figures.py` / `test_compress_action.py` / `test_behavior_events.py`）
-共用一份更小范围的假后端 `tests/web/ar_backend.py`（`/api/doc`、`/api/profile`、`/api/survey`、
-`/api/explain`、`/api/compress`、`/api/events`，全是固定 JSON，**零真实模型调用**；
+共用一份更小范围的假后端 `tests/web/ar_backend.py`（`/api/doc`、`/api/profile`、
+`/api/profile/rating`、`/api/profile/preference`、`/api/survey`、`/api/explain`、`/api/compress`、
+`/api/events`，全是固定 JSON，**零真实模型调用**；写画像的两个端点会把请求体记进
+`rating_calls` / `preference_calls` 并就地改内存里的画像，模拟后端「响应里回整份写回后的画像」；
 它的 `open_fixture` / `open_api` 拆页后指向 `web/reader.html`——阅读器页）；
-2026-10-15 新增的 `test_launcher.py`（34 条用例：四块都在 + ①入口归位 + ③清单逐字段 / 后端说明 /
-空列表 / 404 / 结构不符（含「带真实 url」）+ ④上传成功 / 400 / 409 / 上传中按钮禁用 / 连点只发一个请求 /
-非 UTF-8 与二进制可见说明 / invalid 三档带原因且清旧值 + ②卡片三态 / 版本提示与后端说明 /
+2026-10-15 新增的 `test_launcher.py`（34 条用例：四块都在 + 入口归位 + 清单逐字段 / 后端说明 /
+空列表 / 404 / 结构不符（含「带真实 url」）+ 上传成功 / 400 / 409 / 上传中按钮禁用 / 连点只发一个请求 /
+非 UTF-8 与二进制可见说明 / invalid 三档带原因且清旧值 + 问卷卡三态 / 版本提示与后端说明 /
 读不到 / 点按钮打开同一张表单并在答完与关闭后刷新 / 无题目不空壳 + 显示设置 4 条：存档吃到 body /
 系统深色首访 / 两页底色一致 / 六种组合下导语读得清）**只看启动页**，
 假后端是本文件自己的 `LauncherApi`（`page.route` 拦 `/api/sources`、`/api/survey`、`/api/ingest`，
 零真实模型调用；助手 `dbg` / `banner_texts` / `has_banner` 仍从 `ar_backend.py` 复用）；
 mermaid 那几条要么放真库（5.3 MiB 从本机静态服务取，验证真渲染），要么用几十字节的假库
 （验证「只注入一次」「render() 抛错 → 退回文字」）。
+2026-10-22 新增的 `test_profile_ui.py`（6 条）用同一份 `ar_backend.py` 的假后端：
+入口与当前状态、自评写回（请求体逐字段 + 面板 / 指纹 / 横幅）、口径写回、
+夹具模式不请求 `/api/*` 且控件禁用、读失败、写失败不装成功。
 `test_reader_features.py` 末尾两条打真服务（`http://127.0.0.1:8765`，跑之前先起 `ar serve`，
 **服务没起就 skip**）：
 

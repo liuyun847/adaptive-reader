@@ -1,11 +1,15 @@
 /**
- * 阅读页顶栏的「状态」面板（2026-10-09 新增）。
+ * 启动页顶栏的「测试和修改」面板（2026-10-09 新增，2026-10-20 从主栏那张卡搬进顶栏）。
  *
  * 两块内容：① 测试结论（后端 / 前端两套的 passed / failed / skipped + 耗时）② 本次修改
  * （note 一句话 + 汇总 + 文件清单）。**数据源只有一个**：同源静态文件 `/status.json`
  * （由 `tools/gen_status.py` 生成，后端把它挂在 `/` 上，与 `/api/*` 同源）。
  * 本文件里**没有任何数字**——读不到 / 读坏了就走「尚未生成」的降级文案，
  * 不空白、不假装成功（`web/README.md` 的「降级纪律」）。
+ *
+ * 入口在顶栏（`data-role="status-toggle"`，按钮文字「测试和修改」）；原来主栏那张
+ * ① 状态卡里的说明文字与「报告读不到时…」备注都已并入**面板内部**（见 `buildStatusCard`
+ * 的 lead），主栏不再有那一块。
  *
  * 形态与纪律（与 `survey.js` 同一套视觉语言与指针模型）：
  *   - 层 `.status-layer` 与卡片 `.status` 都是 `pointer-events: none`，只有关闭按钮要回 auto
@@ -110,19 +114,22 @@ export function buildStatusCard(doc = document) {
   card.tabIndex = -1;                                  // 打开时焦点落这里（不进入 Tab 序）
   card.setAttribute('role', 'dialog');
   card.setAttribute('aria-modal', 'false');
-  card.setAttribute('aria-label', '状态：测试结论与本次修改');
+  card.setAttribute('aria-label', '测试和修改：测试结论与本次修改');
 
   const head = el(doc, 'div', 'status__head');
-  head.appendChild(el(doc, 'span', 'status__title', 'status-title', '状态'));
+  head.appendChild(el(doc, 'span', 'status__title', 'status-title', '测试和修改'));
   head.appendChild(el(doc, 'span', 'status__stamp', 'status-generated-at', ''));
   const close = el(doc, 'button', 'status__close', 'status-close', '×');
   close.type = 'button';
-  close.setAttribute('aria-label', '关闭状态面板');
+  close.setAttribute('aria-label', '关闭「测试和修改」面板');
   head.appendChild(close);
   card.appendChild(head);
 
+  // 这段并的是原来主栏那张「① 状态」卡里的说明文字与备注（2026-10-20 随卡片一起搬进面板）
   card.appendChild(el(doc, 'div', 'status__lead', 'status-lead',
-    '这两块是项目自己跑出来的结论，不是手写的：报告由 tools/gen_status.py 生成，页面只负责显示。'));
+    '两套测试的结论（后端 / 前端）与本次未提交的改动，由 tools/gen_status.py 生成，'
+    + '页面只负责显示，一个数字都不硬编码。报告读不到时这里会写「尚未生成」+ 生成命令'
+    + '（不空白、不假装成功）。'));
 
   card.appendChild(el(doc, 'div', 'status__body', 'status-body'));
   const foot = el(doc, 'div', 'status__foot');

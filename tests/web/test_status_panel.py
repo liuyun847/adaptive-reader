@@ -1,12 +1,15 @@
-"""**启动页**「状态」块（①）的无头验证（playwright 驱动本机 Edge）。
+"""**启动页**顶栏那颗「测试和修改」入口的无头验证（playwright 驱动本机 Edge）。
 
 🔁 2026-10-15 拆页后：状态面板从阅读器顶栏搬到了**启动页**（`GET /` → `web/index.html`），
 所以本文件的用例一律打开启动页；阅读器页（`web/reader.html`）里**没有**这个入口
 （`test_reader_page_has_no_status_entry` 守着这一点）。
 
+🔁 2026-10-20：入口从启动页主栏那张「① 状态」卡搬进了**顶栏**（按钮文字「测试和修改」，
+卡片里的说明文字与备注并进了面板内部），主栏不再有状态那一块。
+
 覆盖的契约：
 
-1. **入口在启动页的①状态块里**（不再是阅读器顶栏那条）；点开显示两块内容——① 测试结论 ② 本次修改；
+1. **入口在启动页顶栏里**（仍在 `data-block="status"` 那一块里）；点开显示两块内容——① 测试结论 ② 本次修改；
 2. **数据源是机器生成的同源静态文件** `/status.json`（由 `tools/gen_status.py` 产出），
    前端不硬编码任何数字，也不写死「通过」；
 3. **降级可见**（`web/README.md` 的「降级纪律」）：报告取不到 / 坏掉 / 字段不认识时，
@@ -190,26 +193,28 @@ def close_panel(page) -> None:
     page.wait_for_function("() => globalThis.__arDebug.statusOpen === false", timeout=5000)
 
 
-# =================================================== 1. 入口在启动页①状态块、能开、焦点进面板
+# =================================================== 1. 入口在启动页顶栏、能开、焦点进面板
 
 def test_entry_sits_in_the_launcher_status_block_and_opens_the_panel_with_focus_inside(page, ar_server):
-    """入口在启动页的①状态块里（`data-block="status"`），点开后焦点进面板、`aria-expanded` 跟随。"""
+    """入口在启动页顶栏里（`data-block="status"`），点开后焦点进面板、`aria-expanded` 跟随。"""
     stub_report(page, report())
     stub_launcher_api(page)
     open_launcher_page(page, ar_server)
 
     entry = toggle(page)
     expect(entry).to_be_visible()
-    # 拆页前这一条断言的是「与「Aa 显示」并排在顶栏里」；入口搬进启动页的①块之后，
-    # 改断言「它确实在那个块里」——那才是这次改造要守住的位置。
+    # 拆页前这一条断言的是「与「Aa 显示」并排在顶栏里」；2026-10-20 状态卡搬进顶栏之后，
+    # 改断言「它确实在顶栏里、也在那个块里」——那才是这次改造要守住的位置。
     assert page.evaluate(
         "() => { const b = document.querySelector('[data-role=\"status-toggle\"]');"
         " const block = b && b.closest('[data-role=\"launcher-block\"]');"
-        " return Boolean(block && block.dataset.block === 'status' && b.closest('.lcard')); }"
-    ), "状态入口不在启动页的①状态块里"
+        " const bar = b && b.closest('.topbar');"
+        " return Boolean(block && block.dataset.block === 'status' && b.closest('.lcard') && bar); }"
+    ), "状态入口不在启动页顶栏里"
     assert page.locator('[data-role="launcher-block"]').count() == 4, "启动页应该是四块"
     status_block = page.locator('[data-role="launcher-block"][data-block="status"]')
     assert entry.bounding_box()["y"] >= status_block.bounding_box()["y"] - 1
+    assert status_block.bounding_box()["y"] <= 48, "状态那块应该在顶栏那一行里"
 
     assert dbg(page)["statusOpen"] is False
     expect(card(page)).to_have_count(0)
@@ -249,6 +254,11 @@ def test_panel_renders_tests_and_changes_from_the_report(page, ar_server):
 
     assert card(page).get_attribute("data-state") == "ok"
     assert GENERATED_AT in page.locator('[data-role="status-generated-at"]').inner_text()
+
+    # 面板标题＝入口那颗按钮的文字；原来主栏那张卡里的说明文字与备注已并进面板内部
+    assert page.locator('[data-role="status-title"]').inner_text() == "测试和修改"
+    lead = page.locator('[data-role="status-lead"]').inner_text()
+    assert "一个数字都不硬编码" in lead and "尚未生成" in lead, lead
 
     # ① 两块都在
     expect(page.locator('[data-role="status-tests"]')).to_be_visible()

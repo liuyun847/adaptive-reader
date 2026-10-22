@@ -3,6 +3,11 @@
 给一段材料，先摸清读者知道什么，再把材料改写成更贴合他的版本；读的时候原文收在右侧抽屉，
 遇到不懂的点标记弹讲解卡片。设计见 [DESIGN.md](DESIGN.md)，实施契约见 [PLAN-skeleton.md](PLAN-skeleton.md)。
 
+**2026-10-22 补上「画像」页面入口**：阅读器页顶栏新增「画像」面板，做**概念自评**与
+**事实锚口径**两件此前只能命令行 / URL / 手改 `profile.yaml` 的事；分别写
+`POST /api/profile/rating` / `POST /api/profile/preference`，写回即刷新画像指纹。
+口径见 §4「页面入口」，逐项见 [web/README.md](web/README.md) 的「读者画像面板」。
+
 **2026-10-18 这一批**（`rewrite-v7` + 逐段循环 + 一次性基线）：
 
 1. **提示词重排 + 全文进固定上下文**：材料行 / 概念清单 / 配图候选挪到规则之后，并新增
@@ -30,11 +35,15 @@
 
 最近一批（2026-10-15）把**入口与阅读页拆开**，并把「换材料」这件事从命令行搬到页面上：
 
-1. **`GET /` 变成启动页**（`web/index.html`），四块：① **状态**——原阅读器顶栏那枚「状态」按钮与它的
-   面板整体搬来（数据源照旧是同源静态 `web/status.json`）；② **做测试**——**读前背景问卷入口**
+1. **`GET /` 变成启动页**（`web/index.html`），四块：顶栏那颗 **测试和修改**——原阅读器顶栏那枚
+   「状态」按钮与它的面板整体搬来，2026-10-20 起又从主栏那张卡搬进**顶栏**（只留这颗按钮，
+   面板标题与说明并入面板内部；数据源照旧是同源静态 `web/status.json`）；
+   **背景测评**——**读前背景问卷入口**
    （显示已答 / 已跳过 / 未答 + 作答时间，点按钮**就地打开**问卷，**绝不自动弹**）；
-   ③ **历史记录**——材料清单（`data/` 下每份材料的段数、最后动过的时间、动作统计、事实锚校验状态，
-   点一条进阅读器）；④ **输入文件**——浏览器选 `.md` / `.txt` 上传 → 后端摄取成新材料。
+   **历史记录**——材料清单（`data/` 下每份材料的段数、最后动过的时间、动作统计、事实锚校验状态，
+   点一条进阅读器）；**输入文件**——浏览器选 `.md` / `.txt` 上传 → 后端摄取成新材料。
+   主栏**版面**（2026-10-20）：历史记录 / 输入文件并排一行（输入文件在左），背景测评整行铺满且
+   未答（空）时在第一行、答过 / 跳过（有记录）时挪到最后一行。
 2. **阅读器页移到 `GET /reader`**（`web/reader.html`，由原 `index.html` 改名而来，只少了状态入口那两处）；
    老链接 `/?source=…`、`/?fixture=…` **302** 到 `/reader?<原样 query>`，一个都没失效。
 3. **顺带去掉那条打扰**：答过 / 跳过过背景问卷时，**不再弹**「已答过，本次不再打扰…」的黄色横幅
@@ -54,7 +63,7 @@
    阅读器页那处已成死判定的 `isStatusOpen()` 已删、阅读器 doc 载入失败现在显示后端原文）。
    前端口径的逐条落点在 [web/README.md](web/README.md)。
 
-用例账：后端 **688 passed / 0 skipped**、前端 **184 passed / 1 skipped**（口径见 §7）；
+用例账：后端 **688 passed / 0 skipped**、前端 **195 passed / 1 skipped**（口径见 §7）；
 前端模块与页面的逐项说明见 [web/README.md](web/README.md)。
 
 本轮（2026-10-14，`PLAN-actions-feedback.md` §14.1）把**事实锚从「逐段严格比对」松绑成
@@ -143,13 +152,13 @@ async 版入口。
 | M2 概念清单抽取与契约校验（`analyze`） | **按本篇材料出题的读前短测验**（`DESIGN.md` §3.1 的 `buildQuiz` / `quiz.json` 那一套） |
 | **M3 逐段决策 + 改写（`rewrite`）**：四动作全部实现（`expand` / `compress` / `keep` / `illustrate`），提示词 `rewrite-v7`（全文进固定上下文 + 逐段循环 + 校验回灌） | **网页抓取** / PDF / 剪贴板入口（同一 `SourceDoc` 契约）——纯文本（`.md` / `.txt`）的上传入口已由启动页的「输入文件」补上，但它**只摄取**，不代办 `analyze` / `rewrite` / `check` |
 | **M3 事实锚校验（`check` 的数字 / 引号引文 / 书名号《》+ 段缺失）**：2026-10-14 起**可申报 + 可见**（申报放行由读者画像偏好 `pref_fact_anchor` 决定；未申报的缺失照旧退出码 4） | 跨材料概念复用（一期按单篇独立） |
-| **配图与图表渲染**（`illustrate` → `changes[].figure`；mermaid 懒加载 + SVG 白名单；失败退回文字） | 页面自评勾选入口（后端 `POST /api/profile/rating` 已可用，前端还没有对应 UI） |
+| **配图与图表渲染**（`illustrate` → `changes[].figure`；mermaid 懒加载 + SVG 白名单；失败退回文字） | — |
 | **局部重跑**（`ar rewrite --only / --retry-failed / --from-signals` + 逐段 patch 合并器） | **效果观测**：「背景 / 行为信号有没有让改写更贴读者」目前没有对照证据（本项目没有理解力测验兜底） |
 | **行为回流**（`events.jsonl` → `POST /api/events`（只 append）→ `ar feedback` 折算 → `profile.applySignals`） | 讲解链路注入背景（`/api/explain` 仍只按概念状态讲） |
 | **「太啰嗦」当场压缩**（`POST /api/compress` + 压缩缓存 + 单段事实锚比对（**同一档读者口径 + 申报通道**）+ 写回三份产物） | 多人账号 / 按请求传读者（读者 id 取自应用级配置） |
-| 最小画像（`profiles/local-default/profile.yaml`，自评写回 + 手写 `overrides`；行为回流只累加计数、不动 `overrides`） | — |
+| 最小画像（`profiles/local-default/profile.yaml`，自评写回 + 手写 `overrides`；行为回流只累加计数、不动 `overrides`）+ **页面画像入口**（2026-10-22：阅读器页顶栏「画像」面板做概念自评与事实锚口径，写 `POST /api/profile/rating` / `POST /api/profile/preference`；夹具模式禁用并写明原因，失败不装成功） | — |
 | **读前背景问卷 + 读者素描**（六道固定题 + 条件题联动 + 整场跳过；可选模型追问；答案落 `background`，素描注入 `rewrite` 提示词，产物追记 `background_used` / `background_fingerprint`） | — |
-| 模型客户端（OpenAI 兼容流式，密钥不落盘、报错脱敏）+ 前端 `web/`（零构建静态页：**启动页 `GET /`**（状态 / 背景问卷入口 / 材料清单历史 / 上传摄取四块）+ **阅读器页 `GET /reader`**，已实现，口径与用例见 [web/README.md](web/README.md)） | — |
+| 模型客户端（OpenAI 兼容流式，密钥不落盘、报错脱敏）+ 前端 `web/`（零构建静态页：**启动页 `GET /`**（顶栏的「测试和修改」+ 背景问卷入口 / 材料清单历史 / 上传摄取四块）+ **阅读器页 `GET /reader`**，已实现，口径与用例见 [web/README.md](web/README.md)） | — |
 
 > **第四批的「已实现」= 逻辑已实现 + 假模型 / 夹具覆盖**（后端与前端用例见 §7），
 > **不等于真机验收**：压缩、配图、行为回流这三项**没有**跑过真网关（那几批的硬约束就是零真实模型调用）；
@@ -268,8 +277,9 @@ uv run python tools/gen_status.py --note "一句话说明"   # 跑两套测试 +
 uv run python tools/gen_status.py --skip-web           # 跳过前端那套（要本机 Edge、约 65 秒）
 ```
 
-启动页（`GET /`，即 `web/index.html`）①状态块里的「状态」按钮读的就是这份 `web/status.json`
-（两块：① 测试结论 ② 本次修改）；阅读器页顶栏**没有**这个入口（2026-10-15 起搬到启动页）。
+启动页（`GET /`，即 `web/index.html`）**顶栏**那颗「测试和修改」按钮读的就是这份 `web/status.json`
+（两块：① 测试结论 ② 本次修改）；阅读器页**没有**这个入口（2026-10-15 起搬到启动页，
+2026-10-20 起在启动页里又从主栏搬进了顶栏）。
 产物**机器生成、不入库**（`.gitignore`），页面读不到时显示「尚未生成」+ 上面的命令；
 口径与字段形状见 [web/README.md](web/README.md) 的「状态报告怎么生成」。
 
@@ -822,7 +832,7 @@ overrides: []
 
 | 方法 与 路径 | 说明 |
 |---|---|
-| `GET /` | 托管**启动页** `web/index.html`（状态 / 背景问卷入口 / 材料清单 / 上传摄取四块）；带 `source` 或 `fixture` 任一 query（空值也算）→ **302** 到 `/reader?<原样 query>`（老链接 `/?source=…` 因此不失效，query 不重排、不重编码）；`web/` 不存在时回**写明原因**的 404，不影响 `/api/*` |
+| `GET /` | 托管**启动页** `web/index.html`（顶栏的「测试和修改」+ 背景问卷入口 / 材料清单 / 上传摄取四块）；带 `source` 或 `fixture` 任一 query（空值也算）→ **302** 到 `/reader?<原样 query>`（老链接 `/?source=…` 因此不失效，query 不重排、不重编码）；`web/` 不存在时回**写明原因**的 404，不影响 `/api/*` |
 | `GET /reader` | 托管**阅读器页** `web/reader.html`（直接访问 `/reader.html` 也由静态托管兜住）；文件不存在 → **带可读原因的 JSON 404**，绝不回落到启动页、也不走静态兜底那句「文件或路由不存在」 |
 | `GET /api/doc/<source_id>` | `{ meta, rewritten, changes, concepts, degraded }`；产物缺失的字段是 `null`，原因写在 `degraded` 里（**只摄取、没改写**的材料照此回 `rewritten: null` + 说明，页面显示原文并标「未改写」） |
 | `GET /api/sources` | 材料清单（**只读，一个字节都不写盘**）：`{ sources[], degraded[] }`，每条 `{ source_id, paragraphs, ingested_at, mtime, concepts, rewrite, fidelity }`。缺产物 / 坏 JSON / 形状不对 ⇒ **那一块 `null`** + 顶层 `degraded` 一条可读说明（**绝不 500**）；`concepts = { present, count, generated_at }`、`rewrite = { present, generated_at, action_counts, degraded_count, paragraph_count }`、`fidelity = { present, checked, ok, mismatch_count, counts }`（`ok` = `checked` 为真且 `mismatch_count` 为 0 —— 老产物没有 `checked` 时是 `false`，「没校验过」不算通过）；`mtime` 取三份产物存在者中最新，都没有才退回 `source.meta.json`；排序按**响应里暴露的那个秒精度 `mtime`** 倒序、同刻按 `source_id` 升序（保证「按接口 mtime 排」与「接口给的顺序」永远一致）；空 `data/` → 空数组 + `degraded: []`，`data/` 目录**不存在**才记一条说明；`.upload-*` 残留目录会被点名（不静默） |
@@ -957,6 +967,16 @@ overrides: []
   行为信号回流（`applySignals`）**仍然只给已有偏好追加 evidence、绝不自动新建偏好**。
   这条端点也排在兜底路由之前；读取侧不加新端点（`GET /api/profile` 直接返回整份画像）。
 
+**页面入口（2026-10-22）**：阅读器页（`GET /reader`）顶栏的「画像」面板把这两个写入端点搬上了页面
+（此前只能命令行 / URL / 手改 `profile.yaml`）：点开才读 `GET /api/profile`，概念**只列当前材料**
+`concepts.json` 里的那些，自评三档发 `{concept_id, state}`；「事实锚口径」两条单选发
+`{id: "pref_fact_anchor", value}`（不带 `note`）。成功时直接用响应里的整份画像重画面板，
+并**当场重算画像指纹**（会话讲解缓存随之换键；后端 LRU 下一次讲解也会按新指纹失效）；
+横幅写「已记下自评…」/「事实锚口径已改为…」，并说明**下一次 `ar check` / `ar rewrite`** 才按新值判。
+读失败 / 写失败都在状态行与横幅里说出来，**写失败时该行仍是写之前那一档**（不先把界面改成成功）；
+夹具模式一个 `/api/*` 都不请求，面板写明「不能保存」且控件禁用。逐项口径与用例见
+[web/README.md](web/README.md) 的「读者画像面板」。
+
 ## 5. 配置与密钥纪律
 
 `config.example.json` 是模板；`config.local.json`（**不进版本库**）覆盖默认值：
@@ -1078,7 +1098,7 @@ overrides: []
 
 ```powershell
 uv run pytest tests -q            # 后端用例（688 passed / 0 skipped）：默认不收集 tests/web（前端用例单独跑）
-python -m pytest tests/web -q     # 前端无头用例（184 passed + 1 skipped，需要本机 Edge）——**必须用系统 Python**
+python -m pytest tests/web -q     # 前端无头用例（195 passed + 1 skipped，需要本机 Edge）——**必须用系统 Python**
 ```
 
 > **跑前端那套之前先把 `TEMP` 指到可写目录**（本机受限环境的实测结论，不是可选项）：
@@ -1108,7 +1128,15 @@ python -m pytest tests/web -q     # 前端无头用例（184 passed + 1 skipped�
 > 「阅读器页没有状态入口」**1 条** + 启动页只读对抗复核后的修复 **13 条**
 > （`tests/web/test_launcher.py` 22→34、`tests/web/test_reader_ui.py` +1）；
 > 唯一 skip 是**计费**的真服务用例 `test_real_service_explain_end_to_end_is_billable`（要 `AR_E2E_BILLABLE=1`）。
-> 服务没起时前端套件会多 skip 两条真服务联调用例（**估 169 + 3，这批没实测**）。
+> 服务没起时前端套件会多 skip 两条真服务联调用例（**估 184 + 3，这批没实测**）。
+
+> **计数口径（2026-10-22 页面画像入口）**：前端 **195 passed / 1 skipped（196 collected）**
+> （8765 的 `ar serve` 在跑；服务没起时估 193 + 3，未实测）
+> = 工作区现状的 **189 passed / 1 skipped**（2026-10-22 实测；旧账面 184 之后已有的未提交启动页改动
+> 另多 5 条，不是这一批加的）+ 本批 `tests/web/test_profile_ui.py` **6 条**
+> （入口与当前状态 / 自评写回 / 口径写回 / 夹具模式零 `/api/*` 且控件禁用 / 读失败 / 写失败不装成功）。
+> 后端 **688 passed 不变**（这批只动前端，`tests/web/ar_backend.py` 那两个画像端点只是测试桩）。
+> 唯一 skip 仍是**计费**的真服务用例 `test_real_service_explain_end_to_end_is_billable`。
 
 > **2026-10-18（`rewrite-v7` + 逐段循环 + 一次性基线 + 逐段对话）再补 15 条 ⇒ 后端 688 passed**：
 > `tests/test_baseline.py` 5 条（成功 / 事实锚不符 / 缺段补位 / 输出读不通 / 调用失败留证）、
@@ -1178,7 +1206,7 @@ python -m pytest tests/web -q     # 前端无头用例（184 passed + 1 skipped�
 1 skipped 是那条**默认跳过**的真服务计费用例（见下）。
 
 上面这两个数字不用手抄：`uv run python tools/gen_status.py` 会真跑这两套、把结果写进
-`web/status.json`，**启动页**①状态块里的「状态」按钮读的就是它（口径见 [web/README.md](web/README.md)）。
+`web/status.json`，**启动页顶栏**那颗「测试和修改」按钮读的就是它（口径见 [web/README.md](web/README.md)）。
 
 **静态检查（ruff）的现状——如实记账**（2026-10-14 重核）：`uv run ruff check src tests`
 现存 **7 条**（与 2026-10-13 那次**同一批**，见下表），**2026-10-14 的事实锚申报这批新增 1 条、
@@ -1470,8 +1498,8 @@ Windows 上新建目录默认当前用户可写（`os.access(dir, os.W_OK)` 对 
    那次产物是 `profile_used: true`、「仅背景，无概念自评」档），不再是「无画像」；**连 `background`
    也为空**时才走「无画像」降级路径，那时决策只能依据概念清单的难度提示（产物里已显式标注）。
    要让改写「因人而异」，有两条路：
-   填一次读前背景问卷（页面首次打开材料时弹，落 `background`），或用页面的自评勾选
-   （`POST /api/profile/rating`）写 `concepts` 自评。**注意口径**：背景非空即算「有画像」
+   填一次读前背景问卷（页面首次打开材料时弹，落 `background`），或用阅读器页顶栏「画像」
+   里的自评（`POST /api/profile/rating`，2026-10-22 起页面上有入口）写 `concepts` 自评。**注意口径**：背景非空即算「有画像」
    （`profile_used: true`），但那条路径下每段依据写在 `why.note` 里、`why.profile` 保留模型引用——
    「有没有画像」与「依据强不强」是两件事。
 7. **单读者**：画像格式按「任何读者都能用」设计，但当前只服务 `local-default` 一个人。
@@ -1588,9 +1616,11 @@ Windows 上新建目录默认当前用户可写（`os.access(dir, os.W_OK)` 对 
       放行结论与退出码都不变（本来就没有缺失可放行），但命令行逐条打 `⚠ 事实锚多申报：…`、
       产物留 `fidelity.over_declared[]`、页面挂「本段一个锚点都没少：模型多申报了」徽标。此前
       `same_facts(...) → continue` 在校验申报之前短路，这种乱申报一个字都不提（2026-10-14 收尾修）。
-    - **偏好没有页面 UI**：写入只有 `POST /api/profile/preference` 与手改 `profile.yaml` 两条路
-      （`set_preference` 是同一个纯函数）；页面只**显示**口径与放行结论，不提供改它的入口。
-      另：取值写坏（拼错 / 没有 `value`）**一律退到严口径**并给可见降级，永远不会悄悄放宽。
+    - **偏好的页面入口（2026-10-22 起）**：阅读器页顶栏「画像」面板可改「事实锚口径」这一条，
+      走 `POST /api/profile/preference`（`set_preference` 是同一个纯函数）；它是当前唯一可写的偏好，
+      其他偏好仍只能读。页面上的卡片 / 标记继续**只读显示**本次采用的口径与放行结论。
+      取值写坏（拼错 / 没有 `value`）**一律退到严口径**并给可见降级，永远不会悄悄放宽；
+      面板也会把「画像里的取值不认识、后端按严口径处理」写出来（不把它显示成读者选过的严口径）。
 
 23. **2026-10-14 的真机验证：范围很窄，别读过头**（真网关，模型 `deepseek/deepseek-v4.1-flash`）。
     这一批（`rewrite-v6` / `compress-v3` 的 `why.profile` 语义与措辞）在此前**只有假模型覆盖**，

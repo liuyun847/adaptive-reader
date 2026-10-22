@@ -181,6 +181,33 @@ def test_drawer_is_collapsed_by_default(page, ar_server):
     assert page.locator('[data-role="drawer-toggle"]').is_visible()
 
 
+def test_reader_brand_links_back_to_launcher(page, ar_server):
+    """顶栏品牌名 = 回启动页的链接（2026-10-20 新增，此前阅读器页没有任何出口）。
+
+    只在这里验「是个指向 `/` 的链接 + 长得不像默认蓝链接」；点下去的落点由真服务那条路
+    （`GET /` → 启动页）看着，本目录的静态服务根目录没有 index.html，点了只会看到目录列表。
+    """
+    open_reader(page, ar_server)
+
+    brand = page.locator("a.topbar__brand")
+    assert brand.text_content() == "自适应阅读器"
+    assert brand.get_attribute("href") == "/"
+    assert "回到启动页" in (brand.get_attribute("title") or "")
+
+    # 链接默认色/下划线被收掉：颜色跟顶栏（--panel-ink）一致，且不带下划线
+    styles = brand.evaluate(
+        "el => { const s = getComputedStyle(el);"
+        " return {color: s.color, deco: s.textDecorationLine,"
+        " topbar: getComputedStyle(el.closest('.topbar')).color}; }",
+    )
+    assert styles["deco"] == "none"
+    assert styles["color"] == styles["topbar"], "品牌名还是浏览器默认的链接蓝"
+
+    # 悬停（或键盘聚焦）有反馈——不然没人知道它能点
+    brand.hover()
+    assert brand.evaluate("el => getComputedStyle(el).color") != styles["color"]
+
+
 def test_topbar_badges_are_not_covered_by_the_drawer(page, ar_server):
     """「夹具模式」这类徽标必须一直看得见——抽屉不许把它盖住（回归：曾经被盖住过）。"""
     open_reader(page, ar_server)

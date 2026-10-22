@@ -23,7 +23,7 @@
  *     两个值都取 `GET /api/survey` 顶层；**不从浏览器本地存储读版本号**。
  *   - **可见降级**：跳过 / 提交成功 / 夹具模式不保存 / 后端降级 / 版本不一致 / 校验失败 / 题目拉不到 /
  *     追问失败或降级，都在页面上留字，并在 `globalThis.__arDebug.survey*` 留可断言的标志。
- *   - **由按钮显式打开（2026-10-15）**：启动页（`web/index.html` + `web/js/launcher.js`）的「做测试」
+ *   - **由按钮显式打开（2026-10-15）**：启动页（`web/index.html` + `web/js/launcher.js`）的「背景测评」
  *     卡片走 `openSurveyManually` 打开**同一张**问卷（题目、提交、跳过、追问全走既有路径），
  *     并用 `setSurveyLifecycleHooks` 在「答完 / 关闭」之后刷新卡片上的状态。
  *     阅读器那条路（`bootSurvey`）既不调这个入口也不设钩子 ⇒ 行为与改造前逐字一致。
@@ -554,7 +554,7 @@ const degrade = note;
 /**
  * 生命周期钩子（2026-10-15 新增，**只给启动页用**）。
  *
- * 启动页的「做测试」卡片要先显示现状（已答 / 已跳过 / 未答），而读者点开问卷答完或关掉之后，
+ * 启动页的「背景测评」卡片要先显示现状（已答 / 已跳过 / 未答），而读者点开问卷答完或关掉之后，
  * 那张卡片必须**立刻**刷新——不许靠轮询、也不许靠 sleep（无头验证只等显式状态）。
  * 所以问卷自己在这里留两个显式出口：
  *   - `closed(reason)`：问卷整层被移除之后调用（跳过 / 完成 / Esc / × 都算）；
@@ -604,7 +604,7 @@ export function closeSurvey(reason = 'unknown') {
   state.popupSuppressed = true;
   emit('close', { reason, answers });
   clearLayer();
-  // 层已经收干净了才通知外面（启动页据此刷新「做测试」卡片的状态；阅读器没设钩子）
+  // 层已经收干净了才通知外面（启动页据此刷新「背景测评」卡片的状态；阅读器没设钩子）
   notifyHook('closed', { reason, answers });
 
   const before = state.focusBefore;
@@ -1465,7 +1465,7 @@ export async function bootSurvey({ ctx, banner: bannerFn, degrade: degradeFn } =
 }
 
 /**
- * **由按钮显式打开**问卷（2026-10-15 新增，启动页「做测试」卡片的那颗按钮）。
+ * **由按钮显式打开**问卷（2026-10-15 新增，启动页「背景测评」卡片的那颗按钮）。
  *
  * 与 `bootSurvey` 的关系（有意只做最小改造，两边共用同一套题目 / 表单 / 提交路径）：
  *   - `bootSurvey` 仍然是**阅读器**那条路：它自己判定要不要弹（已答 / 已跳过 / 夹具模式都不弹），

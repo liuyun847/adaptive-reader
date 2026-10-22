@@ -43,7 +43,8 @@
  */
 
 import {
-  DataError, loadDoc, loadProfileSignal, postEvents, readContext, requestCompress, requestExplain,
+  DataError, fetchProfile, loadDoc, loadProfileSignal, postEvents, postPreference, postRating,
+  profileSignalOf, readContext, requestCompress, requestExplain,
 } from './api.js';
 import { createExplainCache } from './cache.js';
 import { armFigures, buildFigure } from './figures.js';
@@ -64,6 +65,10 @@ import {
   MIN_CONTRAST, bootstrapSettings, buildSettingsPanel, measureInkContrast, resetSettings,
   setSettingsPanelOpen, syncSettingsPanel, updateSettings,
 } from './settings.js';
+import {
+  FACT_ANCHOR_OPTIONS, RATING_LABELS, buildProfilePanel, conceptStateOf, factAnchorOf,
+  renderProfile, setProfilePanelOpen,
+} from './profile.js';
 import { bootSurvey, isSurveyOpen } from './survey.js';
 
 const D = globalThis.__arDebug;
@@ -85,6 +90,8 @@ const dom = {
   selectBar: document.querySelector('[data-role="select-bar"]'),
   settingsToggle: document.querySelector('[data-role="settings-toggle"]'),
   settingsPanel: document.querySelector('[data-role="settings-panel"]'),
+  profileToggle: document.querySelector('[data-role="profile-toggle"]'),
+  profilePanel: document.querySelector('[data-role="profile-panel"]'),
   // 状态面板的入口与宿主**不在这里**：2026-10-15 起它搬到了启动页（web/index.html +
   // web/js/launcher.js），阅读器页（web/reader.html）里既没有那个按钮也没有 #status-host。
   sourceBadge: document.querySelector('[data-role="source-id"]'),
@@ -108,6 +115,10 @@ const state = {
   settingsCtx: null,        // updateSettings/resetSettings 要的上下文（root + storage）
   settingsPanelOpen: false,
   inkContrast: null,        // 正文栏当前的实测对比度（量不出来为 null）
+  profile: null,            // 最近一次读到的读者画像（GET/POST /api/profile* 的 profile 字段）
+  profilePanelOpen: false,
+  profileLoadSeq: 0,        // 读画像的请求序号：迟到的响应不许盖掉新的
+  profileBusy: false,       // 正在写画像（自评 / 偏好一次只跑一个）
   profileSignal: '',        // 会话缓存键的画像指纹（夹具模式 / 拿不到时为空串）
   profileSignalNoted: false,
   selection: null,          // 最近一次选区的描述（浮条展示中的那一份）
@@ -269,6 +280,11 @@ function renderDoc(doc, docUrl) {
 
   renderDrawer(paragraphs);
   computeCompression(paragraphs);
+
+  // 画像面板若在正文载入前就被打开，概念清单此刻才齐：就地重画一次（不重新请求画像）
+  if (state.profilePanelOpen && dom.profilePanel && !dom.profilePanel.hidden) {
+    paintProfile({ ...D.profilePanel });
+  }
 }
 
 function renderDrawer(paragraphs) {
@@ -462,6 +478,7 @@ function mountSettings() {
 }
 
 function setSettingsPanelOpen_(open) {
+  if (open && state.profilePanelOpen) setProfilePanelOpen_(false);
   state.settingsPanelOpen = Boolean(open);
   D.settingsPanelOpen = state.settingsPanelOpen;
   setSettingsPanelOpen(dom.settingsPanel, dom.settingsToggle, state.settingsPanelOpen);
@@ -469,6 +486,235 @@ function setSettingsPanelOpen_(open) {
 
 function toggleSettingsPanel() {
   setSettingsPanelOpen_(!state.settingsPanelOpen);
+}
+
+/* --------------------------------------------------- 读者画像面板（2026-10-22） */
+
+/** 面板要列的概念：只取当前材料的概念清单（concepts.json）。 */
+function profileConcepts() {
+  const items = [];
+  state.concepts.forEach((concept) => {
+    if (!concept || typeof concept.id !== 'string' || !concept.id) return;
+    const name = typeof concept.name === 'string' && concept.name.trim() ? concept.name.trim() : concept.id;
+    items.push({ id: concept.id, name, state: conceptStateOf(state.profile, concept.id) });
+  });
+  return items;
+}
+
+/** 记一条画像面板事件（可断言的流水，不进行为事件流）。 */
+function recordProfileEvent(kind, detail = null) {
+  const prev = D.profilePanel || {};
+  const events = Array.isArray(prev.events) ? prev.events.slice() : [];
+  events.push({ kind, at: Date.now(), detail: detail || null });
+  D.profilePanel = { ...prev, events };
+}
+
+/** 后端 `degraded` 的三种形状都认（数组 / 字符串 / 布尔），逐条变成可见说明。 */
+function profileNotes(payload) {
+  if (!payload) return [];
+  const raw = payload.degraded;
+  if (Array.isArray(raw)) return raw.filter((note) => typeof note === 'string' && note.trim());
+  if (typeof raw === 'string' && raw.trim()) return [raw.trim()];
+  if (raw === true) return ['后端没有给出具体原因（degraded: true）。'];
+  return [];
+}
+
+/**
+ * 把当前画像画进面板，并同步 `__arDebug.profilePanel`（唯一出口：别处不要直接改面板 DOM）。
+ *
+ * `locked` 的口径：加载中 / 读失败 / 写盘中 / 夹具模式 → 控件禁用；
+ * **写失败（write-error）不禁用**——画像没改动，读者可以重试。
+ */
+function paintProfile(extra = {}) {
+  const prev = D.profilePanel || {};
+  const panelState = extra.state || prev.state || 'closed';
+  const locked = extra.locked !== undefined
+    ? extra.locked
+    : ['fixture', 'loading', 'error', 'pending'].includes(panelState);
+  const model = {
+    open: state.profilePanelOpen,
+    state: panelState,
+    statusText: extra.statusText || '',
+    mode: state.ctx && state.ctx.mode === 'fixture' ? 'fixture' : 'api',
+    // 读失败且手上没有旧画像时**不列概念**：列出来会像「都没自评过」，而真相是没读到
+    concepts: (panelState === 'error' && !state.profile) ? [] : profileConcepts(),
+    preference: factAnchorOf(state.profile),
+    degraded: Array.isArray(extra.degraded) ? extra.degraded : [],
+    url: extra.url !== undefined ? extra.url : (prev.url || null),
+    locked,
+    events: prev.events || [],
+    lastWrite: extra.lastWrite !== undefined ? extra.lastWrite : (prev.lastWrite || null),
+    error: extra.error || null,
+  };
+  renderProfile(dom.profilePanel, model);
+  D.profilePanel = model;
+  return model;
+}
+
+/**
+ * 一次画像读 / 写成功后统一收口：存画像、算指纹（会话讲解缓存的第五段）、重画面板。
+ * 指纹直接由响应里的整份画像算，省一次 `GET /api/profile`。
+ */
+function applyProfile(payload, url, extra = {}) {
+  state.profile = payload && payload.profile && typeof payload.profile === 'object' ? payload.profile : null;
+  state.profileSignal = profileSignalOf(payload || {});
+  D.profileSignal = state.profileSignal;
+  const rated = profileConcepts().filter((concept) => concept.state !== 'unrated').length;
+  return paintProfile({
+    state: 'ready',
+    statusText: `已同步画像（本材料已自评 ${rated} 条概念）`,
+    url,
+    degraded: profileNotes(payload),
+    ...extra,
+  });
+}
+
+async function loadProfile_() {
+  if (!state.ctx) return;
+  if (state.ctx.mode === 'fixture') {
+    paintProfile({
+      state: 'fixture',
+      statusText: '夹具模式：没有画像后端（GET/POST /api/profile 只在正式模式可用），自评与偏好都不能保存。',
+      degraded: [],
+      url: null,
+      locked: true,
+    });
+    return;
+  }
+  const seq = state.profileLoadSeq + 1;
+  state.profileLoadSeq = seq;
+  recordProfileEvent('load');
+  paintProfile({ state: 'loading', statusText: '正在读读者画像…', degraded: [], locked: true });
+  try {
+    const { payload, url } = await fetchProfile(state.ctx);
+    if (seq !== state.profileLoadSeq) return;      // 迟到响应：只丢掉，不盖新状态
+    applyProfile(payload, url, {});
+  } catch (err) {
+    if (seq !== state.profileLoadSeq) return;
+    paintProfile({
+      state: 'error',
+      statusText: `画像读不出来：${err.message}`,
+      degraded: [],
+      locked: true,
+      error: err.message,
+    });
+    degrade('profile-load', `读不到读者画像（${err.message}）：这次不能改自评或偏好，阅读照常。`);
+  }
+}
+
+function setProfilePanelOpen_(open) {
+  const next = Boolean(open);
+  if (!next && !state.profilePanelOpen) return;   // 已经关着：不要每次 Esc 都记一条 close
+  if (next && state.settingsPanelOpen) setSettingsPanelOpen_(false);
+  state.profilePanelOpen = next;
+  D.profilePanel = { ...(D.profilePanel || {}), open: next };
+  setProfilePanelOpen(dom.profilePanel, dom.profileToggle, next);
+  recordProfileEvent(next ? 'open' : 'close');
+  if (next) loadProfile_();
+}
+
+function toggleProfilePanel() {
+  setProfilePanelOpen_(!state.profilePanelOpen);
+}
+
+/** 写一条自评：成功才改界面（响应里的 profile 是写回后的整份画像）。 */
+async function submitRating(conceptId, ratingState) {
+  if (!state.ctx || state.ctx.mode !== 'api' || state.profileBusy) return;
+  const concept = state.concepts.get(conceptId);
+  const name = concept && concept.name ? concept.name : conceptId;
+  const label = RATING_LABELS[ratingState] || ratingState;
+  // 同档重复点不写盘：自评端点不是幂等的（后端会再追一条 evidence / override），
+  // 白写一次还会换画像指纹 ⇒ 讲解缓存全失效。
+  if (conceptStateOf(state.profile, conceptId) === ratingState) {
+    recordProfileEvent('rating-noop', { concept: conceptId, state: ratingState });
+    paintProfile({ state: 'ready', statusText: `${name} 已经是「${label}」，没有重复写盘。`, locked: false });
+    return;
+  }
+  state.profileBusy = true;
+  paintProfile({ state: 'pending', statusText: `正在写回自评：${name} = ${label}…`, locked: true });
+  try {
+    const { payload, url } = await postRating(state.ctx, { conceptId, state: ratingState });
+    state.profileBusy = false;
+    recordProfileEvent('rating-ok', { concept: conceptId, state: ratingState });
+    applyProfile(payload, url, {
+      statusText: `已记下自评：${name} = ${label}`,
+      lastWrite: { kind: 'rating', concept: conceptId, state: ratingState, at: Date.now(), ok: true },
+    });
+    addBanner(dom.banners,
+      `已记下自评：${name} = ${label}（写回画像；下一次 ar rewrite 才会用上）。`, 'info');
+  } catch (err) {
+    state.profileBusy = false;
+    recordProfileEvent('rating-error', { concept: conceptId, state: ratingState, message: err.message });
+    paintProfile({
+      state: 'write-error',
+      statusText: `自评没写上：${err.message}`,
+      locked: false,
+      error: err.message,
+    });
+    degrade('profile-rating',
+      `自评没写上（${name}）：${err.message}。画像没有改动，页面上显示的还是上一次读到的那份。`);
+  }
+}
+
+/** 写「事实锚口径」偏好；同 id 同取值时后端幂等（不写盘、指纹不变）。 */
+async function submitPreference(value) {
+  if (!state.ctx || state.ctx.mode !== 'api' || state.profileBusy) return;
+  const option = FACT_ANCHOR_OPTIONS.find((item) => item.value === value);
+  if (!option) return;
+  const preferenceId = factAnchorOf(state.profile).id;
+  state.profileBusy = true;
+  paintProfile({ state: 'pending', statusText: `正在写回事实锚口径：${option.label}…`, locked: true });
+  try {
+    const { payload, url } = await postPreference(state.ctx, { id: preferenceId, value });
+    state.profileBusy = false;
+    recordProfileEvent('preference-ok', { id: preferenceId, value });
+    applyProfile(payload, url, {
+      statusText: `事实锚口径已改为：${option.label}`,
+      lastWrite: { kind: 'preference', id: preferenceId, value, at: Date.now(), ok: true },
+    });
+    addBanner(dom.banners,
+      `事实锚口径已改为「${option.label}」：下一次 ar check / ar rewrite 起按它判（已有产物不变，要一致就重跑）。`,
+      'info');
+  } catch (err) {
+    state.profileBusy = false;
+    recordProfileEvent('preference-error', { id: preferenceId, value, message: err.message });
+    paintProfile({
+      state: 'write-error',
+      statusText: `事实锚口径没写上：${err.message}`,
+      locked: false,
+      error: err.message,
+    });
+    degrade('profile-preference',
+      `事实锚口径没写上（${option.label}）：${err.message}。画像没有改动，当前口径照旧。`);
+  }
+}
+
+function mountProfile() {
+  const panel = buildProfilePanel();
+  if (dom.profilePanel) dom.profilePanel.replaceWith(panel);
+  dom.profilePanel = panel;
+  paintProfile({ state: 'closed', statusText: '', locked: true });
+
+  dom.profileToggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggleProfilePanel();
+  });
+  panel.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const role = event.target.dataset ? event.target.dataset.role : null;
+    if (role === 'profile-close') { setProfilePanelOpen_(false); return; }
+    if (role === 'profile-rate') {
+      submitRating(event.target.dataset.concept, event.target.dataset.state);
+    }
+  });
+  panel.addEventListener('change', (event) => {
+    const input = event.target.closest ? event.target.closest('input[data-role="profile-preference"]') : null;
+    if (!input) return;
+    submitPreference(input.value);
+  });
+  panel.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') setProfilePanelOpen_(false);
+  });
 }
 
 /* ------------------------------------------------------------ 讲解卡片 */
@@ -1153,6 +1399,11 @@ function wireInteractions() {
 
   // 点外部关闭卡片；Esc 也关（顺带收浮条与设置面板）
   document.addEventListener('click', (event) => {
+    if (state.profilePanelOpen
+      && !(dom.profilePanel && dom.profilePanel.contains(event.target))
+      && !(dom.profileToggle && dom.profileToggle.contains(event.target))) {
+      setProfilePanelOpen_(false);
+    }
     if (state.settingsPanelOpen
       && !(dom.settingsPanel && dom.settingsPanel.contains(event.target))
       && !(dom.settingsToggle && dom.settingsToggle.contains(event.target))) {
@@ -1172,6 +1423,7 @@ function wireInteractions() {
     if (isSurveyOpen()) return;
     closeCard('escape');
     setSettingsPanelOpen_(false);
+    setProfilePanelOpen_(false);
     hideSelectBar();
   });
 
@@ -1323,6 +1575,9 @@ async function boot() {
   dom.modeBadge.dataset.mode = state.ctx.mode;
   dom.modeBadge.textContent = state.ctx.mode === 'fixture' ? '夹具模式' : '正式模式 /api';
   dom.sourceBadge.textContent = `材料：${state.ctx.sourceId || '（未指定）'}`;
+
+  // 画像面板（2026-10-22）：入口常驻顶栏，**只在读者点开时**才去读 /api/profile（不挡阅读）
+  mountProfile();
 
   if (state.ctx.mode === 'fixture') {
     addBanner(dom.banners,

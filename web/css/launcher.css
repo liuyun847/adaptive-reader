@@ -5,7 +5,13 @@
  * 启动页因此和阅读器共用同一份 `body[data-bg] / data-ink / data-size` 主题
  * （`<head>` 打 `<html>`、`<body>` 一开头打 body，两处用同一份结论，见 web/index.html 里那两段脚本）。
  *
- * 版面：顶栏（沿用 .topbar，fixed）之下是一列卡片，四块按 ①状态 ②做测试 ③历史记录 ④输入文件 排列。
+ * 版面：顶栏（沿用 .topbar，fixed）之下是主栏 —— 两列弹性网格：
+ *   - 历史记录 / 输入文件**并排**（输入文件在左、历史记录在右）；
+ *   - 背景测评**整行铺满**：未答（空）时排在第一行，答过 / 跳过（有记录）时挪到最后一行
+ *     （开关是 js/launcher.js 按问卷状态打在 .launcher 上的 `data-survey`）。
+ * 视觉顺序全靠 flex `order` 摆，**不改 DOM 顺序**（`data-role="launcher-block"` 的 DOM 次序
+ * 仍是 status→survey→history→upload，无头验证按 DOM 读，见 tests/web/test_launcher.py）。
+ * 第四块「测试和修改」在顶栏里（只剩一颗按钮，卡片说明文字并进了状态面板内部）。
  * 状态面板 / 问卷卡片是浮层（.status-layer / .survey-layer，position: fixed），由各自模块插入宿主，
  * 这里只管宿主自己不占位、不留框。 */
 
@@ -19,7 +25,41 @@ body[data-page="launcher"] .launcher {
   margin: 0 auto;
   padding-left: 1.25rem;
   padding-right: 1.25rem;
+  /* 两列弹性网格：卡片 `flex: 1 1 20rem`，容器够宽时两列并排、窄了就一行一块；
+     行间距交给 `gap`，卡片自己那份 `margin-bottom` 在下面的规则里清掉。 */
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 1rem;
 }
+
+/* 导语整行铺在最前（order 比三块都小，且比背景测评默认的 -1 还靠前） */
+.launcher > .launcher__lead {
+  flex: 1 1 100%;
+  order: -2;
+  margin: 0;
+}
+
+/* 主栏三块卡片：各占一列、整行铺满的块单独覆盖；间距交给 gap，所以清掉卡片自带的下外边距。 */
+.launcher > [data-role="launcher-block"] {
+  flex: 1 1 20rem;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+/* 输入文件在左、历史记录在右 */
+.launcher > [data-block="upload"] { order: 0; }
+.launcher > [data-block="history"] { order: 1; }
+
+/* 背景测评整行铺满：未答（空）在最前（order -1）。三条同权重规则按书写顺序决胜，
+   所以这条要排在上面那条「卡片各占一列」之后。 */
+.launcher > [data-block="survey"] {
+  flex: 1 1 100%;
+  order: -1;
+}
+
+/* 有记录（答过 / 跳过）时背景测评挪到最后一行 */
+.launcher[data-survey="record"] > [data-block="survey"] { order: 2; }
 
 /* 导语：颜色必须取**跟 data-bg 成对**的那一档（--panel-muted 与 --bg 同跟 data-bg 走）。
    不能借 --muted / --ink-soft：那两个跟 data-ink 走，「纸白背景 + 浅灰文字」这类手动组合下
@@ -41,6 +81,19 @@ body[data-page="launcher"] .launcher {
   padding: .9rem 1rem 1rem;
   margin-bottom: 1rem;
   box-shadow: 0 2px 10px var(--shadow-drawer);
+}
+
+/* 顶栏里那颗「测试和修改」入口（2026-10-20 随那张状态卡一起搬进顶栏）：
+   仍用 .lcard 这个元素（`data-role="launcher-block" data-block="status"` 的契约不变），
+   但把卡片那套外观（底 / 边框 / 圆角 / 内边距 / 外边距 / 阴影）全部去掉，
+   只留里面那颗按钮——观感与顶栏里的 .badge / .settings-toggle 同一档。 */
+.lcard--bar {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+  box-shadow: none;
 }
 
 .lcard__title {
@@ -151,7 +204,7 @@ body[data-page="launcher"] .launcher {
 .lresult__note { margin-top: .4rem; }
 .lcard__result .lcard__btn { margin-top: .55rem; }
 
-/* ---------------------------------------------------------------- ③ 历史记录 */
+/* ---------------------------------------------------------------- 历史记录 */
 .hist {
   list-style: none;
   margin: .6rem 0 0;
@@ -210,7 +263,7 @@ body[data-page="launcher"] .launcher {
   line-height: 1.6;
 }
 
-/* ---------------------------------------------------------------- ④ 输入文件 */
+/* ---------------------------------------------------------------- 输入文件 */
 .lfield {
   flex: 0 1 auto;
   min-width: 0;

@@ -123,7 +123,18 @@ body {
 
 body[data-drawer="open"] .topbar { padding-right: calc(var(--drawer-w) + 1rem); }
 
-.topbar__brand { font-weight: 600; letter-spacing: .02em; }
+/* 品牌名 = 回启动页的链接（2026-10-20，只有阅读器页用它；启动页那处仍是 div）：
+   链接默认色/下划线按 .hist__link 那套口径收掉（配色跟 data-bg 走，不留硬编码颜色），
+   悬停/聚焦给一点反馈——它不长得像按钮，不给反馈没人知道能点。 */
+.topbar__brand {
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: inherit;
+  text-decoration: none;
+}
+
+a.topbar__brand:hover { color: var(--accent); }
+a.topbar__brand:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 4px; }
 
 .topbar__side { display: flex; align-items: center; gap: .6rem; min-width: 0; }
 
@@ -250,6 +261,147 @@ body[data-drawer="open"] .topbar { padding-right: calc(var(--drawer-w) + 1rem); 
 }
 
 .settings__warn[hidden] { display: none; }
+
+/* ------------------------------------------------- 读者画像面板（◉，2026-10-22） */
+/* 与设置面板同一套外观（绝对定位挂顶栏、点外部 / Esc / × 关闭），内容换成
+   「概念自评 + 事实锚口径」。控件禁用三档：加载中 / 读失败 / 写盘中 / 夹具模式；
+   写失败（write-error）不禁用——画像没变，读者可以重试。 */
+.topbar__profile { position: relative; flex: 0 0 auto; }
+
+.profile {
+  position: absolute;
+  top: calc(100% + .5rem);
+  right: 0;
+  width: 25rem;
+  max-width: calc(100vw - var(--rail-w) - 2rem);
+  max-height: calc(100vh - var(--topbar-h) - 1.5rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--panel);
+  color: var(--panel-ink);
+  border: 1px solid var(--panel-line);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px var(--shadow-card);
+  padding: .7rem .85rem .8rem;
+  font-size: .84rem;
+  z-index: 62;
+}
+
+.profile[hidden] { display: none; }
+
+.profile__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .5rem; }
+.profile__title { font-weight: 600; }
+
+.profile__close {
+  border: 0;
+  background: transparent;
+  color: var(--panel-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.profile__status {
+  margin-bottom: .45rem;
+  padding: .3rem .45rem;
+  border-radius: 6px;
+  background: var(--panel-sunken);
+  color: var(--panel-muted);
+  font-size: .76rem;
+  line-height: 1.5;
+}
+.profile__status[data-state="ready"] { color: var(--ok-ink); background: var(--ok-bg); }
+.profile__status[data-state="loading"],
+.profile__status[data-state="pending"] { color: var(--info-ink); background: var(--info-bg); }
+.profile__status[data-state="error"],
+.profile__status[data-state="write-error"] { color: var(--err-ink); background: var(--err-bg); }
+.profile__status[data-state="fixture"] { color: var(--warn-ink); background: var(--warn-bg); }
+
+.profile__degraded {
+  margin: 0 0 .45rem;
+  padding: .3rem .45rem;
+  border: 1px solid var(--warn-line);
+  background: var(--warn-bg);
+  color: var(--warn-ink);
+  border-radius: 6px;
+  font-size: .76rem;
+  line-height: 1.5;
+}
+.profile__degraded[hidden] { display: none; }
+.profile__degraded-line + .profile__degraded-line { margin-top: .2rem; }
+
+.profile__section { margin-top: .55rem; }
+.profile__label { display: flex; align-items: baseline; gap: .35rem; flex-wrap: wrap; font-weight: 600; }
+.profile__note { color: var(--panel-muted); font-size: .74rem; font-weight: 400; }
+
+.profile__concepts { margin-top: .25rem; }
+
+.profile__concept {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  flex-wrap: wrap;
+  padding: .3rem 0;
+  border-top: 1px dashed var(--panel-line);
+}
+.profile__concept:first-child { border-top: 0; }
+.profile__concept-name { flex: 1 1 8rem; min-width: 0; overflow-wrap: anywhere; }
+.profile__concept-state { color: var(--panel-muted); font-size: .74rem; }
+.profile__concept[data-state="known"] .profile__concept-state { color: var(--ok-ink); }
+.profile__concept[data-state="partial"] .profile__concept-state { color: var(--warn-ink); }
+.profile__concept[data-state="unknown"] .profile__concept-state { color: var(--err-ink); }
+
+.profile__rating { display: flex; gap: .25rem; flex-wrap: wrap; }
+
+.profile__rate {
+  font-family: inherit;
+  font-size: .74rem;
+  color: var(--panel-ink-soft);
+  background: var(--panel-sunken);
+  border: 1px solid var(--panel-line);
+  border-radius: 999px;
+  padding: .1rem .5rem;
+  cursor: pointer;
+}
+.profile__rate:hover { border-color: var(--accent); color: var(--accent); }
+.profile__rate:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.profile__rate[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--info-bg);
+}
+.profile__rate:disabled { opacity: .5; cursor: not-allowed; }
+
+.profile__options { display: flex; flex-direction: column; gap: .3rem; margin-top: .3rem; }
+
+.profile__option {
+  display: flex;
+  align-items: flex-start;
+  gap: .35rem;
+  border: 1px solid var(--panel-line);
+  border-radius: 6px;
+  padding: .25rem .45rem;
+  background: var(--panel-sunken);
+  cursor: pointer;
+}
+.profile__option:hover { border-color: var(--accent); }
+.profile__option:has(input:checked) { border-color: var(--accent); background: var(--info-bg); }
+.profile__option:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 1px; }
+.profile__option input { margin: .18rem 0 0; accent-color: var(--accent); }
+.profile__option input:disabled { cursor: not-allowed; }
+.profile__option-label { font-size: .78rem; line-height: 1.45; }
+
+.profile__empty { margin-top: .25rem; color: var(--panel-muted); font-size: .78rem; }
+.profile__empty[hidden] { display: none; }
+
+.profile__hint {
+  margin-top: .55rem;
+  padding-top: .45rem;
+  border-top: 1px solid var(--panel-line);
+  color: var(--panel-muted);
+  font-size: .72rem;
+  line-height: 1.5;
+}
 
 /* ------------------------------------------------------------ 降级横幅 */
 /* 显示层纪律（2026-10-09，实现见 js/view.js 的 addBanner）：同文本只留一条（叠计数）、
