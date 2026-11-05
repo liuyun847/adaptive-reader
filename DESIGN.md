@@ -64,7 +64,7 @@
 | 重写 Rewrite | 逐段决策 + 生成改写稿；**`why.profile` 逐条保留模型给的引用**（漏键 / 给错形状 / 该给引用却给空数组 ⇒ 逐段可见降级 + 只照读者自评兜底补齐，读者本来没有自评时不误报，契约 §4.4） | `planDecisions(SourceDoc, ConceptInventory, Profile) -> [Decision]`<br>`rewrite(SourceDoc, [Decision], Profile) -> RewrittenDoc + Changes` | `rewritten.md` + `changes.json` |
 | 事实锚 Fidelity（2026-10-14 扩） | 三类锚点抽取 + **按口径**逐段比对：申报（`fact_declarations`）覆盖的缺失在松口径下放行、其余一律违规；**申报与实测对不上**（多申报）单列一条可见说明、不改结论 | `facts_of(text)` / `parse_declarations(raw)` / `compare_blocks_detailed(src, blocks, declarations=…, policy=…) -> FactComparison`（`compare_blocks` 的三返回值签名不变） | 无（结果写回 `changes.json` 的 `fidelity.{fact_anchor_policy,waived,over_declared,mismatches,counts}`） |
 | 模型调用 LLM（2026-10-13 新增） | 全仓模型调用的唯一出口：重试策略、错误码白名单、逐次尝试记账；**失败不抛** | `call(LlmRequest, client, policy) -> LlmResult`<br>`acall(...)`（异步同形） | 无（账目落进各业务产物的 `meta.attempts` / `meta.retry_account`，见 §4.6） |
-| 工具 Tools（2026-10-13 新增，第四批加第五个） | 五个能力各是一个**具名工具**：拼提示词 → 经 LLM 层调模型 → 解析成结构 | `analyze_concepts` / `rewrite_batch` / `explain_paragraph` / `survey_followups` / `compress_paragraph`（入参出参均是 JSON Schema，`ar tools` 可列举） | 无（**校验与落盘仍留在原模块**：`validate_inventory` 之类不搬） |
+| 工具 Tools（2026-10-13 新增，第四批加第五个、2026-10-19 加第六个） | 六个能力各是一个**具名工具**：拼提示词 → 经 LLM 层调模型 → 解析成结构 | `analyze_concepts` / `rewrite_batch` / `explain_paragraph` / `survey_followups` / `compress_paragraph` / `plan_actions`（入参出参均是 JSON Schema，`ar tools` 可列举） | 无（**校验与落盘仍留在原模块**：`validate_inventory` 之类不搬） |
 | 行为事件 Events（2026-10-13 第四批新增） | 行为事件流的读写与折算：一行一条 JSON、按 `id` 幂等去重、`kind` 白名单、事件 → 画像信号；另有回流**水位线**（已折算的事件 id，供 `ar feedback --apply` 幂等） | `read_events` / `append_events` / `validate_event` / `dedup` / `signals_from_events` / `read_feedback_record` / `pending_events` / `write_feedback_record` | `profiles/<reader>/events.jsonl`（**只 append**；端点与 CLI 都不写 `profile.yaml`）+ `profiles/<reader>/feedback.json`（水位线，不进版本库、不参与画像指纹，见 §10.2） |
 | 阅读器 Reader | 展示三份内容、收集行为信号 | 读上述产物；写 `events.jsonl` | 行为事件流 |
 
@@ -76,13 +76,15 @@
 `background_fingerprint` 记这次用没用、用的是哪版）。要按本篇材料的概念出辨识题 / 复述题，
 仍走上面那套 `buildQuiz` / `quiz.json`，**那一层还没实现**。
 
-**模型调用统一经一层**（2026-10-13 落地，第四批加第五个工具，见 [PLAN-llm-tools.md](PLAN-llm-tools.md)）：
+**模型调用统一经一层**（2026-10-13 落地，第四批加第五个工具、2026-10-19 加第六个 `plan_actions`，见 [PLAN-llm-tools.md](PLAN-llm-tools.md)）：
 全仓只有六处会调模型（分析 / 改写 / 讲解 / 追问 / **在线压缩** / **一次性基线**），它们**都不再直接碰 `ModelClient`**：
 前五处各走一个具名工具
 （`analyze_concepts` / `rewrite_batch` / `explain_paragraph` / `survey_followups` / `compress_paragraph`），
+两遍式的第一遍在改写那条路上另发一次 `plan_actions`（只打动作标）；
 一次性基线（对照用，不进工具注册表）直接经 `src/ar/llm.py` 发一次请求；
-六个提示词版本
-（`concepts-v2` / `rewrite-v7` / `explain-v2` / `survey-v1` / `compress-v3` / `oneshot-v1`）
+七个提示词版本
+（`concepts-v2` / `rewrite-v7` / `explain-v2` / `survey-v1` / `compress-v3` / `oneshot-v1`），
+另加两遍式第一遍的 `plan-v1`（第二遍仍是 `rewrite-v7`：计划块为空时零字符插入、逐字未变）
 里 `explain-v2` / `survey-v1` / `concepts-v2` 的正文**逐字未变**，
 `rewrite-v3 → rewrite-v4` 是第四批的语义变化（四动作判据 + `illustration_block`），
 `rewrite-v4 → rewrite-v5` 是 2026-10-14 的语义变化（事实锚口径固定块 + 逐段申报规则，§10.1c），
@@ -316,7 +318,18 @@ overrides:                  # 用户手动推翻，优先级最高，行为信�
 - **`fact_declarations`（为真才出现，2026-10-14）**：这一段**没有原样保留**哪几项事实锚，
   形状 `{numbers?, quotes?, books?, note?}`，每一项逐字来自原文；它是 `ar check` 按读者口径
   放行缺失的唯一依据，也是页面与命令行的可见面（§6 的「事实锚申报」）；
-- **`decisions.json` 不带 `figure` / `figure_error` / `deferred` / `fact_declarations`**
+- **两遍式（`--plan-first`，2026-10-19）**：第一遍一次调用只给全篇打动作标（提示词 `plan-v1`，
+  **不写正文**），计划作为固定上下文 `{plan_section}` 进第二遍（`rewrite-v7` 不升版：计划块为空时零字符插入）；
+  `meta` 追加 `plan_first` / `plan` / `plan_missing` / `plan_usage` / `plan_request_count` / `plan_attempts` /
+  `plan_retry_account` / `plan_prompt_version`，某段的计划动作与最终动作不同时追加
+  `changes[i].plan_action`（为真才出现）；`plan_missing` 不算 unplanned、不改退出码；
+- **两遍式的局部重跑（2026-10-19 复核修复）**：旧产物里已有计划**且**读者 / 背景指纹 / 事实锚口径
+  三项都对得上才复用（0 次打标请求，`meta.plan_reused` 记实情），否则重新全篇打标（多一次请求）；
+  不带 `--plan-first` 的局部重跑也照旧计划执行，注入不了的目标段进 `meta.plan_not_applied`（可见、不改退出码）；
+- **逐段对话的上下文瘦身（`--conversation-digest`，2026-10-19）**：塞回 transcript 的是一行摘要
+  （`p001 keep` / `p002 expand：<改写后正文>`），`why` / `confidence` 外壳不进上下文；
+  开了才在 `meta` 追加 `conversation_digest: true`（关着时 transcript 与产物键集逐字不变）；
+- **`decisions.json` 不带 `figure` / `figure_error` / `deferred` / `fact_declarations` / `plan_action`**
   （决策记录只留动作与依据）；
 - 局部重跑在 `meta` 上追加 `rerun` / `rerun_history[]`，并把 `fidelity` **重置**为未校验
   （`checked: false`、`counts: null`、`waived: []`）——绝不许把上次的 `checked: true` 带过来。
@@ -487,7 +500,7 @@ overrides:                  # 用户手动推翻，优先级最高，行为信�
 > **同样是零真实模型调用**（`rewrite-v5` / `compress-v2` 都没打过真网关）。
 >
 > **2026-10-13 追加（模型调用工具化 + 重试改造）**：模型调用收敛到 `src/ar/llm.py`（统一调用层：
-> 重试策略、错误码白名单、逐次记账、失败不抛）与 `src/ar/tools.py`（具名工具，第四批起是**五个**），
+> 重试策略、错误码白名单、逐次记账、失败不抛）与 `src/ar/tools.py`（具名工具，第四批起五个、2026-10-19 加 `plan_actions` 后是**六个**），
 > 产物追加 `meta.attempts` / `meta.retry_account`（§4.6；口径与错误码表见 README §5.1）；
 > 新增 `tests/test_llm.py` / `tests/test_tools.py`，后端 **382 条全绿**（`uv run pytest tests -q`）。
 > 另外新增只读子命令 `ar tools`（列举工具契约），见 README §2。
@@ -624,7 +637,7 @@ overrides:                  # 用户手动推翻，优先级最高，行为信�
 | 1 | 「严格档」（逐句可回溯规格） | **一期不做，但接口预留** | 重写引擎按 `mode` 留插口，默认 `free`；`ar rewrite --mode strict` 明确报错 + 退出码 3，**不写产物、不发请求**（`src/ar/rewrite.py::STRICT_NOT_IMPLEMENTED`） |
 | 2 | 图表方案 | 方向定为 **mermaid + SVG**（结构 / 流程类走 mermaid，需要精确排版或自定义图形时走 SVG） | **2026-10-13 第四批落地**：搬本机离线构建 `deepseek-chat/app/js/vendor/mermaid.min.js` → `web/vendor/mermaid.min.js`（5,575,485 B，**懒加载**、每页最多注入一次），**不引 CDN**；SVG 走模型产源码 + 后端白名单（禁 `<script>` / `on*` / `foreignObject` / 外部 `href`）+ 前端 `DOMParser` 白名单；失败一律退回文字 |
 | 3 | 范围 | **先做走通骨架**，链路验证过再补齐 | 见 PLAN-skeleton §2；骨架已跑通；**压缩 / 配图 / 行为回流已于第四批补齐**（局部重跑与在线压缩一并落地，只差真机验收），网页 / PDF 入口仍未做；**「测验」那一项已按 2026-10-08 的追加拍板落了前半（跨材料背景问卷，见 §10.1b）** |
-| 4 | 模型接入 | **OpenAI 兼容 HTTP + 项目内配置**，密钥不进任何被提交的文件 | `src/ar/model.py`（只发一次请求 + 错误码归一）+ `src/ar/llm.py`（重试策略与逐次记账）+ `src/ar/tools.py`（具名工具，第四批起**五个**）+ `config.local.json`（含可选的 `retry` 段；密钥优先取环境变量 `AR_API_KEY`，只在运行时读；报错与产物全部脱敏） |
+| 4 | 模型接入 | **OpenAI 兼容 HTTP + 项目内配置**，密钥不进任何被提交的文件 | `src/ar/model.py`（只发一次请求 + 错误码归一）+ `src/ar/llm.py`（重试策略与逐次记账）+ `src/ar/tools.py`（具名工具，第四批起五个、2026-10-19 加 `plan_actions` 后**六个**）+ `config.local.json`（含可选的 `retry` 段；密钥优先取环境变量 `AR_API_KEY`，只在运行时读；报错与产物全部脱敏） |
 | 5 | 画像 | **YAML**，落 `profiles/<读者 id>/profile.yaml`（便于手改 `overrides`） | `src/ar/profile.py`（`overrides` 优先级最高，写入时追记） |
 | 6 | 压缩提示 | **只在读完时提示**，读中不常驻 | 前端 `web/js/main.js` 的 `markReadComplete()`（滚到底才显示「本次改写比原文长 / 短了百分之几」） |
 | 7 | 概念清单复用 | **一期按单篇独立**，字段预留跨材料合并 | `concepts[].domain` / `concept_key` 已落库（如 `socially_necessary_labor_time`），合并逻辑不做 |

@@ -130,7 +130,7 @@
 （新增 `src/ar/llm.py` 与 `src/ar/tools.py`）：重试照 DSH 内置重试的口径（默认 5 次重试、
 错误码白名单、500→10000 ms 指数退避 ±10% 抖动），**失败不抛**，逐次尝试落进产物
 `meta.attempts` / `meta.retry_account`；CLI 新增**只读**子命令 `ar tools`（第四批在此之上加了第五个工具
-`compress_paragraph`）。**原有五个子命令（+ 只读的 `ar tools`）的名称、参数、退出码语义一个没变**，
+`compress_paragraph`；2026-10-19 又加了第六个 `plan_actions`——两遍式的第一遍，只打动作标）。**原有五个子命令（+ 只读的 `ar tools`）的名称、参数、退出码语义一个没变**，
 产物既有字段一个没改（只追加字段）。见 §2、§3、§5.1。
 
 2026-10-13 当晚的**对抗性复核修复**（第三批收尾，见 §3「模型调用的尝试记账」）：
@@ -212,6 +212,8 @@ uv run ar rewrite <source_id> --from-signals      # 局部重跑：只重跑行�
 uv run ar rewrite <source_id> --per-paragraph --concurrency 1   # 逐段循环（串行）：一段一请求 + 校验回灌重试
 uv run ar rewrite <source_id> --per-paragraph --concurrency 4   # 逐段循环（并发上限 4）
 uv run ar rewrite <source_id> --per-paragraph --conversation     # 逐段对话：原文与已改内容留在同一上下文（强制串行）
+uv run ar rewrite <source_id> --conversation-digest              # 逐段对话的上下文瘦身（与上一条同用：只回填一行摘要）
+uv run ar rewrite <source_id> --plan-first                       # 两遍式：先一次调用给全篇打动作标，再按原模式照计划改写
 uv run ar baseline <source_id> --reader local-default           # 一次性整篇改写基线（只写 data/<id>/_eval/）
 uv run ar check   <source_id>                     # 锚点校验 + 事实锚校验（数字 / 引号引文 / 书名号《》+ 段缺失）
 uv run ar check   <source_id> --reader local-default   # 口径按这个读者的画像偏好 pref_fact_anchor 判（默认读者）
@@ -244,12 +246,16 @@ uv run ar feedback <source_id> --reader local-default --apply  # 真的写 profi
 `ar rewrite` 打口径与每段申报、`ar check` 打口径与逐条放行，两处都在 §3 那一节里列了。
 
 `ar tools` 是 2026-10-13 新增的**只读**子命令：不读配置、不调模型、不发请求，
-只列举**五个**工具（`analyze_concepts` / `rewrite_batch` / `explain_paragraph` / `survey_followups` /
+只列举**六个**工具（`analyze_concepts` / `rewrite_batch` / `plan_actions` / `explain_paragraph` / `survey_followups` /
 `compress_paragraph`）的名称、描述、入参出参与提示词版本；`--json` 输出同一份契约的 JSON 数组
 （照 `tools.schemas()`）。`compress_paragraph` 是第四批新增的第五个工具（提示词版本
 `compress-v3`：2026-10-14 收尾从 `compress-v1` 升到 `compress-v2`，多了事实锚申报通道；
 同日复核修复升到 `compress-v3`——它与 `rewrite` 共用同一个「读者画像」块，块措辞一改内容就变了），
-`POST /api/compress` 走的就是它。
+`POST /api/compress` 走的就是它。第六个工具 `plan_actions`（提示词版本 `plan-v2`，2026-10-31）
+是**两遍式的第一遍**：一次吃全篇、每段只回一个动作（**不写正文**），由 `ar rewrite --plan-first` 调它；
+它没有对应的 HTTP 路由（在线交互用不到打标）。
+它的提示词与第二遍**共用同一段前缀**（同一段 user 头 + 各自的尾巴、system 也逐字相同），
+所以第一遍建好的缓存能被第二遍第 1 批吃到（`plan-v1` 时两遍公共前缀 0 字符，见 §8 第 14 条）。
 
 `ar feedback`（第四批新增，第 7 个子命令）：读 `profiles/<reader>/events.jsonl` → 折算信号 →
 `ar.profile.applySignals`（纯函数，不碰磁盘）→ 打印 `changed` / `skipped_overrides` /
@@ -299,6 +305,20 @@ uv run python tools/gen_status.py --skip-web           # 跳过前端那套（�
 `--conversation`（必须与 `--per-paragraph` 同用、强制串行）把「独立请求」换成**一条累积的对话**：
 第一轮仍是 v7 的全文 / 规则，之后每轮把上一轮的 assistant 决策与当前段指令追加进 `messages`，
 校验反馈也追加成新的 user 消息——模型能看到前面几段已经怎么改。
+`--conversation-digest`（2026-10-19，必须与 `--per-paragraph --conversation` 同用）是这条模式的
+**上下文瘦身**：上一轮塞回 transcript 的不再是整段 JSON，而是一行摘要（`p001 keep` /
+`p002 expand：<改写后正文>`），`why` / `confidence` 这些外壳不进上下文（原始 JSON 仍用于
+本轮校验解析）。关着时 transcript 与之前**逐字一致**，开了才在产物 `meta` 追加 `conversation_digest: true`。
+`--plan-first`（2026-10-19，两遍式；2026-10-31 起提示词版本 `plan-v2`，与第二遍共享同一段前缀）先把「动作决策」单独跑一遍：
+一次调用给全篇每段打动作标（展开 / 压缩 / 保持 / 配图，**不写任何正文**），再把这份计划当**固定上下文**
+（`{plan_section}`，全文块之后、本次段号之前）进第二遍的原有模式（分批 / 逐段 / 逐段对话都行）。
+不写正文时模型没有「别把原文改坏」的压力，动作决定因此更敢下手——**适合通篇偏保守、几乎全 keep 的材料**；
+代价是多一次请求（第一遍吃全篇）。与 `--only` / `--retry-failed` / `--from-signals` 同用时，
+**旧产物里已有计划**才复用（读者 / 背景指纹 / 事实锚口径三项都对得上，0 次打标请求，产物记
+`meta.plan_reused`）；旧产物没有计划、或这三项对不上就**重新全篇打标**（多一次请求）。
+不带 `--plan-first` 的局部重跑也按旧计划执行那几段：旧计划里没有它的条目时，段 id 进
+`meta.plan_not_applied` 并在命令行点名（不许静默降级成单遍）。`meta.plan_missing`（第一遍漏了
+哪几段）**不改退出码**（它不是「有段落没被改写」）。两个新开关**互不冲突**，可以同时开。
 `--help` 里的文案与本节一致（`ar feedback --help` 同样写明默认 dry-run、`--apply` 才写盘、
 内容逐字相同则不写）。
 
@@ -435,6 +455,173 @@ temperature 0.6 的随机性没有做重复实验摊平。
 - **一次性基线很便宜但几乎没改**：25 段里只改了 1 段（其余逐字照抄），completion 1.1 万（其中 7,740 是
   reasoning）；它把「不需要改就照抄」执行得最保守，作为「便宜但没做多少事」的下限对照。
 
+### 2.1.3 两遍式（`--plan-first`）对照：它**没有**更敢下手（2026-10-31，第二份材料）
+
+第二份材料：`学习/10-资本论第二卷_第20章_简单再生产.md` 的前 25 段（`data/xuexi-10-ch20`，3,048 字符 /
+25 段；`ar analyze` 出 17 条概念 / 4 个配图候选），读者 `local-default`（只有背景、没有概念自评），
+模型 `deepseek/deepseek-v4.1-flash`（`config.local.json` 已改成 3 跳回退链，首跳 commandcode），
+`temperature 0.2`。四档产物写 `data/xuexi-10-ch20/_compare/{A,B,C,D}/`，**不覆盖**主产物。
+
+| 档 | 跑法 | 调用 | 墙钟 | prompt | completion | 前缀缓存 | 动作（展开/压缩/保持/配图） | 降级 |
+|---|---|---|---|---|---|---|---|---|
+| A | 独立逐段 `--per-paragraph --concurrency 4` | 25（+1 次校验重试） | 87.9 s | 114,444 | 26,946 | 97,280（85%） | 9 / 0 / 12 / 4 | 4 |
+| B | 逐段对话 `--conversation` | 25（+3 次校验重试） | 205.5 s | 255,760 | 11,130 | 245,120（96%） | 8 / 0 / 14 / 3 | 17 |
+| C | 两遍式 `--plan-first --per-paragraph --concurrency 4` | 25 + 计划 1 | 69.1 s | 125,440 + 4,671 | 10,159 + 1,804 | 120,960（96%） | 4 / 0 / 17 / 4 | 3 |
+| D | 与 C 同跑法（复跑一遍，看波动） | 27 + 计划 1 | 79.8 s | 137,453 + 4,671 | 10,598 + 2,187 | 132,480（96%） | 5 / 0 / 16 / 4 | — |
+
+四档 `ar check` 全部退出码 0（25 段全比对，数字 6 / 引文 0 / 书名 1，与原文一致）；C 在 p019 多申报一条
+（一个数字没少却申报放弃「第VIII稿」），只记 `fidelity.over_declared`、不影响放行。
+逐段动作矩阵与四份产物在 `data/xuexi-10-ch20/_compare/`（`report.md` 是同一份结论的速查版）。
+
+读法（这一节的结论与 3c 的动机**相反**）：
+
+- **两遍式更保守，不是更敢下手**：计划那一遍只标了 4–5 段展开（C 4 / D 5），第二遍**一段都没改主意**
+  （C、D 均为 **25 / 25** 与计划一致）；同样的材料，独立逐段（A）与逐段对话（B）各判出 9 / 8 段展开。
+- **差异不是随机噪声**：A 与 B（两种完全不同的上下文策略）只在 3 段上不同，而 A 与 C 差 5 段、且**全是
+  「A 展开 / C 保持」**（p006 / p009 / p011 / p014 / p020）——计划把 25 次独立判断压成了**一次冷判**。
+- **计划本身是稳定的**：C 与 D 两次独立打标 24 / 25 段相同（只差 p006），两次都被照抄 ⇒ 这是可复现的行为，
+  不是一次抖动。
+- **墙钟最快是意外收获**：C 69 s（A 88 s、B 206 s）——「该不该改」在计划里已经定了，第二遍只写正文，
+  completion 1.0 万（A 2.7 万）；prompt 与 A 同量级（96% 命中，计划那 4.7k 只付一次全价）。
+- **逐段对话这次没被锚定**：B 判出 8 段展开（14 保持），与 A 只差 3 段（p011 / p014 / p019），不再像 §2.1.2
+  那次「0 展开 / 20 保持」那么贴着前面的决策走；它的 17 条降级里 9 条是「改写正文里有空行，已并成同一段」，
+  另 3 段是校验回灌重试。⇒ 对话模式的锚定程度**依赖材料**，不能拿一次结论当通例。
+- **补充（2026-11-03）**：上一条那句「锚定程度依赖材料」，已被 §2.1.4 的六档对照修正/收窄——同材料同日、
+  逐段对话与独立逐段的动作差只有 0–1 段，上下文形态里真正稳定、两材料同向的效应是上下文瘦身
+  （`--conversation-digest`）让模型更保守，而不是上下文累积导致锚定。
+
+**为什么没有变「敢」**：第二遍的指令是「照这份计划执行——与计划不一致时，就在该段的 why.note 里写明为什么
+改主意」，实测这条出路**一次都没被用过**（25 / 25 照抄）。计划用一次冷启的全局判断替代了逐段的独立判断，
+而那次判断本来就偏保守（它只看动作、不看正文，反而更不愿意给长段做展开）。要真的更敢下手，得改的是
+**计划的性质**（从「命令」降成「建议」）或**打标的判据**（把「读者已熟悉的段」与「可压缩的冗余段」分开标），
+不是再调第二遍的措辞。
+
+限制：单一材料、每档只跑一遍（C 有 D 复跑）、`temperature 0.2` 未做多次平均；这份材料只有 3,048 字符 /
+25 段（比 `capital-v1-ch01` 短 43%），全文块小 ⇒ 逐段 prompt 也比 §2.1.2 那次小一半。
+
+### 2.1.4 逐段对话的锚定到底跟什么有关（2026-11-03 六档对照）
+
+这一节回答 TODO 第 3 项 c（3c）那个问题：逐段对话里累积的上下文，到底把模型「锚」在了什么上——是上下文的
+**体积**、「前面几段怎么判」的**决策**，还是材料本身的**段间依赖**？设计是 2 材料 × 3 种上下文形态：
+独立逐段（`--per-paragraph --concurrency 4`，每段一次全新请求）/ 逐段对话（`--conversation`，一条累积的
+`messages`，前几轮的决策都看得见）/ 逐段对话 + 上下文瘦身（`--conversation-digest`，回填进上下文的只剩
+一行摘要）。六档在 2026-11-03 一天内跑完，条件统一：模型 `deepseek/deepseek-v4.1-flash`、
+`prompt_version rewrite-v7`、`temperature 0.2`、读者 `local-default`；每档产物都含 `decisions.json` /
+`rewritten.md` / `changes.json`。
+
+两份材料：`data/xuexi-10-ch20`（3,048 字符 / 25 段 / 17 概念）与 `data/capital-v1-ch01`（5,290 字符 /
+25 段 / 10 概念，事实锚 34 数字 / 11 引文 / 13 书名号）。
+
+| 档 | 材料 | 跑法 | 墙钟 s | 请求 | prompt | completion | cached | 动作（展开/压缩/保持/配图） | 改动段 | 降级 | `ar check` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| X-A | xuexi | 独立逐段（并发 4） | 91.8 | 27 | 118,945 | 25,229 | 114,048（96%） | 7 / 0 / 15 / 3 | 7 | 6 | 退出码 0 |
+| X-B2 | xuexi | 逐段对话 | ≈200 | 26 | 217,368 | 10,266 | 203,776（94%） | 7 / 0 / 16 / 2 | 7 | 12 | 退出码 0 |
+| X-Bd | xuexi | 对话 + digest | 208.8 | 30 | 206,413 | 8,779 | 200,320（97%） | 5 / 0 / 17 / 3 | 5 | 13 | 退出码 0 |
+| K-A | capital | 独立逐段（并发 4） | 87.1 | 25 | 138,342 | 26,753 | 131,840（95%） | 4 / 1 / 16 / 4 | 5 | 3 | 退出码 0 |
+| K-B2 | capital | 逐段对话 | ≈200 | 27 | 241,233 | 9,781 | 225,536（93%） | 3 / 1 / 17 / 4 | 4 | 7 | 退出码 0 |
+| K-Bd | capital | 对话 + digest | 208.7 | 28 | 213,441 | 7,266 | 206,720（97%） | 1 / 0 / 20 / 4 | 1 | 7 | 退出码 0 |
+
+统计口径：「动作」= 展开 / 压缩 / 保持 / 配图；**「改动段」= 展开 + 压缩**（配图不改正文）。六档 `ar check`
+全部退出码 0、25 段全比对，事实锚与原文一致：xuexi 各档「数字 6 / 引文 0 / 书名 1」，capital 各档
+「数字 34 / 引文 11 / 书名 13」。
+
+逐段动作一致度（25 段逐段比）：X-A vs X-B2 19 / 25 相同、X-A vs X-Bd 21 / 25；K-A vs K-B2 **24 / 25**
+（只差 p020）、K-A vs K-Bd 21 / 25。而在对话模式**内部**换一次上下文形态——X-B2 vs X-Bd 21 / 25、
+K-B2 vs K-Bd 22 / 25——差得一样多。⇒「无上下文」与「对话」之间的动作差距，并不比「对话」内部换一次
+上下文形态的差距更大。
+
+同材料换上下文形态（逐段对话 → 对话 + digest）具体改了哪几段：xuexi 4 段（p005 expand→keep、
+p014 keep→expand、p019 expand→illustrate、p020 expand→keep）；capital 3 段（p018 expand→keep、
+p021 expand→keep、p023 compress→keep）。
+
+跨日期参照（条件不同，不进上面六档、只作对照）：xuexi 的逐段对话档前一天（2026-10-31）是展开 8 / 保持 14 /
+配图 3，当天同样是 `temperature 0.2`；capital 的逐段对话档（2026-10-18）是展开 0 / 压缩 1 / 保持 20 /
+配图 4——但那天整批五版对照用的是 `temperature 0.6`，与今天的 0.2 不是同一条件。
+
+读法（这一节的结论与 §2.1.2 那次「对话被锚定」的印象**相反**）：
+
+- **对话上下文本身造成的锚定很小**：同材料同日、独立逐段 vs 逐段对话 = xuexi 7 vs 7（零差）、
+  capital 5 vs 4（少 1 段）。原先「capital 被明显锚定（0 展开）」的印象，主要来自 2026-10-18 那次
+  `temperature 0.6` 的单次跑，**不能**作为「上下文累积导致锚定」的证据。
+- **方向一致，但幅度未超噪声**：上下文瘦身（`--conversation-digest`）在两份材料上都把模型推向**保守**——
+  xuexi 7→5、capital 4→1，方向一致；但段级差异只有 4 / 25 与 3 / 25，落在当天实测的**同配置重跑噪声带
+  （4–5 / 25）**内。因此只能记为「**方向一致、幅度未超噪声**」，**不能**判为已证实效应——详见本节末尾的
+  「噪声底线与打乱顺序对照（同日补充）」。
+- **材料之间的差异与上下文形态的差异同量级**：xuexi 7 段 vs capital 5 段的改动差距，与上下文形态造成的差距
+  （2 段上下）差不多；单靠这两份材料，无法把「材料」这一维单独判成主因。
+- **仍未隔离的**：段间依赖这一维——已用打乱顺序对照做过（两档各变 6 / 25），但幅度与同配置重跑的噪声带
+  （4–5 / 25）同量级，故**未判为效应**、这一维仍未隔离；「同条件重复」也已做两档（X-A2 / X-B2r，4–5 / 25）。
+- **digest 的账**：prompt 少 5.0%（xuexi）与 11.5%（capital）、缓存命中率 94%→97%，但重试请求更多
+  （26→30、27→28），省下的 prompt 有一部分被多出的请求吃回去；它换来的是「更保守」，不是「更省钱更好改」。
+
+限制：① **已做**两档同配置重跑（见本节末尾「噪声底线与打乱顺序对照」），**噪声底线 4–5 / 25 段**；此前那句
+「噪声量级 1 段」是跨日期重复的间接推断，低估了一个量级，已作废；② capital 的
+2026-10-18「0 展开」记录**不可直接比**（`temperature 0.6` vs `0.2`），既不能拿来估噪声，也不能拿来证明
+「对话被锚定」；③ **已做**打乱顺序对照（xuexi 25 段、seed `20261103`），两档各变 6 / 25，幅度与噪声同量级、
+**未**判为效应；④ 两份材料的事实锚密度差很多
+（capital 数字 34 / 引文 11 / 书名 13，xuexi 6 / 0 / 1），无法把「材料」单独判成主因。
+
+产物：**实验产物已在 2026-11-03 收尾时清理**（各档的 `decisions.json` / `rewritten.md` / `changes.json` 随实验目录
+一并删除）；主产物不受影响——`data/xuexi-10-ch20/` 顶层仍是素材三件、`data/capital-v1-ch01/` 顶层仍是主产物六件。
+要复跑按本节档位与参数重跑即可：独立逐段 `--per-paragraph --concurrency 4`、逐段对话 `--conversation`、上下文
+瘦身 `--conversation-digest`，`temperature 0.2`、`prompt_version rewrite-v7`、读者 `local-default`。
+
+同一份结论的速查版（表格 + 结论 + 路径）：`data/_eval/conversation-anchor-2026-11-03/report.md`；
+打乱顺序实验的原始记录：`data/_eval/conversation-anchor-2026-11-03/shuffle-report.md`。
+
+#### 噪声底线与打乱顺序对照（同日补充）
+
+上面的读法建立在「每档只跑一遍」上，于是把 2–4 段的差异读成了效应。同一天补跑两组对照来量噪声：**同配置重跑**
+（同一档、同一材料、参数一字不改，再跑一遍）与**打乱段落顺序**（同一份材料内容一字不改，只把 25 段按 seed
+`20261103` 重排，概念清单按置换对齐）。两组都只跑 xuexi 材料。
+
+打乱段落顺序（材料 `xuexi-10-ch20`，25 段；原序基线就是上表的 X-A / X-B2）：
+
+| 档 | 跑法 | 退出码 | 墙钟 s | 请求 | prompt | completion | 合计 | cached | 动作（展开/压缩/保持/配图） | 降级 | `ar check` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| S-A | 打乱 · 独立逐段（并发 4） | 0 | 174.4 | 25 | 109,990 | 41,892 | 151,882 | 97,152（88%） | 10 / 0 / 11 / 4 | 5 | 退出码 0 |
+| S-B2 | 打乱 · 逐段对话 | 0 | 204.3 | 26 | 205,751 | 11,803 | 217,554 | 196,864（96%） | 5 / 1 / 17 / 2 | 9 | 退出码 0 |
+
+同配置重跑（材料 `xuexi-10-ch20`、原序，参数与上表六档完全相同）：
+
+| 档 | 跑法 | 退出码 | 墙钟 s | 请求 | prompt | completion | 合计 | cached | 动作（展开/压缩/保持/配图） | 降级 | `ar check` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| X-A2 | 独立逐段重跑 | 0 | 80.9 | 26 | 114,471 | 23,446 | 137,917 | 112,768（99%） | 7 / 0 / 14 / 4 | 6 | 退出码 0 |
+| X-B2r | 逐段对话重跑 | 0 | 197.2 | 27 | 222,659 | 10,319 | 232,978 | 213,632（96%） | 4 / 1 / 17 / 3 | 10 | 退出码 0 |
+
+统计口径：「动作」= 展开 / 压缩 / 保持 / 配图；「请求」= 25 段 + 校验重试（S-B2 的 p011 校验重试 1 次 ⇒ 26，
+其余各档重试 0）。打乱版按**正文 SHA1** 对齐比较——25 段正文 hash 互不相同，所以等价于按 id 对齐。
+
+两两动作距离（/ 25 段动作不同）：
+
+- 同配置重跑：X-A vs X-A2 = **5**；X-B2 vs X-B2r = **4**
+- 跨模式（原序）：X-A vs X-B2 = 6；X-A vs X-B2r = 6；X-A2 vs X-B2 = 7；X-A2 vs X-B2r = 5
+- 打乱顺序：X-A vs S-A = 6；X-B2 vs S-B2 = 6
+- 换上下文形态（digest，前面那批）：X-B2 vs X-Bd = 4；K-B2 vs K-Bd = 3
+
+变化段清单（重跑那两对）：
+
+- X-A → X-A2（5 段）：p005 expand→keep、p006 keep→expand、p009 keep→expand、p013 expand→keep、p023 keep→illustrate
+- X-B2 → X-B2r（4 段）：p005 expand→keep、p016 keep→compress、p019 expand→illustrate、p020 expand→keep
+
+读法：
+
+- **每一种差异都落在同一条带里**：换上下文形态 3–4 / 25、打乱顺序 6 / 25、跨模式 5–7 / 25——全在 4–7 / 25 这一带
+  内互相重叠，没有一个跳出噪声。
+- **噪声底线就是 4–5 / 25**：同一档、同一材料、参数一字不改地再跑一遍，动作就翻 4–5 段。所以单次采样分不开
+  「效应」与「采样抖动」。
+- **段间依赖未超噪声**：打乱顺序后两档都变 6 / 25，与噪声同量级，**不能**判为效应；但有 4 段（p005 / p009 /
+  p015 / p020）在两档里同向漂移，其中 p005 有可解释机制——它是「社会资本 / 个别资本 / 再生产」的首现段，原序排
+  第 5（前面没有定义）判展开，被挪到第 24 位后改判保持。这些只作**线索**记录，不当结论。
+- **p005 是波动最大的段**：X-A expand、X-A2 keep、X-B2 expand、X-B2r keep、S-A keep、S-B2 keep——6 次里翻面
+  3 次。
+- **要定论必须加重复**：每档 ≥3 次重复、用一致性分布判，而不是再改提示词或再换材料。
+
+> **本节推翻了 §2.1.4 前面「digest 更保守是真效应」的读法**：方向在两份材料上确实一致（xuexi 7→5、capital
+> 4→1），但段级差异只有 4 / 25 与 3 / 25，落在同配置重跑 4–5 / 25 的噪声带内，只能记为「方向一致、幅度未超
+> 噪声」。同样，前面读法里「段间依赖未隔离」与「同条件重复没做」（含限制①③）也已被本节取代。两者不一致时
+> **一律以本节为准**。
+
 ## 3. 产物与数据模型
 
 落盘位置（字段名与 [DESIGN.md](DESIGN.md) §4 一致，逐字不改）：
@@ -447,7 +634,7 @@ temperature 0.6 的随机性没有做重复实验摊平。
 | `data/<id>/concepts.raw.txt` | 只在抽取失败时出现：模型原始输出（排查用） |
 | `data/<id>/decisions.json` | `decisions[{paragraph,action,why{profile,note},confidence}]`（**每段一条**，**不带** `figure` / `deferred`）+ `meta{action_counts,deferred_count,profile_used,profile_note,background_used,background_fingerprint,request_count,usage,batch_usage,degraded,attempts,retry_account,rerun?,rerun_history?,…}`（`batch_usage[]` 每条另含 `attempts`；`rerun` / `rerun_history` 见下） |
 | `data/<id>/rewritten.md` | 改写稿（段序与源一致、段间空行分隔、段首不写 id）；`illustrate` 段的正文与原文**逐字节相同**（**图不进 md**），枚举内未实现的动作按保持处理 |
-| `data/<id>/changes.json` | `changes[{paragraph,action,why,confidence,facts{numbers,quotes},fact_declarations?,profile_refs_filled?,figure?,figure_error?,deferred?}]` + `fidelity{checked,mismatches,counts,fact_anchor_policy,waived,over_declared,…}` + `meta{paragraph_count,action_counts,deferred_count,…,fact_anchor_policy,fact_anchor_policy_source,model_errors,unplanned_paragraphs,rewrite_incomplete,attempts,retry_account,rerun?,rerun_history?}`（`figure` **只在配图成功时出现**，失败时该条 `action` 退回 `keep` + `figure_error`；`fact_declarations` **只在模型真的申报了放弃某项事实锚时出现**——整篇改写与**在线压缩**两条路径都会写它；`profile_refs_filled`（布尔 `true`）**只在骨架照读者自评兜底补齐了这一段 `why.profile` 时出现**，是页面那枚徽标的唯一判据，同样不进 `decisions.json`；`waived` / `over_declared` **只由 `ar check` 填**，改写与压缩阶段一律留空数组；`paragraph_count` 与 `decisions.json` 的 `meta` 同口径，2026-10-13 复核修复 F5 补上） |
+| `data/<id>/changes.json` | `changes[{paragraph,action,why,confidence,facts{numbers,quotes},fact_declarations?,profile_refs_filled?,figure?,figure_error?,deferred?,plan_action?}]` + `fidelity{checked,mismatches,counts,fact_anchor_policy,waived,over_declared,…}` + `meta{paragraph_count,action_counts,deferred_count,…,fact_anchor_policy,fact_anchor_policy_source,model_errors,unplanned_paragraphs,rewrite_incomplete,attempts,retry_account,rerun?,rerun_history?}`（`figure` **只在配图成功时出现**，失败时该条 `action` 退回 `keep` + `figure_error`；`fact_declarations` **只在模型真的申报了放弃某项事实锚时出现**——整篇改写与**在线压缩**两条路径都会写它；`profile_refs_filled`（布尔 `true`）**只在骨架照读者自评兜底补齐了这一段 `why.profile` 时出现**，是页面那枚徽标的唯一判据，同样不进 `decisions.json`；`waived` / `over_declared` **只由 `ar check` 填**，改写与压缩阶段一律留空数组；`plan_action`（2026-10-19）**只在两遍式的计划动作与该段最终动作不同时出现**（`--plan-first` 没开时一条都没有）；`paragraph_count` 与 `decisions.json` 的 `meta` 同口径，2026-10-13 复核修复 F5 补上） |
 | `data/<id>/_verify/` | 真服务联调的截图与 uvicorn 日志（人工验收材料，不是程序产物） |
 | `data/<id>/_eval/` | **一次性基线**（`ar baseline`）的证据：`oneshot.json` + `oneshot.md`（读不通时另有 `oneshot.raw.txt`）。**不碰**三份主产物；`data/` 已进 `.gitignore`，留作人工对照 |
 | `profiles/<reader>/profile.yaml` | 读者画像（顶层键 `reader` / `background` / `concepts` / `preferences` / `overrides`；行为演化的计数器放在 `concepts[cid]` **内层**，不动顶层白名单；`preferences[]` 的条目里**可以带取值** `value`——目前只有事实锚口径 `pref_fact_anchor` 用它，`value ∈ keep_all / allow_declared_drops`，写入走 `set_preference` / `POST /api/profile/preference`） |
@@ -456,7 +643,12 @@ temperature 0.6 的随机性没有做重复实验摊平。
 | `profiles/<reader>/survey.json` | 读前背景问卷的记录文件（**不进版本库**）：问卷版本、每题**原始**作答（截断前的自由文本也在）、落画像后的 `background`、追问的原始问答、追问调用的元数据（`model` / `prompt_version` / `usage` / `followup_history[]` / 追问那条 `call` 事件的 `attempts`） |
 
 **提示词版本**：`concepts-v2` / **`rewrite-v7`** / `explain-v2` / `survey-v1`，加在线压缩的
-**`compress-v3`**、一次性基线的 **`oneshot-v1`**（`src/ar/prompts.py` 里的六个常量）。
+**`compress-v3`**、一次性基线的 **`oneshot-v1`**、两遍式第一遍的 **`plan-v2`**
+（`src/ar/prompts.py` 里的七个常量）。`plan-v2` 单独记版本：第二遍仍走 `rewrite-v7`，
+计划块为空时那一格**零字符插入**、提示词逐字未变，所以 `rewrite-v7` **不升版**。
+`plan-v2` 与 `plan-v1` 的差别只有排版：第一遍的 user 消息改成「改写那份的**公共头**（到全文块结束）
++ 打标尾巴（判别标记 / 指令 / 示例 / 5 条规则）」，system 也换成 `REWRITE_SYSTEM_PROMPT`
+⇒ 两遍的公共前缀从 **0 字符**变成 **9889 字符（5364 token）**，第一遍建的缓存第二遍第 1 批直接用得上。
 最近的变化：
 - `rewrite-v6 → rewrite-v7`（2026-10-18）：材料行 / 概念清单 / 配图候选从固定块中间挪到**规则之后**，
   并在同一条「按材料变」的段里新增**全文**（`{full_text_block}`）与**校验反馈槽**（`{feedback_block}`，
@@ -503,6 +695,27 @@ temperature 0.6 的随机性没有做重复实验摊平。
 |---|---|
 | `background_used` | `true` / `false`：这次改写是否拿到了非空素描。判据是「固定题答过**或**有非空追问摘要」（`ar.survey.has_background`），与 `profile_used` 一起决定每段 `why.profile` 留不留「（无画像）」标记 |
 | `background_fingerprint` | 素描文本的 8 位 sha256 哈希（`ar.survey.sketch_fingerprint`）。**背景一变它就变**，是「这次用的是哪版背景」唯一的对照依据——旧产物与新产物的改写决策不可直接比（`PLAN-background-survey.md` §14）。没有背景时素描是固定文案 `未提供`，哈希就是这段文案的哈希 |
+
+`rewrite` 的 `meta` 里另有两组由两个开关决定的**追加**字段（旧键一个不改；**开关关着时这几格一个都不出现**，
+所以默认路径的产物键集与加它们之前**逐字相同**）：
+
+| 字段 | 位置 | 含义 |
+|---|---|---|
+| `plan_first` | 两份 meta | `true` = 这一篇是按两遍式跑的（`--plan-first`）。只在开时出现 |
+| `plan` | 两份 meta | 第一遍的计划：`[{paragraph, action, note}]`，按全篇段序、每段一条；**只有动作与一句依据，没有正文** |
+| `plan_missing` | 两份 meta | 第一遍漏了哪几段（段 id）。**不算 `unplanned_paragraphs`、不改退出码 6**——它只是「计划不完整」 |
+| `plan_usage` | 两份 meta | 第一遍那一次调用的 token 账（与 `usage` 同形；网关没上报 `cached_tokens` 时为 `null`） |
+| `plan_request_count` / `plan_attempts` / `plan_retry_account` | 两份 meta | 第一遍的请求数（恒 1，除非重试）/ 逐次尝试账 / 汇总账（形状同 `retry_account`） |
+| `plan_prompt_version` | 两份 meta | 第一遍用的提示词版本（`plan-v2`）。第二遍的 `prompt_version` 仍是 `rewrite-v7` |
+| `plan_reused` | 两份 meta | `true` / `false` = 这一轮**有没有沿用**旧产物里的计划（只有「局部重跑 + 旧产物有计划」时才出现这格；复用 = 0 次打标请求） |
+| `plan_not_applied` | 两份 meta | 目标段里**没能注入旧计划**的段 id。旧计划没有它的条目 / 口径对不上时出现，同时命令行点名（不算 `unplanned`、不改退出码） |
+| `conversation_digest` | 两份 meta | `true` = 逐段对话用了上下文瘦身（`--conversation-digest`）。**只在开时为 true** |
+
+同一次改写里，**计划与执行不一致的段**还会在 `changes[i].plan_action` 上留下计划里那一个动作
+（**为真才出现**，照 `fact_declarations` 的先例：一致时不写，免得每段多一个永远相同的键）；
+局部重跑（`--only` / `--retry-failed` / `--from-signals`）时，未重跑段的这些键由合并器
+**逐字搬旧条目**；计划本身按「旧产物里有就复用（0 次打标请求，`meta.plan_reused` 记实情；
+目标段在旧计划里没条目时进 `meta.plan_not_applied`）」办，没有旧计划才重新全篇打标。
 
 **⚠ 盘上的样例产物比文档旧（「键不存在」≠「值不对」）**：`data/capital-v1-ch01/` 现在躺着的那三份产物
 是 **2026-10-13 12:27** 那次 `ar rewrite` 留下的（`concepts.json` 更早，2026-10-08），早于本批复核修复 F5
@@ -644,7 +857,7 @@ overrides: []
 | `config.py` | 配置加载、密钥解析（`AR_API_KEY` > 文件）、`retry` 段解析（含废弃的顶层 `max_retries` 映射）、`redact()` 脱敏 |
 | `model.py` | OpenAI 兼容流式客户端：**只发一次请求并把它看懂**——拼 URL 与请求体、发一次、解析 SSE、`stream_options` 被拒自动降级、`redact()` 脱敏、**错误码归一**；`arequest_once` 是「只发一次、返回 `LlmResult`、不抛」的入口，**自己不再重试**（重试交给 `llm.py`）；`chat` / `achat` 的外观保留（内部经 `llm.acall`，失败抛 `ModelCallFailed`） |
 | `llm.py` | 统一调用层（2026-10-13 新增）：重试策略（错误码白名单 + 指数退避 + 上游 `Retry-After`）、逐次尝试记账、**失败不抛**；对外 `call`（同步）/ `acall`（异步） |
-| `tools.py` | 工具注册表与**五个**具名工具（2026-10-13 新增，第四批加第五个）：`analyze_concepts` / `rewrite_batch` / `explain_paragraph` / `survey_followups` / `compress_paragraph`；每个工具把「拼 messages → 经 `llm.py` 调模型 → 解析成结构」收成一步，入参 / 出参是 JSON Schema，`ar tools` 直接列举 |
+| `tools.py` | 工具注册表与**六个**具名工具（2026-10-13 新增，第四批加第五个、2026-10-19 加第六个 `plan_actions`）：`analyze_concepts` / `rewrite_batch` / `explain_paragraph` / `survey_followups` / `compress_paragraph` / `plan_actions`；每个工具把「拼 messages → 经 `llm.py` 调模型 → 解析成结构」收成一步，入参 / 出参是 JSON Schema，`ar tools` 直接列举 |
 | `prompts.py` | 提示词与版本号（回归基线的一部分） |
 | `analyze.py` | 概念清单抽取、整理（repairs）与契约校验（M2） |
 | `rewrite.py` | 逐段决策（`planDecisions`）、改写（`rewrite`）、事实锚复核（`check_fidelity`）（M3） |
@@ -1017,6 +1230,80 @@ overrides: []
 - `api_key` 为 `""`（或未设 `AR_API_KEY`）= 模型未配置：`/api/health` 的 `model_configured` 为 false，
   `ar analyze` 以退出码 5 结束，`/api/explain` 返回可见降级文案。
 
+### 5.0 多源回退链（2026-10-26 新增，可选）
+
+**为什么要它**：单源写死一家，那家余额打满时整条流水线全挂。本机 DSH 的 `dsh-llm-auto` 插件早就按
+「回退链 + 额度冷却」跑，但它只对外给 `/api/llm-auto/{routes,catalog,diag}` 三个只读端点、
+**没有** OpenAI 兼容的 `/chat/completions`，Python 侧接不进去（2026-10-26 实测）。所以那套规矩在
+`src/ar/chain.py` 里复刻一份，**不依赖 DSH 进程**。
+
+**怎么开**：二选一——`config.local.json` 里的 `routes` 数组 > 环境变量 `AR_ROUTES_FILE` 指的 YAML。
+两处都没有 = **单源模式**，行为与加链之前逐字一致。**链不会因为文件躺在项目根就自动生效**
+（本机是这么接的：`export AR_ROUTES_FILE=<项目根>/config.routes.yaml`，先 `ar routes show` 复核再开服务）。
+
+```bash
+uv run ar routes import --default   # 生成 config.routes.yaml（= 本机 llm-auto 当前那条链）
+uv run ar routes show               # 看当前生效的链、每跳密钥来源（从不打印密钥值）
+```
+
+```json
+"ordering": "auto",
+"routes": [
+  { "provider": "commandcode", "model": "deepseek/deepseek-v4.1-flash",
+    "base_url": "https://api.commandcode.ai/provider/v1", "api_key_env": "CMD_API_KEY",
+    "quota": "commandcode", "quota_base": "https://api.commandcode.ai" },
+  { "provider": "opencode-go", "model": "deepseek-v4.1-flash",
+    "base_url": "https://opencode.ai/zen/go/v1", "api_key_env": "OPENCODE_API_KEY",
+    "quota": "opencode-go", "quota_base": "https://opencode.ai/zen/go/v1",
+    "headers": { "x-opencode-session": "…" } },
+  { "provider": "ju-liu", "model": "DeepSeek-V4.1-flash",
+    "base_url": "https://juflowai.com/v1", "api_key_env": "JU_LIU_API_KEY" },
+  { "provider": "deepseek-official", "model": "deepseek-flash",
+    "base_url": "https://api.deepseek.com", "api_key_env": "DEEPSEEK_API_KEY" }
+]
+```
+
+| 项 | 规则 |
+|---|---|
+| 排序 | `ordering`（默认 `auto`，与插件同口径）：① 从额度接口**现查到的**月度重置时刻升序 → ② 认识这家额度但这次没查到 → ③ 没有额度接口的按量兜底，永远最后；`manual` = 严格按配置顺序、**不跳过**任何一家 |
+| 排序键哪来 | 不写、不猜：每跳写 `quota: commandcode \| opencode-go`（+ 可选 `quota_base`），排序前向上游要——CC 取套餐 `currentPeriodEnd`，Go 取 `usage.monthly.resetsAt`。**查询节流**照插件 0.11：查到后有效期 = 该家最早已知重置时刻（另挂 6 小时上界），查不到才 10 分钟后再问。只认**月度**档（5h/周是速率闸门，按它排会抖） |
+| 换跳 | **默认换**：任一跳失败就试下一跳（AUTH / QUOTA / QUOTA_RATE_WINDOW / SERVER / INVALID_REQUEST / UNKNOWN 都换）。**额度类失败不原地重试**（重试也等不到窗口重置，插件 0.9.1 口径） |
+| 跳内重试 | 换跳**不吃** `retry` 额度；整条链都败了，才由 §5.1 的重试决定要不要再来一轮 |
+| 额度冷却 | `QUOTA` 与 `QUOTA_RATE_WINDOW` 都按 **provider** 记账（额度是账号级的），两步照插件 0.11.0：① 失败当下**同步**记 5 分钟短闸门（补查回来之前，并发批不再白撞同一家）② **只补查这一家、绕缓存**，确认有档位打满就换成「被耗尽那几档里最晚的重置时刻」，确认不了就留那条短闸门。**额度恢复会自愈**：周期补查查到该家健康（`status: ok` 且没有耗尽档）就解除这条冷却，充值 / 换套餐不用等周期末。`NOT_CONFIGURED`（没密钥）按 10 分钟冷、不参与自愈；`AUTH` **不冷却**（插件口径：key 改好就该立刻能用） |
+| 调用内闸门 | 同一次调用里某跳回了 `RATE_LIMIT`，其余 trip 在 2 分钟内也跳过它（与上面那条「补查前的 5 分钟短闸门」是两件事） |
+| 全冷兜底 | 一跳不剩（全在冷却）⇒ **忽略冷却**照链硬走，避免假故障「链已用尽」 |
+| 冷却持久化 | **落盘**：`~/.dsh/storages/adaptive_reader_cooldowns.json`（`DSH_HOME` 可改根），只记**剩余毫秒 + 理由**（单调时钟重启归零，绝对时刻没有跨进程意义）。每次进链时先读回再排序 ⇒ 新进程的第一条请求就绕开已打满那家（插件 0.11「重启后第一条白撞」的同一修复）。读写失败只告警、照常按链走，`/api/health` 的 `cooldowns_persist` 给出 `ok` 或失败原因 |
+| 查询失败 | **fail-open**：断网 / 超时 / 形状不认 / 401 ⇒ 这家进「②额度查不到」桶、**不冷却**（也不把"没查到"当成"查到了"占住 6 小时），宁可下次白撞一次，也不误伤一条其实能用的订阅 |
+| 逃生口 | `subscription` / `reset_at` 仍可手填（覆盖探测结果），只在上游改形状时用；正常情况**一个都不用填** |
+| 换跳卫生 | 换跳前摘掉历史里的 `reasoning_content` / `reasoning`（别的模型的思考喂给下一家会被摊成正文或 400） |
+| 推理档位 | 每跳可写 `reasoning_effort`（默认档：名字或上游原值，`null` = 不写该键）与 `reasoning_efforts`（档位表 `{名字: 上游值}`，照插件 0.10 的 route 级声明）。认不出的档位名**整键不写**；不声明这一跳就一个字节都不多。单源模式的请求体保持原样 |
+| 密钥 | 每跳只写 `api_key_env`（环境变量名）；值在发请求那一刻现读 环境变量 > `~/.dsh/.credentials.yaml` 的 `refs.<名字>`；**永不进 `Config`、不落盘、不打印** |
+| 报错 | 全链失败时 `failure.code` 固定为 **`AUTO_ROUTES_EXHAUSTED`**（插件同值：调用方据此区分「链跑完」与「末跳自己失败」），`message` **逐跳一行**（插件「全部失败」同款信息量）：`1) a/m-a → QUOTA：… （12 ms，已试 1 次）`；同一跳失败多次只占一行、次数累加。**重试仍按逐跳判**：只要有一跳是瞬时类（`SERVER` / `TIMEOUT` / `TRANSPORT` …）外层就会再来一轮，全是确定性失败则一次就停 |
+| `model` 字段 | 链模式下 `Config.model` 为空、`model_label` 是 `a/m1 → b/m2`；`/api/health` 多一个 `routes` 数组（单源模式没有这个键） |
+
+**额度探测实测**（2026-10-26，本机真实凭据）：`ar routes show` 现查到 Command Code 套餐 `individual-goat`、周期末 2026-11-04T14:00:31Z，OpenCode Go 月度档 2026-11-24T07:48:38Z——排序键就是这么来的，配置里没有任何手写时间。
+
+**回退实测**（默认链，2026-10-28）：commandcode 余额 $0.084，上游回 `400 invalid_request_error` +
+`insufficient credits` ⇒ 本地判成 `QUOTA`（**不原地重试**），补查按 `credits.total < 0.2` 确认打满 ⇒
+冷却到套餐周期末（11-04 22:00，实测剩余 6.94 天），本次自动落到 opencode-go 成功返回；**紧随其后的
+调用一个请求都没再发给 commandcode**，这次「跳过」落在 `LlmResult.skipped` 里（`[{provider, model, reason}]`，
+不打印密钥）。两条都已固化成用例（`tests/test_chain.py`、`tests/test_quota.py`）。
+
+> ⚠ **余额判据为什么有 $0.2 下限**（`ar.quota.CREDITS_FLOOR_USD`，与 DSH 插件 0.12.0 同值）：上游的
+> `belowThreshold` 只在余额**恰好归零**时才为真（`creditThreshold = 0`），但它实际上在「余额不够这次
+> 请求的预扣」时就拒——2026-10-28 实测 $0.084、两档窗口 0/14 与 0/35 全未超，连 `max_tokens: 1` 都回
+> 400。只看 `belowThreshold` 就永远「确认不了」，只剩 5 分钟短闸门，每 5 分钟白撞一次（约 3 秒）。
+> 余额回到 0.2 以上后，下一次周期补查（≤6 小时一次）会自动解冻。本项目仍**没有**即时「解除」入口
+> （CLI / 面板都没有）：不想等就删 `~/.dsh/storages/adaptive_reader_cooldowns.json` 再重启进程。上游账单语义的
+> 报告见 [CommandCodeAI/command-code#1081](https://github.com/CommandCodeAI/command-code/issues/1081)。
+
+> ⚠ 判额度靠**文案**而不是状态码：本机实测 commandcode 余额耗尽走 400、opencode-go 额度用完走 429，
+> 只看状态码会分别误判成「参数错误」「限速」——前者不冷却（每次白撞），后者会呆等重试。
+> ⚠ 两条路（`QUOTA` / `QUOTA_RATE_WINDOW`）现在冷却行为**相同**：不原地重试 + 5 分钟短闸门 + 补查确认
+> 后冷到该档重置。分界只看文案：余额词（`insufficient credits` / `insufficient balance`）或含
+> `usage limit` 的句子归 `QUOTA`；只有窗口词、没有余额词的那种（`weekly credits are used up, resets in 3 days`）
+> 归 `QUOTA_RATE_WINDOW`。CC 的真实周窗文案含 "usage limit"，所以落 `QUOTA` —— 结果一样。
+
 ## 5.1 重试与错误码（2026-10-13 新增）
 
 **结论先说**：模型调用统一经 `src/ar/llm.py`；默认最多重试 **5** 次（即最多 **6** 次尝试），
@@ -1043,14 +1330,19 @@ overrides: []
 | 连接失败、协议错误、**流提前结束**（既没有 `[DONE]` 也没有 `finish_reason`） | `TRANSPORT` | **是** |
 | 流内 `error` 字段 | 有 status 按上表，否则 `SERVER` | 视码 |
 | 收完但正文为空 | `EMPTY_RESPONSE` | **是** |
-| 网关明确报额度用尽 | `QUOTA` | 否 |
+| 网关明确报额度用尽（余额/额度文案，如 `insufficient credits`、`insufficient balance`、`… usage limit …`） | `QUOTA` | 否（链上不原地重试；5 分钟短闸门 → 补查确认 → 冷到该档重置） |
+| **窗口**额度耗尽但**不含**余额文案（如 `weekly credits are used up, resets in 3 days`） | `QUOTA_RATE_WINDOW` | 否（链上直接换下一跳；冷却口径与 `QUOTA` 相同） |
 | 未配置密钥 | `NOT_CONFIGURED` | 否（发请求前就返回 `ok=false`） |
 | 其它 / 归不到码 | `UNKNOWN` | 否 |
 
-- **默认只有白名单里的那五个码会重试**；`AUTH` / `INVALID_REQUEST` / `QUOTA` / `UNKNOWN` 一次就停
+- **多源链的整链失败码是 `AUTO_ROUTES_EXHAUSTED`**（稳定、可路由），但它**不决定**要不要重试：
+  链层按「每一跳各自值不值得重试」给出一个覆盖值（`LlmFailure.retryable`），所以「两跳都 500」会
+  再来一轮、「两跳都 AUTH」不会——不会因为末跳恰好是 AUTH 就把瞬时的重试机会一起丢掉。
+- **默认只有白名单里的那五个码会重试**；`AUTH` / `INVALID_REQUEST` / `QUOTA` / `QUOTA_RATE_WINDOW` / `UNKNOWN` 一次就停
   （确定性错误白花一次调用没有意义），`NOT_CONFIGURED` 连请求都不发。
 - `UNKNOWN` 不重试是**刻意**的：拿不到错误码宁可不动。**例外只有一个**：把某个码**显式写进**
   `retryableCodes` 就按写的重试（例如写 `["AUTH"]` 时 401 会重试、429 反而不会——有测试与实测钉住）。
+  **唯一不听白名单的是 `QUOTA_RATE_WINDOW`**：窗口额度耗尽重试也等不到重置，任何模式下都不重试。
 - **流提前结束现在判失败并重试**（`TRANSPORT`），已收到的半截正文一律丢弃。这正是修掉范本自身的一个盲点：
   宿主在「流没有终止事件就被掐断」时抛的 `STREAM_CLOSED` 不在默认可重试集合里（于是不重试）；
   本项目把它归到可重试的 `TRANSPORT`。有 `finish_reason` 但没有 `[DONE]` 仍算成功。
@@ -1315,7 +1607,7 @@ concepts 模板里「材料正文在末尾」、**第 1 批串行跑完才发其
   **流提前结束 → `TRANSPORT` 且可重试**（修掉范本盲点的对照用例）、`maxRetries: 0` 只尝试 1 次、
   `retry` 段解析的合法 / 非法 / 缺省三态、
   **`failure_message` 的文案口径**（`已试 N 次、末次 <CODE>`；未配置时写 `已试 0 次`；网关把密钥回显在错误正文里也不漏）。
-- `tests/test_tools.py`：注册表恰好**五个**工具（第四批加了 `compress_paragraph`）、名称唯一、
+- `tests/test_tools.py`：注册表恰好**六个**工具（第四批加了 `compress_paragraph`、2026-10-19 加了 `plan_actions`）、名称唯一、
   `schemas()` 可 JSON 序列化且字段齐全；
   每个工具的入参缺字段 / 有多余字段 / 类型不对**都返回 `INVALID_REQUEST` 失败信封**（不抛异常、不发请求、
   `degraded` 点名哪个参数），假模型返回下出参结构符合声明的 schema；模型输出不成结构 → 统一信封的失败分支。
@@ -1537,6 +1829,11 @@ Windows 上新建目录默认当前用户可写（`os.access(dir, os.W_OK)` 对 
     - **2026-10-18 `rewrite-v7` 复测：同轮已经命中**。全文进固定上下文后，批间共享前缀 = 9889 字符 /
       5364 token：分批模式第 1 批冷启 0、第 2–6 批 4096–5376（合计 23040 / prompt 35535，65%）；
       逐段 25 次时命中 97–99%。**旧结论「同一轮 6 批互不命中」按 v7 之后作废**（五版对照见 §2.1.2）。
+    - **2026-10-31 `plan-v2` 实测（两遍之间也能命中）**：给共享头塞一个 8 字节随机 nonce（保证网关
+      从没见过这段文本），先发第一遍、再紧随其后发第二遍 —— 第一遍 `plan-v2` **5774 prompt / 命中 0**（冷），
+      **第二遍 5511 prompt / 命中 4096（74%）**；同一份第二遍 20 秒后再发，命中 **5504（99.9%）**。
+      同一材料 warmed 时第一遍自己命中 5632 / 5755（98%）。⇒ 缓存写入是**分块递进**的：紧随其后的
+      那一箭只吃到前 4096 token，隔几秒就到 99%。`plan-v1` 时两遍公共前缀 0 字符，这一条无从谈起。
     实测口径（2026-10-08，同一网关 `deepseek/deepseek-v4.1-flash`，用 `max_tokens=1` 的探针请求量的）：
     共享 2100 token + 1400 token 尾 → 命中 2048；共享 1800 + 1400 尾 → 0；共享 500 + 20 尾 → 命中 512；
     共享 500 + 200 尾 → 0。命中量、逐批命中量都记在产物里（`meta.usage.cached_tokens` /

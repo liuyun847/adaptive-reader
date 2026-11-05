@@ -41,12 +41,17 @@ index.html        启动页（2026-10-15）：四块（[data-role="launcher-bloc
                   status|survey|history|upload；status 那一块 2026-10-20 起在**顶栏里**，只留一颗
                   「测试和修改」按钮，宿主 #status-host 不在顶栏里——顶栏有 backdrop-filter，
                   会把 position: fixed 的浮层裁在顶栏那一行）+ 渲染前应用显示设置的同步脚本 + 就绪标志
-                  globalThis.__arDebug（含 page 与 launcher.{sources,upload,survey}，在模块之前同步建好）
+                  globalThis.__arDebug（含 page 与 launcher.{sources,upload,survey}，在模块之前同步建好）；
+                  2026-10-24 顶栏多一颗「通知」按钮（`data-role="notify-toggle"`，**不包进**
+                  `data-role="launcher-block"`——启动页的块数被用例钉死在 4），面板宿主
+                  `#notify-host` 与 `#status-host` 一样留在 body 层（顶栏有 backdrop-filter）
 reader.html       阅读器页：拆页前那个 index.html，2026-10-15 只删了顶栏 `data-role="status-toggle"`
                   按钮块与 `#status-host` 宿主块，其余（主栏 / 抽屉 / 卡片层 / `#survey-host` / 调试面）都在
                   （`__arDebug` 里 `status*` 那一组声明还留着，只是阅读器页不挂 status.js、不会去取 /status.json）；
                   2026-10-20 顶栏品牌名从 `<div class="topbar__brand">` 改成 `a.topbar__brand[href="/"]`
-                  （回启动页，见下面「两页之间的路」；启动页 `index.html` 那处仍是 `div`，指回自己没有意义）
+                  （回启动页，见下面「两页之间的路」；启动页 `index.html` 那处仍是 `div`，指回自己没有意义）；
+                  2026-10-24 顶栏多一颗「通知」按钮（`data-role="notify-toggle"`，在徽标与「画像」之间），
+                  面板宿主 `#notify-host` 紧挨着 `.banners`（body 层，不在顶栏里）
 css/reader.css    两页共用的全部样式（变量体系 + 三档背景 × 两档文字 × 四档字号的主题覆盖 + 背景问卷卡片
                   + 状态面板 + 段落标记区的「太啰嗦」+ 就地配图容器）
 css/launcher.css  启动页版面（2026-10-15，**只服务 index.html**，阅读器页不加载它）：**颜色**全部走
@@ -70,7 +75,8 @@ js/view.js        造 DOM：段落块 + 标记 + 「太啰嗦」入口、动作�
                   换正文（setBlockText）、抽屉原文、选片浮条、讲解卡片（正文滚动区 + 底部固定区）、
                   卡片里两块的**就地重画**（`renderCardDeclaration` 事实锚申报 /
                   `renderCardProfile` 依据画像 + 兜底补齐徽标，压缩后按本次结果重画）、
-                  横幅（同文本去重 + `×` 手动关 + 成功类自动消失，见「降级纪律」）
+                  横幅（同文本去重 + `×` 手动关 + 到点自动收起——成功类 8 秒 / 降级与失败 20 秒
+                  + 失效时间 `data-expires-at` + 收起进通知中心，见「降级纪律」与「通知中心」两段）
 js/figures.js     **就地配图**（PLAN-actions-feedback.md §4.3）：段落内正文之后插 [data-role="figure"]、
                   SVG 走 DOMParser + 白名单、mermaid 懒加载 + render()、失败一律退回文字
 js/events.js      **行为埋点**（§7.1/§7.2）：缓冲 + ≥10 条或 ≥15 s flush + visibilitychange/pagehide 强刷，
@@ -89,9 +95,18 @@ js/status.js      「测试和修改」面板：读同源静态文件 /status.js
                   2026-10-15 起入口与宿主都在**启动页**（mountStatus 原样复用，面板行为一个字没改）；
                   2026-10-20 入口从主栏那张卡搬进**顶栏**（按钮文字「测试和修改」），卡片里的说明文字
                   与备注并进了面板内部（lead），主栏不再有状态那一块
+js/notify.js      通知中心（2026-10-24）：**纯内存** store（record / list / unread / markCollapsed /
+                  subscribe）+ 顶栏入口与面板（mountNotify / isNotifyOpen）。横幅收起或失效时由
+                  view.js 记一条（`{id, text, state, createdAt, expiresAt, collapsed, reason}`），
+                  面板里可回看、点条目能把那条提示原样重弹一次；**不落 localStorage、不新增后端接口**
+                  （刷新即清空是可接受的）。形态照 status.js：层 `pointer-events: none`、Esc 关闭、
+                  关闭后整层移除、焦点回入口；面板 `z-index` 取 71 一档（问卷 70 之上、状态面板 72 之下）。
+                  它**不 import view.js**（否则与「view.js 记条目」成环）：重弹由页面在
+                  `mountNotify({replay})` 里把 `addBanner` 传进去
 js/launcher.js    启动页装配（2026-10-15）：四块接线（mountStatus / 问卷卡 / 材料清单 / 上传摄取）
                   + 启动页自己的可见降级出口（横幅复用 view.js 的 addBanner：同文本去重 / 手动关 /
-                  成功类自动消失那四条显示层纪律只有那一份实现，不另写第二份）；`ready` 在问卷卡与
+                  到点自动收起（8 秒 / 20 秒）/ 失效时间 / 收起进通知中心这几条显示层纪律只有那一份实现，
+                  不另写第二份）；`ready` 在问卷卡与
                   材料清单两块取数都落定（含各自的降级）之后才置位（状态入口同步挂载不可能失败、
                   上传等读者交互；
                   两份里真有 Promise 被 reject 的意外也逐条走 degrade，不静默）
@@ -100,7 +115,9 @@ js/main.js        装配与交互：当前段、抽屉、卡片、选片浮条�
                   「太啰嗦」压链接线、行为埋点接线；
                   2026-10-15 起**不再挂状态入口**（删掉 mountStatus 挂载与 `dom.statusToggle` /
                   `dom.statusHost`，也不再 import `status.js`——`Esc` 里那句 `isStatusOpen()` 让路判定
-                  随之删掉，那一页它恒为 false；阅读器页的 `Esc` 只让路给问卷）
+                  随之删掉，那一页它恒为 false；阅读器页的 `Esc` 只让路给问卷）；
+                  2026-10-24 起再把**通知中心**挂上（`mountNotify`）：`Esc` 与「点外部关闭」与画像 /
+                  显示面板并列处理，`Esc` 那条放在问卷判定**之前**（一次 `Esc` 只关一层）
 vendor/mermaid.min.js  **离线构建的 mermaid 12.0.0（5,575,485 B ≈ 5.3 MiB）**，从
                   `deepseek-chat/app/js/vendor/mermaid.min.js` 原样复制而来（`Copy-Item`，没有二次加工）。
                   **它不在首屏**：`reader.html` 里没有它的 `<script>`，由 js/figures.js 在
@@ -114,6 +131,8 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
 
 下面这些默认说的是**阅读器页**（`web/reader.html`）；标了「启动页」的那两条（顶栏的「测试和修改」入口、
 背景测评的问卷卡）在启动页上，四块的逐条说明见本节末尾的「启动页四块」，两页的其余交互互不影响。
+两页共有的是顶栏那颗「通知」按钮与通知面板（2026-10-24，见「降级纪律」末尾的「通知中心」段）——
+横幅收起 / 失效的条目在两边都能回看与重弹，历史各自只存内存。
 
 - **主栏**是唯一常驻内容。改写稿按空行切段，第 N 段对应原文第 N 段（契约要求段数/段序一致），
   每段带 `data-paragraph="pNNN"` 作联动锚点。
@@ -313,6 +332,8 @@ status.json       **机器生成的产物，不入库**（见 .gitignore）：`u
 ### 启动页四块（`web/index.html` + `js/launcher.js`，2026-10-15；2026-10-20 状态那块搬进顶栏）
 
 - **测试和修改（在顶栏里）**：见上面那条（面板在这里，数据源仍是 `/status.json`；主栏里没有这一块）。
+- **通知（在顶栏里，2026-10-24）**：顶栏那颗「通知」按钮 + 面板（`js/notify.js`，见上面「通知中心」段）。
+  它**不占块**：按钮不包进任何 `data-role="launcher-block"`，启动页的块数仍是 4。
 - **背景测评**：见上面「读前背景问卷」里的「由按钮显式打开」那一条。
 - **历史记录**：`GET /api/sources` 渲染材料清单，**顺序照后端给的**（mtime 倒序、同一时刻按
   `source_id` 升序）——前端**不重排**（重排会让「两次调用结果稳定」这条契约在页面上失真）。
@@ -544,7 +565,10 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 
 ## 降级纪律（DESIGN §6）
 
-任何降级都在页面上留字，同时在 `globalThis.__arDebug` 留可断言的标志：
+任何降级都在页面上留字，同时在 `globalThis.__arDebug` 留可断言的标志。
+横幅到点会自己收起，**但收起的条目进顶栏「通知」历史**（未读计数 + 可回看 + 点条目原样重弹）——
+所以「到点收起」不等于「把降级藏起来」：留字这件事由「横幅 + 通知中心」两处共同兜住，
+这也是下面「横幅纪律」给降级 / 失败也配了失效时长的依据。
 
 | 情况 | 页面 | `__arDebug` |
 |---|---|---|
@@ -615,19 +639,71 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 上表里的「横幅」是同一条显示通道：容器 `[data-role="banners"]`，渲染在 `js/view.js` 的 `addBanner`，
 `data-state` 的映射在 `js/main.js` 的 `bannerState`（`error`/`fatal` → 红，`info`/`ok` → 绿，
 其余降级与说明 → 黄）。缺陷现场是「提交背景问卷后横幅不消失、同一句话还叠三条」，
-所以这一层补了四条规矩——**只动显示层**，上表的 `__arDebug` 标志与语义一个字没改：
+所以这一层补了四条规矩（2026-10-24 又补两条：失效时间、收起进通知中心）——
+**只动显示层**，上表的 `__arDebug` 标志与语义一个字没改：
 
 | 规矩 | 判据 | 实现 |
 |---|---|---|
 | 同文本只留一条 | 容器里已有同文本横幅时不再新增节点，只把 `data-repeats` 加一，并在横幅里写「（同一提示已出现 N 次）」；关掉之后再出现算新的一条 | `addBanner` 按 `data-text` 比对 |
-| 每条能手动关 | 每条带 `×`（`[data-role="banner-close"]`）：原生 `button`，鼠标点与键盘 `Enter`/`Space` 等价，`:focus-visible` 有 2px 轮廓；关掉一条不动别的横幅，`__arDebug` 一个字节都不变 | `addBanner` 的关闭按钮 + `dismissBanner` |
-| 成功类自动消失 | `data-state="info"`（**做成了**，如「背景已保存」）在 `BANNER_AUTO_DISMISS_MS = 8000`（8 秒）后自己走 | `BANNER_AUTO_DISMISS_STATES` + `setTimeout` |
-| 降级类不自动消失 | `data-state="warn"` / `"error"`（模型未配置 / 保存失败 / 提交失败 / 段数对不上…）**永不**自动消失：本节的「降级可见」要求它们留到读者自己关掉，自己走等于把降级藏起来 | 只对 `info`/`ok` 排定时器 |
+| 每条能手动关 | 每条带 `×`（`[data-role="banner-close"]`）：原生 `button`，鼠标点与键盘 `Enter`/`Space` 等价，`:focus-visible` 有 2px 轮廓；关掉一条不动别的横幅，`__arDebug` 一个字节都不变 | `addBanner` 的关闭按钮 + `removeBanner(el, 'close')` |
+| 成功类 8 秒收起 | `data-state="info"`（**做成了**，如「背景已保存」）在 `BANNER_TTL_MS.info = 8000`（8 秒）后自己走 | `armBannerClock` 的 `setTimeout` |
+| 降级 / 失败 20 秒收起（2026-10-24 改） | `data-state="warn"` / `"error"`（模型未配置 / 保存失败 / 提交失败 / 段数对不上…）在 `BANNER_TTL_MS.warn = 20000`（20 秒）后自己走，**收起的那一刻条目进顶栏「通知」历史**（未读 +1、可回看、点条目原样重弹）。**依据**：早先它们取 `0`/永不消失，是因为「自己消失等于把降级藏起来」；现在收起的条目有地方可寻（通知中心兜住可见性），那个前提不成立了。20 秒比成功类长：降级文案通常要写完原因和下一步怎么办 | 同一套 `armBannerClock`（`ttlOf` 读 `BANNER_TTL_MS`） |
+| 失效时间可见（2026-10-24） | 每条横幅带 `span.banner__expiry`（`[data-role="banner-expiry"]`，**不可聚焦**：横幅里不许因此多一个 Tab 停点，插在 text 之后、`×` 之前）：**三档都写「还剩 N 秒」**并由 JS 每秒刷新；`data-expires-at` 是失效时刻（epoch ms），悬停的 `title` 是绝对本地时刻（带时区偏移，横幅本体上也有同一句）。`0` = 永不 仍是合法取值（`paintExpiry` 会写「不会自动收起」），只是当前四档都不取它。**双通道**是为断言：秒数会抖动，用例按 `data-expires-at` 判 | `view.js` 的 `armBannerClock` / `paintExpiry` |
+| 收起进通知中心（2026-10-24） | 到点消失或被 `×` 关掉时，条目「收起」进顶栏「通知」面板的历史（`reason` 分 `timeout` / `close`）：可回看，点条目能把那条提示原样重弹一次；**纯内存**，刷新即清空，不落 localStorage、不新增后端接口 | `removeBanner` → `js/notify.js` 的 `markCollapsed`；面板见下面「通知中心」段 |
 
-8 秒这个数的理由：成功提示没有待办，中文一眼扫完一行约 2–3 秒，8 秒给了「正在看别处」的读者
-两倍余量；短于 5 秒来不及看清，长于 10 秒就变成新的视觉噪音。改时长只改
-`web/js/view.js` 的 `BANNER_AUTO_DISMISS_MS`（无头用例 `tests/web/test_banner_lifecycle.py`
-的 `AUTO_DISMISS_MS` 要跟着改）。
+两个时长的理由：成功提示没有待办，中文一眼扫完一行约 2–3 秒，8 秒给了「正在看别处」的读者
+两倍余量；短于 5 秒来不及看清，长于 10 秒就变成新的视觉噪音。降级 / 失败给 20 秒——它们的话要说完
+「出了什么事 + 下一步怎么办」，读得慢；而且「消失」不再是「没了」（条目在通知中心里），所以可以比
+成功类跑得久一点，却不必无限期占着屏幕。改时长只改 `web/js/view.js` 的 `BANNER_TTL_MS`
+（`BANNER_AUTO_DISMISS_MS` 是 `BANNER_TTL_MS.info` 的别名，老名字保留；无头用例
+`tests/web/test_banner_lifecycle.py` 的 `AUTO_DISMISS_MS` / `DEGRADE_TTL_MS` 要跟着改）。
+
+**不许用 CSS 动画 / 过渡来「拖时间」**（2026-10-24 明确）：到点必须由 JS 的 `setTimeout` 真的把
+节点从 DOM 摘掉，`tests/web/test_banner_lifecycle.py` 按 `[data-role="banner"]` 的计数断言到点归零
+（成功类 8 秒、降级 / 失败 20 秒各一条用例）。
+
+#### 通知中心（`js/notify.js`，2026-10-24）
+
+横幅会自动消失、也能被读者关掉，关掉之后那句话就彻底没了——所以补一个**纯内存**的通知中心：
+
+- **入口**：两个页面的**顶栏**各一颗「通知」按钮（`[data-role="notify-toggle"]`，外观复用
+  `.settings-toggle`）。它**不叫** `status-toggle`（`test_status_panel.py` 断言阅读器页那个 role
+  的计数为 0），启动页那颗也**不包进** `data-role="launcher-block"`（`test_launcher.py` 把启动页的
+  块数钉死在 4）；
+- **未读徽标**：`span.notify__count[data-role="notify-count"]`，未读数 = **已收起且还没在面板里看过**
+  的条数（还挂在页面上的横幅不算未读——它就在读者眼前）。`data-unread="0"` 时由 CSS
+  （`.notify__count[data-unread="0"]{display:none}`）隐藏，JS 只负责写数；打开面板即清零；
+- **面板**：层 `[data-role="notify-layer"]` + 卡片 `[data-role="notify-panel"]`（`role="dialog"`、
+  `aria-label`、`tabIndex=-1`），内容 = 头（通知 / `×`）+ 列表 `[data-role="notify-list"]` +
+  空态 `[data-role="notify-empty"]`（「还没有通知。收起的提示会留在这里。」）+ 脚
+  `[data-role="notify-foot"]`（「已收起 N 条」，一条都没有时整行不占位）；
+- **宿主在 body 层**：`#notify-host`（`[data-role="notify-host"]`）紧挨着 `.banners`，**不放顶栏里**
+  ——顶栏有 `backdrop-filter` 与 `z-index: 40` 的层叠上下文，`position: fixed` 的后代会被裁在顶栏
+  那一行，还会被抽屉（45）与卡片层（60）压住。面板 `z-index` 取 **71** 一档（问卷 70 之上、
+  状态面板 72 之下）；
+- **指针事件**：层 `pointer-events: none`（正文照常可点可滚），只有卡片自己收事件；点卡片之外由
+  页面关掉它（阅读器页在 `main.js` 的 document click 里，启动页在 `launcher.js` 的 `wireNotify`，
+  两处都用 `panelContains()` 判内外）；
+- **键盘 / 无障碍**：入口带 `aria-expanded` / `aria-controls`；`Esc` 关闭（问卷开着时让路给问卷，
+  一次 `Esc` 只关一层）；关闭后焦点回入口；历史条目本身是原生 `button`（Tab + Enter 即重弹）；
+- **重弹**：点条目 → 页面用 `addBanner(容器, item.text, item.state, { record: false })` 把那条原样弹
+  回来（`record: false` 是为了不在历史里翻倍），然后面板自己让开（读者要看的是刚弹回来的横幅）；
+- **纯内存**：不落 localStorage、不新增后端接口，刷新即清空（这是**预期**，见页面上那句空态文案）。
+  `__arDebug.notifications` = `{open, unread, items[]}`，每项
+  `{id, text, state, createdAt, expiresAt, collapsed, collapsedAt, reason, seen}`，无头验证只断言它。
+- **重弹那条横幅不记账**：`record: false` 的横幅**不进 store**，所以它被 `×` 关掉时
+  `removeBanner` 会拿一个未知 id 去 `markCollapsed`——那条路径是安全的 no-op（返回 `null`，
+  不抛错、不在历史里凭空多一条、不动未读），`test_notify_center.py` 有一条专门断言它；
+- **窄屏（≤430px，2026-10-24 修回归）**：新按钮刚加上时 390px 下顶栏内容比可用宽度多 34px，
+  「Aa 显示」被挤进右侧抽屉窄边；同一宽度下徽标还会折成两三行（行高是写死的 48px）。
+  修法**只在 CSS**（`css/reader.css` 的 `@media (max-width: 430px)`）：品牌名与徽标允许省略号
+  （先截材料 id——读者刚点进来，最没信息量），「第 N / M 段」段号做 **sr-only 视觉隐藏**
+  （`position: absolute` + `clip-path`，文字仍在无障碍树里，读屏照样读得到进度；**不**改成
+  `aria-label`，免得盖掉随时在变的动态文字），三颗按钮照旧 `flex: 0 0 auto` 不参与压缩。
+  ≤880px 那颗「通知」按钮只留图标（与「画像 / 显示」同一档）。实测 1400 / 1024 / 800 / 430 / 390 / 360
+  六个宽度：`.topbar__side` `scrollWidth <= clientWidth`（无横向溢出）、顶栏仍 48px、
+  三颗按钮都点得到（复跑脚本 `data/_verify/notify/narrow.py`，用例
+  `test_notify_center.py::test_topbar_fits_in_one_line_at_narrow_widths` 守着 430 / 390 / 360）。
 
 `__arDebug` 还有 `ready`（就绪标志，无头验证只等它）、`mode`、`sourceId`、`paragraphs`、
 `rewrittenParagraphs`、`currentParagraph`、`drawerOpen`、`cardOpen`、`cards`、`lastCard`、
@@ -849,10 +925,18 @@ uv run python tools/gen_status.py --note "一句话说明"  # 可选：给这次
 ## 无头验证
 
 ```bash
-python -m pytest tests/web -q          # 在本项目根目录跑（195 passed + 1 skipped, 0 failed；196 collected）
+python -m pytest tests/web -q          # 在本项目根目录跑（210 passed + 3 skipped, 0 failed；213 collected）
 ```
 
-上面那行是 **2026-10-22 画像面板当天**的实测口径（系统 Python；`ar serve --port 8765` 在跑、
+上面那行是 **2026-10-24 通知中心当天**的实测口径（系统 Python；`ar serve --port 8765` **没在跑**、
+`web/status.json` 已生成）：**210 passed + 3 skipped（213 collected，159 秒）**。三个 skip = 两条真服务
+用例（服务没起，口径见文件末尾）+ 默认不跑的真实计费用例
+`test_real_service_explain_end_to_end_is_billable`。相对 2026-10-22 的 196 collected，本批多 17 条：
+`test_notify_center.py` **12 条**（9 条面板契约 + 窄屏 3 条参数化）+ `test_banner_lifecycle.py` 的
+失效时间与收起 **5 条**（含 warn 的 20 秒那条线、error 同一条线各一条；195 + 17 = 212 =
+210 passed + 那 2 条这次被 skip 的真服务用例）。
+
+更早那行是 **2026-10-22 画像面板当天**的实测口径（系统 Python；`ar serve --port 8765` 在跑、
 `web/status.json` 已生成）：**195 passed + 1 skipped（196 collected）**，唯一那个 skip 是默认不跑的
 真实计费用例 `test_real_service_explain_end_to_end_is_billable`。
 = 工作区现状的 **189 passed + 1 skipped**（2026-10-22 实测；旧账面 184 之后已有的未提交启动页改动
@@ -869,8 +953,9 @@ C2 结构不符带真实 url 1；C1 JSON `null` 如实说 1）+ `test_reader_ui.
 不是任何一个现行口径。
 **服务没起时**另有两条真服务用例会 skip（`test_reader_features.py` 的
 `test_real_service_page_and_explain_payload_without_calling_the_model` 与
-`test_status_panel.py` 的真服务孪生用例），按同一个 196 条口径推算约 193 passed + 3 skipped
-——**这一档没有实测**，需要引用就先自己跑一遍。
+`test_status_panel.py` 的真服务孪生用例）。这一档 **2026-10-24 实测过**：就是上面那行
+**210 passed + 3 skipped（213 collected）**（服务没起、产物已生成；当年按 196 条口径推算的
+「约 193 passed + 3 skipped」只是推算，现在以实测为准）。
 
 **必须用系统 Python 跑**（`python -m pytest tests/web -q`，不是 `uv run pytest`）：
 用 uv 的 `.venv` 时子进程写不了系统 `%TEMP%`，playwright 的 `mkdtemp` 会 `EPERM` ——
@@ -907,6 +992,20 @@ mermaid 那几条要么放真库（5.3 MiB 从本机静态服务取，验证真�
 2026-10-22 新增的 `test_profile_ui.py`（6 条）用同一份 `ar_backend.py` 的假后端：
 入口与当前状态、自评写回（请求体逐字段 + 面板 / 指纹 / 横幅）、口径写回、
 夹具模式不请求 `/api/*` 且控件禁用、读失败、写失败不装成功。
+2026-10-24 新增的 `test_notify_center.py`（12 条 = 9 条面板契约 + 窄屏 3 条参数化）只看**两页的顶栏与通知面板**（复用
+`test_survey_ui.py` 的夹具页与 `test_status_panel.py` 的启动页开启 / 假后端，零真实请求）：
+入口在两页顶栏且 role 不撞 `status-toggle` / 不包进 launcher-block、点开 `aria-expanded` 跟随、
+横幅收起后未读上涨与打开即清零、`Esc` 与 `×` 与「点外部」三个出口、关闭后整层不留残影且焦点回入口、
+历史条目点一下就原样重弹且不在历史里翻倍（连「重弹那条被关掉」也要安全：`record: false` 的横幅
+没进 store，`markCollapsed` 拿到未知 id 必须是 no-op）、空历史有话说、刷新后清空（纯内存）、启动页同一套；
+另 3 条参数化守**窄屏顶栏**（430 / 390 / 360：`.topbar__side` 无横向溢出、顶栏仍 48px、
+三颗按钮都点得到、段号仍在无障碍树里）。
+同一批 `test_banner_lifecycle.py` 另加 **5 条**：`span.banner__expiry` 的倒计时文字、
+`data-expires-at ≈ now + 8s`（±2s）、倒计时每秒真的在减、warn 的 `data-expires-at ≈ now + 20s`
+（±2s）与倒计时文字（原来那条 `== 0` /「不会自动收起」的断言随行为改变换成了这一条）、
+warn 到 20 秒自动收起且条目进历史（`reason: timeout`、未读 +1）、error 同一条 20 秒时间线
+（用「材料载入失败」造现场，到点归零 + 进历史）、以及自动消失后 `__arDebug.notifications.items`
+仍含该条（`reason: timeout`）。
 `test_reader_features.py` 末尾两条打真服务（`http://127.0.0.1:8765`，跑之前先起 `ar serve`，
 **服务没起就 skip**）：
 
