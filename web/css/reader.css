@@ -178,6 +178,27 @@ a.topbar__brand:focus-visible { outline: 2px solid var(--focus); outline-offset:
 .settings-toggle__mark { font-weight: 700; letter-spacing: .02em; }
 .settings-toggle__text { font-size: .74rem; }
 
+/* ------------------------------------------------- 顶栏「通知」入口（2026-10-24）
+   外观复用 .settings-toggle 那一套（圆角胶囊 + 面板底），这里只补容器与未读徽标。
+   徽标按 data-unread="0" 隐藏（判据在 CSS，JS 只负责把数写进去）。 */
+.topbar__notify { position: relative; flex: 0 0 auto; }
+
+.notify__count {
+  min-width: 1.15em;
+  padding: 0 .28em;
+  border-radius: 999px;
+  border: 1px solid var(--err-line);
+  background: var(--err-bg);
+  color: var(--err-ink);
+  font-size: .68rem;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.notify__count[data-unread="0"] { display: none; }
+
 .settings {
   position: absolute;
   top: calc(100% + .5rem);
@@ -405,7 +426,8 @@ a.topbar__brand:focus-visible { outline: 2px solid var(--focus); outline-offset:
 
 /* ------------------------------------------------------------ 降级横幅 */
 /* 显示层纪律（2026-10-09，实现见 js/view.js 的 addBanner）：同文本只留一条（叠计数）、
-   每条带 `×` 可手动关（`warn`/`error` 只能这样关掉）、`info` 成功类到点自动消失。
+   每条带 `×` 可手动关（不想等可以立刻关）、到点自己收起（`info` 8 秒、`warn`/`error` 20 秒），
+   收起后条目进顶栏「通知」历史（未读 + 可回看 + 可重弹）——所以「到点收起」不等于把降级藏起来。
    四档配色：默认 warn（黄）/ error（红）/ info（绿＝做成了）。 */
 .banners:empty { display: none; }
 
@@ -436,6 +458,19 @@ body[data-drawer="open"] .banners { padding-right: calc(var(--drawer-w) + 1rem);
 }
 
 .banner__text { flex: 1 1 auto; min-width: 0; }
+
+/* 失效时间（2026-10-24）：三档都写「还剩 N 秒」（JS 每秒刷新这段文字；成功类 8 秒、
+   降级 / 失败 20 秒），悬停的 title 是绝对本地时刻。只有「这一档没设失效时长」（ttl = 0）才会
+   走「不会自动收起」——当前四档都不走。
+   **刻意不给 .banner 加 animation / transition 来拖时间**：到点由 JS 的 setTimeout 真的
+   把节点从 DOM 摘掉（tests/web/test_banner_lifecycle.py 按 DOM 计数断言到点归零）。 */
+.banner__expiry {
+  flex: 0 0 auto;
+  font-size: .78rem;
+  opacity: .85;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;   /* 倒计时逐秒刷新时宽度不跳 */
+}
 
 /* 同文本重复触发时的计数（首次出现时 hidden） */
 .banner__repeat { flex: 0 0 auto; font-size: .78rem; opacity: .8; white-space: nowrap; }
@@ -469,6 +504,111 @@ body[data-drawer="open"] .banners { padding-right: calc(var(--drawer-w) + 1rem);
   background: var(--err-bg);
   color: var(--err-ink);
 }
+
+/* ------------------------------------------------------------ 通知中心（2026-10-24）
+   顶栏那颗「通知」按钮的面板 + 历史条目。实现见 js/notify.js：store 纯内存，
+   条目不落 localStorage、不新增后端接口（刷新即清空，这是可接受的）。
+
+   **宿主在 body 层**（[data-role="notify-host"]，紧挨着 .banners）：顶栏有 backdrop-filter
+   与 z-index: 40 的层叠上下文，position: fixed 的后代会被裁在顶栏那一行里，还会被抽屉（45）
+   与卡片层（60）压住。z-index 取 71 一档：问卷层（70）之上、状态面板（72）之下。
+   **指针事件**：层 none（正文照常可点可滚），只有卡片自己收事件——点卡片之外由页面关掉它。
+   关闭时整层被 JS 移除（不留残影），所以这里不做显隐过渡。 */
+.notify-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 71;
+  pointer-events: none;
+}
+
+.notify {
+  pointer-events: auto;
+  position: absolute;
+  top: calc(var(--topbar-h) + .5rem);
+  right: calc(var(--rail-w) + 1rem);
+  width: min(23rem, calc(100vw - 2rem));
+  max-height: min(26rem, calc(100vh - var(--topbar-h) - 2rem));
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  color: var(--panel-ink);
+  border: 1px solid var(--panel-line);
+  border-radius: 10px;
+  box-shadow: 0 18px 44px var(--shadow-card);
+  padding: .7rem .8rem .6rem;
+  font-size: .84rem;
+}
+
+body[data-drawer="open"] .notify { right: calc(var(--drawer-w) + 1rem); }
+
+.notify__head { display: flex; align-items: center; gap: .5rem; margin-bottom: .45rem; }
+
+.notify__title { font-weight: 600; }
+
+.notify__close {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--panel-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.notify__close:hover { color: var(--accent); }
+.notify__close:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* 历史列表：滚动区自己吃掉多余的滚动（不把滚轮放给背后正文） */
+.notify__list {
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  min-height: 0;
+}
+
+/* 条目本身是原生 button：鼠标点、键盘 Tab + Enter 都能重弹那一条横幅 */
+.notify__item {
+  display: flex;
+  flex-direction: column;
+  gap: .18rem;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--panel-line);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--panel-sunken);
+  color: var(--panel-ink);
+  padding: .35rem .5rem;
+}
+
+.notify__item:hover { border-color: var(--accent); }
+.notify__item:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* 四档语义色与横幅同源（--ok / --warn / --err），历史条目一眼能看出是哪一类提示 */
+.notify__item[data-state="info"] { border-left-color: var(--ok-line); background: var(--ok-bg); color: var(--ok-ink); }
+.notify__item[data-state="warn"] { border-left-color: var(--warn-line); background: var(--warn-bg); color: var(--warn-ink); }
+.notify__item[data-state="error"] { border-left-color: var(--err-line); background: var(--err-bg); color: var(--err-ink); }
+
+.notify__item-text { font-size: .8rem; line-height: 1.5; }
+.notify__item-meta { font-size: .72rem; opacity: .8; }
+
+.notify__empty { color: var(--panel-muted); font-size: .8rem; padding: .3rem 0 .45rem; }
+.notify__empty[hidden] { display: none; }
+
+.notify__foot {
+  color: var(--panel-muted);
+  font-size: .72rem;
+  border-top: 1px solid var(--panel-line);
+  margin-top: .5rem;
+  padding-top: .4rem;
+}
+
+/* 一条都没有时不占位（不留一条空白分隔线） */
+.notify__foot:empty { display: none; }
 
 /* ------------------------------------------------------------ 主栏 */
 .reader {
@@ -1641,4 +1781,59 @@ body[data-size="19"] { --reading-size: 19px; }
 /* 窄屏：设置按钮只留「Aa」，省出徽标的位置 */
 @media (max-width: 880px) {
   .settings-toggle__text { display: none; }
+  /* 通知按钮同样只留图标（2026-10-24）；未读徽标照旧显示，它是这颗按钮存在的理由 */
+  .topbar__notify .settings-toggle__text { display: none; }
+}
+
+/* 窄屏第二档（2026-10-24）：**顶栏内容一行装下**。
+   390 / 360 实测：三颗按钮（通知 / 画像 / 显示）约 109px + 间距，加上「材料：<id>」这类徽标，
+   原来的写法（徽标 flex-wrap: wrap + 品牌名可折行）会在顶栏里塞进两三行——而高度是写死的 48px，
+   折下来的行就被压出顶栏，右侧还会挤进抽屉窄边。这里只让路、不隐藏功能：
+   - 品牌名允许省略号截断（「回启动页」这个链接本身还在、仍可点）；
+   - 徽标区收成**单行**，装不下就省略号截断（先截材料名）；
+   - 「第 N / M 段」段号只做**视觉隐藏**（sr-only）：它最长、又随时在变，窄屏优先保住材料名与模式；
+     文字仍留在无障碍树里，读屏照样读得到进度（**不**改成 aria-label，免得盖掉动态文字）；
+   - 三颗按钮照旧 flex: 0 0 auto，不参与压缩，窄屏也点得到。 */
+@media (max-width: 430px) {
+  .topbar {
+    gap: .5rem;
+    padding-left: .6rem;
+    padding-right: calc(var(--rail-w) + .6rem);
+  }
+
+  .topbar__brand {
+    min-width: 3.2rem;          /* 至少留住两个字 + 省略号，够认出这是回首页的链接 */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .topbar__meta {
+    flex-wrap: nowrap;          /* 关键：不再折成两三行把顶栏撑破 */
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .badge {
+    min-width: 0;               /* 允许徽标比内容更窄（后面两行负责省略号） */
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 谁先让路：材料 id 最没信息量（读者刚点进来），先截它；「夹具模式 / 正式模式」留着别截太狠 */
+  .badge[data-role="source-id"] { flex-shrink: 3; }
+  .badge[data-role="mode-badge"] { flex-shrink: 1; }
+
+  /* 段号：视觉隐藏但仍在无障碍树里（sr-only），不占位 */
+  .badge[data-role="progress"] {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    clip-path: inset(50%);
+  }
 }

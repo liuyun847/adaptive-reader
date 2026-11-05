@@ -18,13 +18,20 @@
  *   - **就绪只靠显式状态**：`globalThis.__arDebug.ready` 在主栏三块都到了确定状态（含各自的降级）之后
  *     才置位；无头验证只等它，不 sleep（与 `js/main.js` 同一口径）。
  *   - **零构建**：不引外部 CDN、不加打包器、不用框架；横幅复用 `js/view.js` 的 `addBanner`
- *     （同文本去重 / 可手动关 / 成功类自动消失这四条显示层纪律只有那一份实现，不另写第二份）。
+ *     （同文本去重 / 可手动关 / 到点自动收起（8 秒 / 20 秒）/ 失效时间 + 收起进通知中心这几条显示层纪律
+ *     只有那一份实现，不另写第二份）。
+ *   - **通知中心（2026-10-24）**：入口是顶栏里独立的一颗「通知」按钮（**不包进**
+ *     `data-role="launcher-block"`：启动页的块数被用例钉死在 4），面板与历史在 `js/notify.js`，
+ *     宿主 `#notify-host` 留在 body 层。
  */
 
 import { DataError, SURVEY_URL, fetchSources, fetchSurvey, postIngest } from './api.js';
 import { bootstrapSettings } from './settings.js';
 import { mountStatus } from './status.js';
-import { openSurveyManually, setSurveyLifecycleHooks } from './survey.js';
+import {
+  closeNotifyPanel, isNotifyOpen, mountNotify, panelContains as notifyPanelContains,
+} from './notify.js';
+import { isSurveyOpen, openSurveyManually, setSurveyLifecycleHooks } from './survey.js';
 import { addBanner } from './view.js';
 
 const D = globalThis.__arDebug;
@@ -57,6 +64,10 @@ const dom = {
   launcher: document.querySelector('[data-role="launcher"]'),
   statusToggle: document.querySelector('[data-role="status-toggle"]'),
   statusHost: document.querySelector('[data-role="status-host"]'),
+  // 通知中心（2026-10-24）：入口在顶栏（**不在** status 那个 launcher-block 里，
+  // 启动页的块数被 test_launcher.py / test_status_panel.py 钉死在 4），宿主在 body 层
+  notifyToggle: document.querySelector('[data-role="notify-toggle"]'),
+  notifyHost: document.querySelector('[data-role="notify-host"]'),
   surveyState: document.querySelector('[data-role="launcher-survey-state"]'),
   surveyWhen: document.querySelector('[data-role="launcher-survey-when"]'),
   surveyOpen: document.querySelector('[data-role="launcher-survey-open"]'),
@@ -732,6 +743,35 @@ function wireStatus() {
   mountStatus({ host: dom.statusHost, toggle: dom.statusToggle });
 }
 
+/**
+ * 通知中心（2026-10-24）：顶栏那颗「通知」按钮 + 面板，条目来自 `view.js` 的 `addBanner`。
+ *
+ * 重弹用 `record: false`：历史里已经有这条，重弹再记一条会让同一条在历史里翻倍。
+ * `Esc` 与「点外部关闭」在这里补上（启动页原先一条 document 级快捷键都没有；
+ * 阅读器页那两条在 `js/main.js` 的 keydown / click 里与画像、显示面板并列处理）。
+ * 问卷开着时 `Esc` 让路给问卷——一次 `Esc` 只关一层，这条口径两页一致。
+ */
+function wireNotify() {
+  mountNotify({
+    host: dom.notifyHost,
+    toggle: dom.notifyToggle,
+    replay: (item) => addBanner(dom.banners, item.text, item.state, { record: false }),
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !isNotifyOpen()) return;
+    if (isSurveyOpen()) return;
+    event.preventDefault();
+    closeNotifyPanel('escape');
+  });
+  document.addEventListener('click', (event) => {
+    if (!isNotifyOpen()) return;
+    // 面板自己的点击已被 js/notify.js 的宿主监听 stopPropagation 拦下，这里只会收到真正的外面
+    if (notifyPanelContains(event.target)) return;
+    if (dom.notifyToggle && dom.notifyToggle.contains(event.target)) return;
+    closeNotifyPanel('outside');
+  });
+}
+
 function wireSurvey() {
   dom.surveyOpen.addEventListener('click', () => { openSurveyFromCard(); });
   // 答完（提交成功）/ 关掉问卷之后都要刷新卡片状态：这是「答完/关闭后刷新成已答」的落点，
@@ -777,6 +817,7 @@ async function boot() {
   }
 
   wireStatus();
+  wireNotify();
   wireSurvey();
   wireUpload();
 

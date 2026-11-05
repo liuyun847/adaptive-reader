@@ -9,9 +9,18 @@
    （重复触发照旧各记一条 `__arDebug.degradations` —— 去重属于显示层，不是记录层）；
 2. **每条都能手动关**：`×` 按钮，鼠标与键盘都能用，焦点可达、`:focus-visible` 有可见轮廓，
    关掉一条不影响别的横幅；
-3. **成功类自动消失**：`data-state="info"`（如「背景已保存」）`BANNER_AUTO_DISMISS_MS` 后自己走；
-4. **降级类不自动消失**：`data-state="warn"` / `"error"` 永远留着等手动关
-   —— `web/README.md` 的「降级纪律（DESIGN §6）」要求降级可见，`__arDebug` 的语义一个字没动。
+3. **成功类自动消失**：`data-state="info"`（如「背景已保存」）`BANNER_TTL_MS.info`（8 秒）后自己走；
+4. **降级类同样到点收起**：`data-state="warn"` / `"error"` 走 `BANNER_TTL_MS.warn`（20 秒），
+   收起时进通知中心（未读计数 + 可回看 + 可重弹）——可见性由历史兜住，所以不再需要「永不消失」。
+   `__arDebug` 的记录层语义一个字没动（`degradations` 照旧每条都在）。
+
+2026-10-24 追加第六条（失效时间 + 收起进通知中心，实现同样在 `addBanner`）：
+
+5. **失效时间可见**：每条横幅带 `span.banner__expiry`（成功类与降级类都写「还剩 N 秒」并每秒刷新）、
+   `data-expires-at`（epoch ms）与悬停的绝对本地时刻 `title`（`0` = 永不仍然是合法取值，
+   只是当前四档都不取它）。**双通道**的意义：秒数会抖动，用例按 `data-expires-at` 断言；
+6. **收起进通知中心**：到点消失 / 被 `×` 关掉时，条目「收起」进 `__arDebug.notifications`
+   （纯内存，面板与用例在 `tests/web/test_notify_center.py`）。
 
 本文件复用 `tests/web/test_survey_ui.py` 的假后端与问卷助手：那套桩已经覆盖
 「提交固定题 / 追问降级」两个端点，这里不再抄一份（tests/web 没有 `__init__.py`，
@@ -21,6 +30,7 @@ pytest 会把本目录放进 `sys.path`，所以可以直接 import）。
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -29,9 +39,11 @@ from playwright.sync_api import expect
 FIXTURE_ID = "capital-v1-ch01"
 FIXTURE_DIR = Path(__file__).resolve().parent.parent.parent / "samples" / FIXTURE_ID
 
-# 与 web/js/view.js 的 BANNER_AUTO_DISMISS_MS 对齐（改一边必须改另一边）；
+# 与 web/js/view.js 的 BANNER_TTL_MS 对齐（改一边必须改另一边）：
+# info / ok = 8000，warn / error = 20000（降级与失败也到点收起，条目进通知中心）。
 # 末尾留一点余量，免得机器慢的时候把「已经自己走了」判成「还没走」。
 AUTO_DISMISS_MS = 8000
+DEGRADE_TTL_MS = 20000
 TIMEOUT_MARGIN_MS = 4000
 
 # 真服务/假后端这一刻回的降级文案（与后端 ar/survey.py 的 model_not_configured 文案同源）。
@@ -173,12 +185,12 @@ def test_close_button_removes_only_that_banner_and_keeps_debug_flags(
     assert flags(page) == before_flags, "关横幅只该动显示层，__arDebug 不许变"
 
 
-# =================================================== 3. 成功类自动消失 / 降级类不消失
+# =================================================== 3. 到点自己走（成功类 8s / 降级类 20s）
 
 def test_success_banner_auto_dismisses_while_degrade_stays(
     page, ar_server, fixture_doc, fixture_questions,
 ):
-    """成功类（info）到点自己走；同一时刻的降级类（warn）必须还在原地等着被手动关。"""
+    """成功类（info）8 秒自己走；同一时刻的降级类（warn）走 20 秒那条线，此刻必须还在。"""
     baseline = saved_then_degraded_followup(page, ar_server, fixture_doc, fixture_questions)
     # 先钉住「成功类」的判据：「背景已保存」必须是 info（只有 info 才自动消失）
     info = page.locator('[data-role="banner"][data-state="info"]')
@@ -193,7 +205,7 @@ def test_success_banner_auto_dismisses_while_degrade_stays(
     expect(info).to_have_count(0, timeout=AUTO_DISMISS_MS + TIMEOUT_MARGIN_MS)
 
     degrade = banners_with(page, "模型未配置")
-    assert degrade.count() == 1, f"降级横幅不该自动消失：{banner_texts(page)}"
+    assert degrade.count() == 1, f"降级横幅在 8 秒这一刻不该已经收走（它 20 秒才收）：{banner_texts(page)}"
     assert degrade.first.get_attribute("data-state") == "warn"
     assert all_banners(page).count() == baseline + 1, banner_texts(page)
     # 自动消失同样只动显示层
@@ -202,18 +214,36 @@ def test_success_banner_auto_dismisses_while_degrade_stays(
     assert after["surveyEvents"] == before["surveyEvents"]
 
 
-def test_warn_banner_survives_the_success_timeout_alone(page, ar_server):
-    """页面只有降级横幅时，等过成功类的那段时间它也一条都不许少（夹具模式横幅）。"""
+def test_warn_banner_auto_dismisses_at_its_own_timeout_and_lands_in_history(page, ar_server):
+    """页面只有降级横幅时：它不再「永不消失」——过了 8 秒还在（走的是 20 秒那条线），
+    到 20 秒收起进通知历史（`reason: timeout`、未读 +1），历史里仍能回看。
+
+    🔁 行为变更（2026-10-24）：这条用例原来叫 `test_warn_banner_survives_the_success_timeout_alone`，
+    断言「等过成功类的时间线，降级横幅一条都不许少」。现在降级 / 失败也会到点收起——**因为收起即入
+    通知中心历史**（未读计数 + 可回看 + 可重弹），可见性不再靠「永远占着屏幕」。原断言的前提
+    （收起的条目无处可寻）已不成立，所以这里改成守「20 秒这条时间线 + 入历史」。
+    """
     open_fixture(page, ar_server, extra="")
     fixture_banner = banners_with(page, "夹具模式")
     assert fixture_banner.count() == 1
+    banner_id = fixture_banner.first.get_attribute("data-banner-id")
     count_before = all_banners(page).count()
 
-    page.wait_for_timeout(AUTO_DISMISS_MS + 800)     # 等到过了成功类的那条时间线
-
+    page.wait_for_timeout(AUTO_DISMISS_MS + 800)     # 过了成功类那条时间线：降级的还在
     assert all_banners(page).count() == count_before, banner_texts(page)
-    expect(fixture_banner).to_have_count(1)
     assert fixture_banner.first.get_attribute("data-state") == "warn"
+
+    # 到 20 秒自己走（等待上限＝时长 + 余量；超时还没走就是「没自动收起」）
+    expect(fixture_banner).to_have_count(0, timeout=DEGRADE_TTL_MS + TIMEOUT_MARGIN_MS)
+    assert fixture_banner.count() == 0, banner_texts(page)
+
+    notes = dbg(page)["notifications"]
+    hit = [item for item in notes["items"] if item["id"] == banner_id]
+    assert hit, f"自动收起的降级横幅没进通知历史：{notes['items']}"
+    assert hit[0]["state"] == "warn"
+    assert hit[0]["collapsed"] is True
+    assert hit[0]["reason"] == "timeout", hit[0]
+    assert notes["unread"] >= 1, "收起之后未读数要涨"
 
 
 # =================================================== 4. 可手动关（键盘 + 焦点轮廓）
@@ -245,3 +275,162 @@ def test_close_button_is_keyboard_reachable_with_a_visible_focus_ring(page, ar_s
     page.keyboard.press("Enter")
     expect(all_banners(page)).to_have_count(count_before - 1)
     assert all_banners(page).count() == count_before - 1, banner_texts(page)
+
+
+# =================================================== 5. 失效时间（2026-10-24）
+
+# 与 web/js/view.js 的 BANNER_TTL_MS 对齐（改一边必须改另一边）：
+# info / ok = EXPIRY_TTL_MS（8000），warn / error = DEGRADE_TTL_MS（20000，见上面的常量）。
+EXPIRY_TTL_MS = 8000
+EXPIRY_TOLERANCE_MS = 2000       # data-expires-at 与「现在 + 对应时长」的允许偏差
+
+# 绝对本地时刻（带时区偏移）：2026-10-24 15:04:32 +08:00
+STAMP_RE = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}"
+COUNTDOWN_RE = r"还剩 (\d+) 秒"
+
+
+def expiry_span(banner):
+    return banner.locator('[data-role="banner-expiry"]')
+
+
+def expires_at_of(banner) -> int:
+    raw = banner.get_attribute("data-expires-at")
+    assert raw is not None and raw.strip() != "", "横幅上没有 data-expires-at"
+    return int(raw)
+
+
+def test_info_banner_shows_a_countdown_and_the_expiry_instant(
+    page, ar_server, fixture_doc, fixture_questions,
+):
+    """成功类横幅：可见倒计时「还剩 N 秒」+ data-expires-at ≈ now + 8s + title 是绝对时刻。
+
+    双通道的理由（`web/README.md` 的「横幅纪律」）：文字给人看，`data-expires-at` 给用例断言，
+    这样「还有多久失效」的判据不依赖读文字里的秒数（那一秒之差在慢机器上必然抖动）。
+    """
+    saved_then_degraded_followup(page, ar_server, fixture_doc, fixture_questions)
+    info = page.locator('[data-role="banner"][data-state="info"]')
+    expect(info).to_have_count(1)
+    banner = info.first
+
+    span = expiry_span(banner)
+    assert span.count() == 1, "成功类横幅上要有一段失效时间"
+    text = span.text_content()
+    assert re.search(COUNTDOWN_RE, text), f"倒计时文字不对：{text!r}"
+
+    # 到点必须真的从 DOM 摘掉（纪律 c）：所以这里断言的是「什么时候失效」，不是「会不会」
+    expires_at = expires_at_of(banner)
+    delta = expires_at - page.evaluate("() => Date.now()")
+    assert EXPIRY_TTL_MS - EXPIRY_TOLERANCE_MS <= delta <= EXPIRY_TTL_MS + EXPIRY_TOLERANCE_MS, (
+        f"data-expires-at 与现在差 {delta} ms，预期 {EXPIRY_TTL_MS}±{EXPIRY_TOLERANCE_MS}"
+    )
+
+    # 悬停看的绝对时刻：横幅本体与那段 span 上都有（鼠标停哪儿都能看到）
+    for title in (banner.get_attribute("title"), span.get_attribute("title")):
+        assert title and re.search(STAMP_RE, title), f"title 里没有绝对时刻：{title!r}"
+
+    assert banner.get_attribute("data-banner-id"), "横幅要带 data-banner-id（收起时按它找回条目）"
+
+
+def test_countdown_text_ticks_down_every_second(
+    page, ar_server, fixture_doc, fixture_questions,
+):
+    """倒计时是 JS 每秒刷新的（不是写死的一段静态文字）：等一会儿必须读到更小的秒数。"""
+    saved_then_degraded_followup(page, ar_server, fixture_doc, fixture_questions)
+    info = page.locator('[data-role="banner"][data-state="info"]').first
+    first = expiry_span(info).text_content()
+    page.wait_for_timeout(1500)
+    second = expiry_span(info).text_content()
+    assert first != second, f"倒计时没有刷新（两次都是 {first!r}）"
+    assert re.search(COUNTDOWN_RE, second), f"倒计时文字不对：{second!r}"
+    assert int(re.search(COUNTDOWN_RE, second).group(1)) < int(re.search(COUNTDOWN_RE, first).group(1))
+
+
+def test_warn_banner_shows_the_countdown_and_a_20s_expiry(page, ar_server):
+    """降级类（warn）：与成功类同一套呈现——「还剩 N 秒」+ `data-expires-at` ≈ now + 20s + 绝对时刻。
+
+    🔁 行为变更（2026-10-24）：这条用例原来叫
+    `test_warn_banner_says_it_never_expires_and_carries_zero_expiry`，断言
+    `data-expires-at == "0"`、文字是「不会自动收起」。降级与失败改为 20 秒收起（收起即入通知中心
+    历史）之后，这两条断言随之改成 `> 0` 与倒计时文字——**不是放宽**，是把判据换到新规则上：
+    失效时刻仍然精确（±2 秒）。
+    """
+    open_fixture(page, ar_server, extra="")
+    fixture_banner = banners_with(page, "夹具模式").first
+
+    expires_at = expires_at_of(fixture_banner)
+    assert expires_at > 0, "降级横幅现在也有失效时刻（20 秒后收起进通知中心）"
+    delta = expires_at - page.evaluate("() => Date.now()")
+    assert DEGRADE_TTL_MS - EXPIRY_TOLERANCE_MS <= delta <= DEGRADE_TTL_MS + EXPIRY_TOLERANCE_MS, (
+        f"降级横幅的 data-expires-at 与现在差 {delta} ms，预期 {DEGRADE_TTL_MS}±{EXPIRY_TOLERANCE_MS}"
+    )
+
+    span = expiry_span(fixture_banner)
+    assert span.count() == 1
+    text = span.text_content()
+    assert re.search(COUNTDOWN_RE, text), f"降级横幅要写倒计时，不再写「不会自动收起」：{text!r}"
+    assert "不会自动收起" not in text
+
+    # 悬停的绝对时刻：与成功类同一口径（横幅本体与 span 上都有）
+    for title in (fixture_banner.get_attribute("title"), span.get_attribute("title")):
+        assert title and re.search(STAMP_RE, title), f"title 里没有绝对时刻：{title!r}"
+
+
+def test_auto_dismissed_banner_is_kept_in_the_notification_history(
+    page, ar_server, fixture_doc, fixture_questions,
+):
+    """到点自动消失后，条目仍在 `__arDebug.notifications` 里（收起进通知中心，可回看）。"""
+    saved_then_degraded_followup(page, ar_server, fixture_doc, fixture_questions)
+    info = page.locator('[data-role="banner"][data-state="info"]')
+    expect(info).to_have_count(1)
+    text = info.first.get_attribute("data-text")
+    banner_id = info.first.get_attribute("data-banner-id")
+
+    expect(info).to_have_count(0, timeout=AUTO_DISMISS_MS + TIMEOUT_MARGIN_MS)
+
+    notes = dbg(page)["notifications"]
+    hit = [item for item in notes["items"] if item["id"] == banner_id]
+    assert hit, f"自动消失的横幅没进通知历史：{notes['items']}"
+    assert hit[0]["text"] == text
+    assert hit[0]["collapsed"] is True
+    assert hit[0]["reason"] == "timeout", hit[0]
+    assert notes["unread"] >= 1, "收起之后未读数要涨"
+
+
+def test_error_banner_expires_in_20s_and_lands_in_history(page, ar_server, ar_inject):
+    """失败类（error）：与 warn 同一条 20 秒时间线——有 `data-expires-at` ≈ now + 20s、写倒计时，
+    到点从 DOM 归零并进通知历史（`reason: timeout`、未读 +1）。
+
+    现场用「材料载入失败」造（`ar_inject.fail_doc`：`main.js` 的 `fatal()` 打一条 error 横幅，
+    页面照常 `ready`——与 `test_reader_ui.py::test_doc_load_failure_is_visible_and_page_still_ready`
+    同一个现场，只是这里看的是它的失效时间）。
+    """
+    ar_inject.fail_doc = True
+    open_fixture(page, ar_server, extra="")
+
+    error_banners = page.locator('[data-role="banner"][data-state="error"]')
+    expect(error_banners).to_have_count(1)
+    banner = error_banners.first
+    assert "载入失败" in banner.text_content()
+    banner_id = banner.get_attribute("data-banner-id")
+
+    expires_at = expires_at_of(banner)
+    delta = expires_at - page.evaluate("() => Date.now()")
+    assert DEGRADE_TTL_MS - EXPIRY_TOLERANCE_MS <= delta <= DEGRADE_TTL_MS + EXPIRY_TOLERANCE_MS, (
+        f"error 横幅的 data-expires-at 与现在差 {delta} ms，预期 {DEGRADE_TTL_MS}±{EXPIRY_TOLERANCE_MS}"
+    )
+    span = expiry_span(banner)
+    assert span.count() == 1
+    text = span.text_content()
+    assert re.search(COUNTDOWN_RE, text), f"error 横幅要写倒计时：{text!r}"
+
+    # 到点从 DOM 摘掉（不是靠 CSS 动画「看不见了」）
+    expect(error_banners).to_have_count(0, timeout=DEGRADE_TTL_MS + TIMEOUT_MARGIN_MS)
+
+    notes = dbg(page)["notifications"]
+    hit = [item for item in notes["items"] if item["id"] == banner_id]
+    assert hit, f"自动收起的 error 横幅没进通知历史：{notes['items']}"
+    assert hit[0]["state"] == "error"
+    assert hit[0]["collapsed"] is True
+    assert hit[0]["reason"] == "timeout", hit[0]
+    assert notes["unread"] >= 1, "收起之后未读数要涨"
+

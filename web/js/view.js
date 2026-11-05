@@ -2,10 +2,12 @@
  * 视图层：把数据造成 DOM。只负责「造」，不负责「什么时候造」——交互都在 main.js。
  *
  * 所有可断言的状态都落在 data-* 上（data-paragraph / data-action / data-current / data-state /
- * data-unrewritten / data-repeats），无头验证既断言文字也断言这些属性，避免只靠样式猜状态。
+ * data-unrewritten / data-repeats / data-banner-id / data-expires-at），无头验证既断言文字也断言
+ * 这些属性，避免只靠样式猜状态。
  */
 
 import { renderInto } from './md.js';
+import { absoluteLocalStamp, markCollapsed as markCollapsedNotify, record as recordNotify } from './notify.js';
 import {
   changeSummary, DEFERRED_NOTE, FACT_ANCHOR_POLICY_LABELS, factDeclarations, NO_PROFILE_REFS_LABEL,
   PROFILE_REFS_FILLED_BADGE, PROFILE_REFS_FILLED_TIP,
@@ -698,26 +700,39 @@ export function repositionCard(card, anchor) {
 /* --------------------------------------------------- 横幅（页头降级提示） */
 
 /**
- * 成功类横幅的自动消失时长（毫秒）。
+ * 每档横幅的驻留时长（毫秒）：成功类 **8 秒**、降级 / 失败类 **20 秒**。
+ * `0` 仍是「永不自动收起」的语义（`armBannerClock` / `paintExpiry` 都留着这条分支），
+ * 但当前四档**都不取 0**。
  *
- * 取 8 秒的理由：它要说的只是「刚做的事成了」（如「背景已保存」），没有待办；
- * 中文一眼扫完一行约 2–3 秒，8 秒给了「正在看别处」的读者三倍余量，
- * 而短于 5 秒会让人来不及看清写了什么，长于 10 秒就变成新的视觉噪音。
- * 改这个数只改这一处：`web/README.md` 的「降级纪律」与
- * `tests/web/test_banner_lifecycle.py` 的 `AUTO_DISMISS_MS` 都按它对齐。
- */
-export const BANNER_AUTO_DISMISS_MS = 8000;
-
-/**
- * 会自动消失的横幅状态：只有「做成了」这一类。
+ * 8 秒（`info` / `ok`，即「做成了」如「背景已保存」）：它没有待办；中文一眼扫完一行约 2–3 秒，
+ * 8 秒给了「正在看别处」的读者三倍余量，而短于 5 秒来不及看清、长于 10 秒就变成新的视觉噪音。
  *
- * `warn` / `error` 是**降级与失败**——`web/README.md` 的「降级纪律（DESIGN §6）」要求它们可见，
- * 自己消失等于把降级藏起来，所以它们只能被读者手动关掉（`×`）。
+ * 20 秒（`warn` / `error`，降级与失败）：**它们同样会自己走，这不再是「把降级藏起来」**——
+ * 收起的那一刻，条目会被记成一条**未读通知**（顶栏通知中心：徽标计数 + 可回看 + 点条目原样重弹，
+ * 见 `js/notify.js`），可见性由通知中心兜住；占屏于是可以由时间兜底。取 20 秒而不是 8 秒，
+ * 是因为降级文案通常更长（要写完原因和下一步怎么办）、需要的阅读时间更多，而「消失」不再等于「没了」。
+ * 早先它们必须是 0 的理由（`web/README.md` 的「降级纪律（DESIGN §6）」：自己消失等于没报）
+ * 只在「收起的条目无处可寻」时才成立——现在有历史了，那个前提不在了。
+ *
+ * 改时长只改这一处：`web/README.md` 的「横幅纪律」与
+ * `tests/web/test_banner_lifecycle.py` 的 `AUTO_DISMISS_MS` / `DEGRADE_TTL_MS` 都按它对齐。
  */
-const BANNER_AUTO_DISMISS_STATES = new Set(['info', 'ok']);
+export const BANNER_TTL_MS = { info: 8000, ok: 8000, warn: 20000, error: 20000 };
 
-/** 每条横幅的自动消失定时器（关闭 / 移除时清掉，别让定时器抓着已经不在页面上的元素）。 */
-const bannerTimers = new WeakMap();
+/** 成功类（`info`）的自动消失时长。老名字保留：README 与无头用例引用的是这一个。 */
+export const BANNER_AUTO_DISMISS_MS = BANNER_TTL_MS.info;
+
+/** 某一档的驻留时长（毫秒）；`0`（或没登记的档）= 永不自动收起。 */
+function ttlOf(stateName) {
+  const ttl = BANNER_TTL_MS[stateName];
+  return Number.isFinite(ttl) && ttl > 0 ? ttl : 0;
+}
+
+/** 每条横幅的时钟：自动消失定时器 + 倒计时刷新器（关闭 / 移除时一起清掉，别让它们抓着已经不在页面上的元素）。 */
+const bannerClocks = new WeakMap();
+
+/** 横幅序号：`data-banner-id` 与通知中心里那条记录共用一个 id（收起时按它找回条目）。 */
+let bannerSeq = 0;
 
 /** 容器里同文本的那一条；只在**还在页面上**的横幅里找——关掉之后再出现算新的一条。 */
 function findBannerByText(container, message) {
@@ -728,39 +743,102 @@ function findBannerByText(container, message) {
   return null;
 }
 
-/** 移掉一条横幅：清定时器 + 摘 DOM（`×` 与自动消失走同一条路）。 */
-function removeBanner(el) {
-  const timer = bannerTimers.get(el);
-  if (timer) {
-    clearTimeout(timer);
-    bannerTimers.delete(el);
-  }
-  if (el.parentNode) el.parentNode.removeChild(el);
+/** 清掉一条横幅的时钟（定时器 + 倒计时刷新器）。 */
+function clearBannerClock(el) {
+  const clock = bannerClocks.get(el);
+  if (!clock) return;
+  if (clock.timeout) clearTimeout(clock.timeout);
+  if (clock.ticker) clearInterval(clock.ticker);
+  bannerClocks.delete(el);
 }
 
-/** 成功类横幅排一次自动消失；同一文本重复触发时从**最后一次**出现重新计时。 */
-function scheduleAutoDismiss(el) {
-  const timer = bannerTimers.get(el);
-  if (timer) clearTimeout(timer);
-  bannerTimers.set(el, setTimeout(() => removeBanner(el), BANNER_AUTO_DISMISS_MS));
+/** 剩余秒数（向上取整：剩 0.2 秒也写「还剩 1 秒」，不会先写 0 再消失）。 */
+function remainingSeconds(expiresAt, now = Date.now()) {
+  return Math.max(0, Math.ceil((expiresAt - now) / 1000));
+}
+
+/**
+ * 刷新横幅上的「失效时间」那一段（2026-10-24）。
+ *
+ * 双通道：给人看的文字（`还剩 N 秒`）+ `data-expires-at`（epoch ms），悬停的 `title` 是绝对本地
+ * 时刻（带时区偏移）。**不用 CSS 动画 / 过渡来「拖」时间**：到点由 `setTimeout` 真的把节点从 DOM
+ * 摘掉（`tests/web/test_banner_lifecycle.py` 按 DOM 计数断言）。
+ *
+ * 三档（成功类 8 秒 / 降级与失败 20 秒）都走「还剩 N 秒」这一条；`expiresAt === 0` 的
+ * 「不会自动收起」分支留着给「这一档没有失效时长」的情形（现在没有哪一档这样配）。
+ */
+function paintExpiry(el, expiresAt) {
+  const span = el.querySelector('[data-role="banner-expiry"]');
+  if (!span) return;
+  if (!expiresAt) {
+    span.textContent = '不会自动收起';
+    span.title = '这条提示不会自动收起：看完点 × 关掉';
+    return;
+  }
+  span.textContent = `还剩 ${remainingSeconds(expiresAt)} 秒`;
+  span.title = `到 ${absoluteLocalStamp(expiresAt)} 自动收起`;
+}
+
+/**
+ * 给一条横幅排上「失效时间 + 自动消失」：`data-expires-at`、倒计时刷新、到点移除，全在这里。
+ *
+ * 同一文本重复触发时也从**最后一次**出现重新计时（`armBannerClock` 会先清掉上一轮的时钟）。
+ * 返回这一轮的失效时刻（epoch ms；0 = 永不），通知中心那条记录用它。
+ *
+ * 三档都排时钟：成功类 8 秒、降级与失败 20 秒（`BANNER_TTL_MS`）。到点移除时 reason 是 `timeout`，
+ * `removeBanner` 会把这条「收起」进通知中心——所以降级 / 失败自己走之后，条目仍在历史里、未读 +1。
+ */
+function armBannerClock(el, stateName) {
+  clearBannerClock(el);
+  const ttl = ttlOf(stateName);
+  const expiresAt = ttl > 0 ? Date.now() + ttl : 0;
+  el.dataset.expiresAt = String(expiresAt);
+  el.title = expiresAt
+    ? `到 ${absoluteLocalStamp(expiresAt)} 自动收起（这条提示会自己走，也可以点 × 现在关；收起后留在顶栏「通知」里）`
+    : '不会自动收起：这一档没有设失效时长';
+  paintExpiry(el, expiresAt);
+  if (!expiresAt) return expiresAt;
+  bannerClocks.set(el, {
+    timeout: setTimeout(() => removeBanner(el, 'timeout'), ttl),
+    ticker: setInterval(() => paintExpiry(el, expiresAt), 1000),
+  });
+  return expiresAt;
+}
+
+/**
+ * 移掉一条横幅：清时钟 + 摘 DOM + 把它「收起」进通知中心（`×` 与到点消失走同一条路，
+ * 只是 reason 不同：`close` / `timeout`）。通知历史只存内存——刷新页面即清空。
+ */
+function removeBanner(el, reason = 'close') {
+  clearBannerClock(el);
+  if (el.parentNode) el.parentNode.removeChild(el);
+  markCollapsedNotify(el.dataset.bannerId || '', reason);
 }
 
 /**
  * 页头/横幅：任何降级都要在这里留下可见文字。
  *
- * 三条显示层纪律（2026-10-09 修「横幅不消失、还会重复堆叠」）：
+ * 四条显示层纪律（2026-10-09 修「横幅不消失、还会重复堆叠」；2026-10-24 补失效时间与通知中心）：
  *   - **同文本只留一条**：同内容再来时只把 `data-repeats` 加一、可读地写「已出现 N 次」，
  *     不再叠一条（重复触发照样各记一条 `__arDebug.degradations`——去重属显示层，不是记录层）；
  *   - **每条都能手动关**：`×` 按钮，鼠标与键盘等价（原生 button：Enter/Space 即点），
  *     关掉一条不动别的；
- *   - **成功类自动消失**：`info` / `ok` 到 `BANNER_AUTO_DISMISS_MS` 自己走；
- *     `warn` / `error`（降级 / 失败）永不自动消失，只能手动关。
+ *   - **到点自己收起**：`info` / `ok` 8 秒、`warn` / `error` 20 秒（见 `BANNER_TTL_MS`）；
+ *     降级与失败**同样会走**——收起时条目进通知中心（未读计数 + 可回看 + 可重弹），
+ *     所以「自己消失」不再等于「把降级藏起来」；
+ *   - **失效时间可见 + 收起进通知中心**：每条横幅带 `span.banner__expiry`（`还剩 N 秒`，每秒刷新）、
+ *     `data-expires-at`（epoch ms）与悬停的绝对时刻 `title`；消失或被关掉时由 `js/notify.js`
+ *     记成一条「已收起」的历史（纯内存，可回看、可重弹）。
  *
- * 本函数只碰 DOM：不读不写 `__arDebug`，也不改变调用方的任何语义。
+ * 本函数只碰 DOM 与通知 store：不读不写 `__arDebug`，也不改变调用方的任何语义。
+ *
+ * `options.record === false`：这次**不记**通知（通知中心点条目重弹时用——历史里已经有这条，
+ * 重弹再记一条只会让同一条提示在历史里翻倍）。
  */
-export function addBanner(container, text, state = 'warn') {
+export function addBanner(container, text, state = 'warn', options = {}) {
   if (!container) return null;
   const message = String(text == null ? '' : text);
+  const keepHistory = options.record !== false;
 
   const existing = findBannerByText(container, message);
   if (existing) {
@@ -771,9 +849,14 @@ export function addBanner(container, text, state = 'warn') {
       counter.textContent = `（同一提示已出现 ${repeats} 次）`;
       counter.hidden = false;
     }
-    if (BANNER_AUTO_DISMISS_STATES.has(existing.dataset.state)) scheduleAutoDismiss(existing);
+    // 从**最后一次**出现重新计时（失效时间与倒计时一起跟着走）；
+    // 没登记时长的档 ttlOf 返回 0，armBannerClock 会把它画成「不会自动收起」，不必另开分支
+    armBannerClock(existing, existing.dataset.state);
     return existing;
   }
+
+  bannerSeq += 1;
+  const bannerId = `b${bannerSeq}`;
 
   const el = document.createElement('div');
   el.className = 'banner';
@@ -781,11 +864,19 @@ export function addBanner(container, text, state = 'warn') {
   el.dataset.state = state;
   el.dataset.text = message;   // 去重比的是这一条（textContent 里还有 `×` 与重复计数）
   el.dataset.repeats = '1';
+  el.dataset.bannerId = bannerId;
 
   const body = document.createElement('span');
   body.className = 'banner__text';
   body.textContent = message;
   el.appendChild(body);
+
+  // 失效时间：只在文字之后、关闭按钮之前插一段**不可聚焦**的 span
+  // （横幅里不许因此多出 Tab 停点，见 tests/web/test_banner_lifecycle.py 的键盘用例）
+  const expiry = document.createElement('span');
+  expiry.className = 'banner__expiry';
+  expiry.dataset.role = 'banner-expiry';
+  el.appendChild(expiry);
 
   const counter = document.createElement('span');
   counter.className = 'banner__repeat';
@@ -801,12 +892,15 @@ export function addBanner(container, text, state = 'warn') {
   close.textContent = '×';
   close.addEventListener('click', (event) => {
     event.stopPropagation();
-    removeBanner(el);
+    removeBanner(el, 'close');
   });
   el.appendChild(close);
 
   container.appendChild(el);
-  if (BANNER_AUTO_DISMISS_STATES.has(state)) scheduleAutoDismiss(el);
+  const expiresAt = armBannerClock(el, state);
+  if (keepHistory) {
+    recordNotify({ id: bannerId, text: message, bannerState: state, expiresAt });
+  }
   return el;
 }
 

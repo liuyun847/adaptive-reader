@@ -23,7 +23,8 @@
  *   `answers` / `skipped`（不读 localStorage，那个键是显示设置）。界面本身在 js/survey.js。
  *
  * 2026-10-09（横幅的显示层纪律）：横幅改由 `view.js` 的 `addBanner` 统一管——同文本只留一条、
- * 每条带 `×` 可手动关、成功类（`info`）到点自动消失、降级类（`warn`/`error`）只能手动关。
+ * 每条带 `×` 可手动关、到点自己收起（成功类 8 秒，降级 / 失败 20 秒；收起后条目进顶栏「通知」历史，
+ * 未读计数 + 可回看 + 可重弹——见 `view.js` 的 `BANNER_TTL_MS` 与 `js/notify.js`）。
  * 这里只负责把 `kind` 映射成 `data-state`（`bannerState`）：横幅是显示层，
  * `__arDebug` 的标志与语义一个字没动。
  *
@@ -32,6 +33,12 @@
  * `web/js/launcher.js`）：阅读器页（`web/reader.html`）里既没有那个按钮也没有 `#status-host`，
  * 这一页也不再 import `status.js`——原先 `Esc` 里那句 `isStatusOpen()` 让路判定随之删掉
  * （恒为 false 的死判定），阅读器页的 `Esc` 现在只让路给问卷（`isSurveyOpen()`）。
+ *
+ * 2026-10-24（横幅的失效时间 + 顶栏通知中心）：横幅上的失效文字与倒计时在 `view.js`
+ * （`BANNER_TTL_MS` / `armBannerClock`），收起后的历史在 `js/notify.js`（纯内存）。
+ * 这里只做三件事：把入口与宿主交给 `mountNotify`、`Esc` 先关通知面板（在问卷之前判断，
+ * 一次 `Esc` 只关一层）、「点外部」与画像 / 显示面板并列处理。`__arDebug.notifications`
+ * （`{open, unread, items}`）由 `notify.js` 自己写，供无头验证断言。
  *
  * 2026-10-13（PLAN-actions-feedback.md 的 W 路，三件事都在这里接线）：
  *   ① **就地配图**：`changes[i].figure` / `figure_error` 交给 `js/figures.js` 在段落容器内画
@@ -70,6 +77,9 @@ import {
   renderProfile, setProfilePanelOpen,
 } from './profile.js';
 import { bootSurvey, isSurveyOpen } from './survey.js';
+import {
+  closeNotifyPanel, isNotifyOpen, mountNotify, panelContains as notifyPanelContains,
+} from './notify.js';
 
 const D = globalThis.__arDebug;
 D.jsLoaded = true;
@@ -92,6 +102,9 @@ const dom = {
   settingsPanel: document.querySelector('[data-role="settings-panel"]'),
   profileToggle: document.querySelector('[data-role="profile-toggle"]'),
   profilePanel: document.querySelector('[data-role="profile-panel"]'),
+  // 通知中心（2026-10-24）：入口在顶栏，宿主在 body 层（顶栏有 backdrop-filter，浮层放进去会被裁）
+  notifyToggle: document.querySelector('[data-role="notify-toggle"]'),
+  notifyHost: document.querySelector('[data-role="notify-host"]'),
   // 状态面板的入口与宿主**不在这里**：2026-10-15 起它搬到了启动页（web/index.html +
   // web/js/launcher.js），阅读器页（web/reader.html）里既没有那个按钮也没有 #status-host。
   sourceBadge: document.querySelector('[data-role="source-id"]'),
@@ -1399,6 +1412,13 @@ function wireInteractions() {
 
   // 点外部关闭卡片；Esc 也关（顺带收浮条与设置面板）
   document.addEventListener('click', (event) => {
+    // 通知面板（2026-10-24）：与画像 / 显示面板并列的「点外部关闭」。
+    // 面板自己的点击已被 js/notify.js 的宿主监听 stopPropagation 拦下，这里只会收到真正的外面。
+    if (isNotifyOpen()
+      && !notifyPanelContains(event.target)
+      && !(dom.notifyToggle && dom.notifyToggle.contains(event.target))) {
+      closeNotifyPanel('outside');
+    }
     if (state.profilePanelOpen
       && !(dom.profilePanel && dom.profilePanel.contains(event.target))
       && !(dom.profileToggle && dom.profileToggle.contains(event.target))) {
@@ -1416,6 +1436,12 @@ function wireInteractions() {
   });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    // 通知面板（2026-10-24）：它是最轻的一层，Esc 先关它，一次 Esc 只关一层。
+    // 放在问卷之前判断——问卷开着时也必须能用 Esc 收起通知面板。
+    if (isNotifyOpen()) {
+      closeNotifyPanel('escape');
+      return;
+    }
     // 问卷优先：Esc 与问卷的「跳过」同效，由 js/survey.js 自己处理（那里还会问一次确认）。
     // 这里直接让路，免得同一个 Esc 顺带把讲解卡片也关掉。
     // （状态面板那条让路判定 2026-10-15 删掉了：面板搬到了启动页，阅读器页没有 `#status-host`，
@@ -1578,6 +1604,14 @@ async function boot() {
 
   // 画像面板（2026-10-22）：入口常驻顶栏，**只在读者点开时**才去读 /api/profile（不挡阅读）
   mountProfile();
+
+  // 通知中心（2026-10-24）：顶栏那颗「通知」按钮 + 横幅收起 / 失效后的历史（纯内存）。
+  // 重弹走 addBanner 的 `record: false`：历史里已经有这条，重弹再记一条会让同一条在历史里翻倍。
+  mountNotify({
+    host: dom.notifyHost,
+    toggle: dom.notifyToggle,
+    replay: (item) => addBanner(dom.banners, item.text, item.state, { record: false }),
+  });
 
   if (state.ctx.mode === 'fixture') {
     addBanner(dom.banners,

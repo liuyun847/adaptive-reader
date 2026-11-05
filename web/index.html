@@ -78,6 +78,17 @@
   <header class="topbar">
     <div class="topbar__brand">自适应阅读器</div>
     <div class="topbar__side">
+      <!-- 通知中心（2026-10-24）：横幅收起 / 失效后留下的历史，点条目能在页面上原样重弹一次。
+           面板宿主 #notify-host 在 body 层（顶栏有 backdrop-filter，fixed 后代会以顶栏为包含块被裁掉）；
+           未读徽标是 .notify__count[data-unread]，0 时由 CSS 隐藏。 -->
+      <div class="topbar__notify">
+        <button class="settings-toggle" type="button" data-role="notify-toggle"
+          aria-expanded="false" aria-controls="notify-panel" title="通知（收起的提示会留在这里）">
+          <span class="settings-toggle__mark" aria-hidden="true">🔔</span>
+          <span class="settings-toggle__text">通知</span>
+          <span class="notify__count" data-role="notify-count" data-unread="0" aria-hidden="true">0</span>
+        </button>
+      </div>
       <!-- 「测试和修改」入口（2026-10-20 从主栏那块状态卡搬进顶栏）：
            点开仍是同一张状态面板（js/status.js），面板里两块 = ① 测试结论 ② 本次修改。
            原来的说明文字与「读不到时怎么办」那句都并进面板内部了，顶栏只留这一颗按钮。 -->
@@ -99,6 +110,10 @@
 
   <!-- 全页级降级提示（接口不可用 / 结构不符 / 上传失败 / 问卷读不到 等）都落在这里，不允许静默 -->
   <div class="banners" data-role="banners" aria-live="polite"></div>
+
+  <!-- 通知面板的宿主（2026-10-24）：面板由 js/notify.js 造，关闭后整层从这里移除（不留残影）。
+       与 #status-host 同一口径留在 body 层——顶栏的 backdrop-filter 会把 fixed 后代裁在顶栏那一行。 -->
+  <div id="notify-host" data-role="notify-host"></div>
 
   <main class="launcher" data-role="launcher">
     <p class="launcher__lead" data-role="launcher-lead">
@@ -168,6 +183,8 @@
       page: 'launcher',
       errors: [],
       degradations: [],           // {kind, message}：与阅读器同一套可见降级记账
+      // 通知中心（js/notify.js 写这一组；2026-10-24）：{open, unread, items[]}
+      notifications: { open: false, unread: 0, items: [] },
       // ---- 启动页各块的可断言状态（无头验证只等这些显式字段，不 sleep）----
       launcher: {
         // 历史记录（GET /api/sources）：state ∈ idle | loading | ok | empty | degraded

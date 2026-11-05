@@ -61,6 +61,17 @@
         <span class="badge badge--mode" data-role="mode-badge">加载中</span>
         <span class="badge" data-role="progress">第 — / — 段</span>
       </div>
+      <!-- 通知中心（2026-10-24）：横幅收起 / 失效后留下的历史，点条目能在页面上原样重弹一次。
+           面板宿主 #notify-host 在 body 层（顶栏有 backdrop-filter，fixed 后代会以顶栏为包含块被裁掉）；
+           未读徽标是 .notify__count[data-unread]，0 时由 CSS 隐藏。 -->
+      <div class="topbar__notify">
+        <button class="settings-toggle" type="button" data-role="notify-toggle"
+          aria-expanded="false" aria-controls="notify-panel" title="通知（收起的提示会留在这里）">
+          <span class="settings-toggle__mark" aria-hidden="true">🔔</span>
+          <span class="settings-toggle__text">通知</span>
+          <span class="notify__count" data-role="notify-count" data-unread="0" aria-hidden="true">0</span>
+        </button>
+      </div>
       <!-- 读者画像（2026-10-22）：概念自评 + 事实锚口径。此前这两件事只能命令行 / URL /
            手改 profile.yaml，这一版把它们搬到页面上；面板内容由 js/profile.js 造、main.js 接数据。 -->
       <div class="topbar__profile">
@@ -87,6 +98,11 @@
 
   <!-- 全页级降级提示（模型不可用 / 段数对不上 / 概念清单缺失 等）都落在这里，不允许静默 -->
   <div class="banners" data-role="banners" aria-live="polite"></div>
+
+  <!-- 通知面板的宿主（2026-10-24）：面板由 js/notify.js 造，关闭后整层从这里移除（不留残影）。
+       它留在 body 层、**不放顶栏里**：顶栏有 backdrop-filter 与 z-index: 40 的层叠上下文，
+       position: fixed 的后代会被裁在顶栏那一行，还会被抽屉（45）与卡片层（60）压住。 -->
+  <div id="notify-host" data-role="notify-host"></div>
 
   <div class="reader" data-role="reader">
     <main class="main" data-role="main">
@@ -159,6 +175,9 @@
       lastCard: null,
       compression: null,
       degradations: [],
+      // 通知中心（js/notify.js 写这一组；2026-10-24）：{open, unread, items[]}，
+      // items 每项 {id, text, state, createdAt, expiresAt, collapsed, collapsedAt, reason, seen}
+      notifications: { open: false, unread: 0, items: [] },
       // 选片讲解 / 显示设置 / 会话缓存：无头验证断言这三块的状态
       toolbarOpen: false,
       selection: null,
