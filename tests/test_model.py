@@ -256,10 +256,13 @@ def test_cached_tokens_of_reads_both_gateway_shapes(usage: Any, expected: int | 
         (500, "boom", "SERVER"),
         (503, "gateway down", "SERVER"),
         (418, "teapot", "UNKNOWN"),
-        # 配额文案优先归 QUOTA（402 / 403 也可能是额度用尽，重试无用）
+        # 余额类额度文案归 QUOTA（402 也可能是额度用尽，补查确认后冷却该家）
         (402, "Insufficient Balance", "QUOTA"),
         (429, "you exceeded your current quota", "QUOTA"),
         (400, "账户余额不足，请充值", "QUOTA"),
+        # 订阅式上游的窗口文案同样是额度类：归 QUOTA（不重试；补查确认后按档冷却）。
+        # 严格"窗口语义但不含余额文案"的那一档归 QUOTA_RATE_WINDOW，见 test_chain.py 的窗口类用例。
+        (429, "You've reached your weekly usage limit for your plan", "QUOTA"),
         # 401 就是鉴权，不许被文案带走
         (401, "insufficient quota", "AUTH"),
     ],

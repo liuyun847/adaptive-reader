@@ -14,14 +14,23 @@
   按 ``tempfile.TMP_MAX`` 空转下去——2026-10-14 本机实测那是 **2147483647**（21 亿级，
   Windows 上**近似无界**，不是常说的 10000）；本实现的重试上限是写死的 ``_TMP_NAME_ATTEMPTS = 32``）
 - ``errors``   统一错误类型与退出码表（退出码的唯一实现处）
-- ``config``   配置与密钥读取（``AR_API_KEY`` > ``config.local.json`` 的 ``api_key``）+ 脱敏
-- ``model``    OpenAI 兼容流式模型客户端（httpx + httpx-sse，失败自动降级 stream_options）
+- ``config``   配置与密钥读取（``AR_API_KEY`` > ``config.local.json`` 的 ``api_key``）+ 脱敏；
+  可选的 ``routes`` 段（多源回退链）也在这里汇入 ``Config``
+- ``chain``    多源回退链：``Route`` 定义与校验、逐跳密钥现读（环境变量 > DSH 凭据文件 ``refs``）、
+  按 provider 记账的冷却表、`order_routes` 三桶自动排序（形状照 DSH 插件 ``dsh-llm-auto``，不依赖 DSH 进程）
+- ``quota``    额度探测：现查 Command Code 的 ``/alpha/billing/{credits,subscriptions}`` 与
+  OpenCode Go 的 ``/usage``，给出「月度重置时刻 / 哪一档打满 / 冷到何时」——排序键与冷却终点都从这里来，
+  **不需要人工填写任何时间**；查不到一律 fail-open（不冷却、进「未知」桶）
+- ``model``    OpenAI 兼容流式模型客户端（httpx + httpx-sse，失败自动降级 stream_options）；
+  配了 ``routes`` 时按链逐跳换源、换跳前摘掉历史思考
 - ``llm``      统一模型调用层：重试策略、错误码白名单、逐次尝试记账、失败不抛
-- ``tools``    模型工具层：五个具名工具的注册表、JSON Schema 与执行
+- ``tools``    模型工具层：六个具名工具的注册表、JSON Schema 与执行
 - ``prompts``  提示词与版本号（回归基线：产物里记录 prompt_version）
 - ``analyze``  概念清单抽取 + 契约校验（M2）；``format_illustration_block`` 供 ``rewrite`` 提示词用
 - ``rewrite``  逐段决策 + 改写（M3：默认先串行预热第 1 批再并发其余批次；``per_paragraph`` 时
-  一段一请求，``conversation`` 时同一上下文累积；校验不过带反馈重试；四个动作都已实现）；
+  一段一请求，``conversation`` 时同一上下文累积；校验不过带反馈重试；四个动作都已实现；
+  两遍式 ``plan_first``（``plan-v2``：第一遍只打动作标、第二遍照计划改写；两遍共享同一段前缀）与逐段对话的
+  上下文瘦身 ``conversation_digest``（摘要回填替代整段 JSON）也在这里）；
   局部重跑（``--only`` / ``--retry-failed`` / ``--from-signals``）与逐段合并器 ``merge_artifacts``、
   在线压缩 ``acompress_paragraph``（``POST /api/compress``，与 ``ar check`` 同一套事实锚口径 + 申报通道）都在这里；
   ``why.profile`` 的语义与兜底也在这里：模型给的引用逐条保留，漏键 / 给错形状 / 该给引用却给空数组
@@ -47,7 +56,7 @@
 - ``explain``  按需讲解（``POST /api/explain`` 的实现，降级必须可见）
 - ``cache``    讲解与在线压缩共用的进程内 LRU（只缓存成功结果，键含画像指纹；``kind`` 一格分开两类）
 - ``server``   HTTP 层：``/api/*`` + 托管 ``web/``（含偏好写入 ``POST /api/profile/preference``）
-- ``cli``      命令行：七个冻结子命令（ingest / analyze / rewrite / check / serve / tools / feedback）
+- ``cli``      命令行：八个冻结子命令（ingest / analyze / rewrite / check / serve / tools / feedback / routes）
 
 尚未实现（后续里程碑）：按材料出辨识题与复述题；``rewrite --mode strict`` 严格档（接口已留位，
 遇到明确报错）。

@@ -22,6 +22,9 @@ htmlcov/
 data/
 profiles/
 config.local.json
+# 本机回退链（ar routes import 生成；含 provider 会话头等本机取值，不入库）。
+# 仓库里的模板在 src/ar/chain.py 的 DEFAULT_ROUTES_YAML，用 ar routes import --default 生成。
+config.routes.yaml
 
 # ── 机器生成的状态报告(web/README.md「状态面板」:由 tools/gen_status.py 生成) ──
 web/status.json
@@ -32,3 +35,7 @@ web/status.json
 Thumbs.db
 desktop.ini
 *.log
+
+# ── 过程产物(根目录:`_audit-*.md` / `_docfix-*.md`:审计与修文档的一次性报告,本机留档、不入库) ──────
+/_audit-*.md
+/_docfix-*.md

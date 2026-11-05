@@ -16,7 +16,7 @@ from ar.paths import profile_path
 from ar.server import build_app
 from test_rewrite import write_fake_doc
 
-SUBCOMMANDS = ("ingest", "analyze", "rewrite", "check", "serve", "tools", "feedback")
+SUBCOMMANDS = ("ingest", "analyze", "rewrite", "check", "serve", "tools", "feedback", "routes")
 
 
 def test_help_lists_all_frozen_subcommands(run_cli) -> None:
@@ -25,6 +25,25 @@ def test_help_lists_all_frozen_subcommands(run_cli) -> None:
     for name in SUBCOMMANDS:
         assert name in output, name
     assert "ingest" in output and "--id" not in output  # --id 是子命令选项
+
+
+def test_routes_show_reports_single_source_mode(run_cli, tmp_path: Path) -> None:
+    """没配链时 ``ar routes show`` 必须说清「单源模式」并给出一条开启命令（不是空输出）。"""
+    config = tmp_path / "config.local.json"
+    config.write_text('{"base_url": "https://single.invalid/v1", "model": "fake/model"}', encoding="utf-8")
+    code, output = run_cli("routes", "show", "--json", "--config", str(config))
+    assert code == EXIT_OK, output
+    payload = json.loads(output)
+    assert payload["mode"] == "single" and payload["routes"] == []
+
+
+def test_routes_import_writes_file_and_refuses_overwrite(run_cli, tmp_path: Path) -> None:
+    target = tmp_path / "routes.yaml"
+    code, output = run_cli("routes", "import", "--default", "--out", str(target))
+    assert code == EXIT_OK, output
+    assert target.is_file() and "commandcode" in target.read_text(encoding="utf-8")
+    code, output = run_cli("routes", "import", "--default", "--out", str(target))
+    assert code == EXIT_USAGE and "已存在" in output
 
 
 def test_version_flag(run_cli) -> None:
@@ -135,29 +154,32 @@ def test_cli_check_and_rewrite_report_their_exit_codes(
 
 
 # ------------------------------------------------------------------ ar tools --
-#: 五个模型工具（第五个是 PLAN-actions-feedback §5.1 的 compress_paragraph）
+#: 六个模型工具（第五个是 PLAN-actions-feedback §5.1 的 compress_paragraph，
+#: 第六个是两遍式的第一遍 plan_actions（plan-v2，2026-10-31 起两遍共享同一段前缀））
 TOOL_NAMES = (
     "analyze_concepts",
     "rewrite_batch",
+    "plan_actions",
     "explain_paragraph",
     "survey_followups",
     "compress_paragraph",
 )
 
 
-def test_tools_subcommand_prints_the_five_contracts(run_cli) -> None:
-    """人类可读输出：五个工具的名称、描述、入参/出参 schema 都要在。"""
+def test_tools_subcommand_prints_the_six_contracts(run_cli) -> None:
+    """人类可读输出：六个工具的名称、描述、入参/出参 schema 都要在。"""
     code, output = run_cli("tools")
     assert code == EXIT_OK, output
     for name in TOOL_NAMES:
         assert name in output, name
     assert "描述：" in output
-    assert output.count("入参（JSON Schema）：") == 5
-    assert output.count("出参（JSON Schema）：") == 5
-    # 提示词版本：rewrite 升到 v7（材料块挪到规则后 + 全文进固定上下文 + 校验反馈槽），
-    # compress 仍是 v3（这一批没动它）
+    assert output.count("入参（JSON Schema）：") == 6
+    assert output.count("出参（JSON Schema）：") == 6
+    # 提示词版本：rewrite 仍是 v7（计划块为空时那一格零字符插入，所以**不升版**），
+    # compress 仍是 v3（这一批没动它），两遍式的第一遍单列 plan-v1
     assert "concepts-v2" in output and "rewrite-v7" in output and "explain-v2" in output and "survey-v1" in output
     assert "compress-v3" in output
+    assert "plan-v2" in output
 
 
 def test_tools_json_output_is_a_parseable_array(run_cli) -> None:

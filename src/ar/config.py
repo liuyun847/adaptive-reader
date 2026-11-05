@@ -5,6 +5,10 @@
 与 ``retry`` 段（PLAN-llm-tools §3.5，形状照 DSH：``mode`` / ``maxRetries`` /
 ``retryableCodes`` / ``backoff{initialDelayMs,maxDelayMs,jitterRatio}``）。
 
+**多源回退链**（可选的 ``routes`` 段，形状照本机 DSH 插件 ``dsh-llm-auto``）：给了 ``routes``
+就按链逐跳尝试，不再用顶层的 ``base_url`` / ``model`` / ``api_key``；没给就还是单源老行为。
+链上每一跳的密钥**按需现读**（环境变量 > 本机 DSH 凭据文件），不缓存、不落盘，见 ``ar.chain``。
+
 ``retry`` 段**可选**：不写就是 §2 的内置默认值（5 次重试、500→10000ms、±10% 抖动）。
 非法值（负数、``initialDelayMs > maxDelayMs``、``jitterRatio`` 越界、未知错误码、
 ``mode=always``）**报错退出**（``InputError`` → CLI 退出码 2），不静默回落；
@@ -27,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .chain import ORDERING_MODES, Route, load_routes_file, parse_routes
 from .errors import InputError
 from .jsonio import read_json_if_exists
 from .llm import RETRY_BACKOFF_KEYS, RETRY_SECTION_KEYS, resolve_retry_policy
@@ -47,7 +52,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "retry": None,
 }
 
-_KNOWN_KEYS = (*DEFAULT_CONFIG.keys(), "api_key")
+_KNOWN_KEYS = (*DEFAULT_CONFIG.keys(), "api_key", "routes", "ordering")
 
 
 
@@ -72,11 +77,31 @@ class Config:
     retry: dict[str, Any] | None = None
     #: 配置层面的提示（目前只有 ``max_retries`` 的废弃说明），供 CLI / 测试查看
     retry_notes: tuple[str, ...] = ()
+    #: 多源回退链（配置的 ``routes`` 段，**只存静态字段**：provider / model / base_url /
+    #: api_key_env / headers / subscription / reset_at）。空元组 = 单源模式，行为与加链之前逐字一致
+    routes: tuple[Route, ...] = ()
+    #: 链的排序模式：``auto``（默认；按月度重置时刻升序、按量垫底、跳过冷却中的家）/
+    #: ``manual``（严格按配置顺序；冷却表照记但不跳过）。形状照 DSH 插件 ``dsh-llm-auto``
+    ordering: str = "auto"
+
+    @property
+    def single_source(self) -> bool:
+        """单源模式（没配 ``routes``）时才用顶层的 base_url / model / api_key。"""
+        return not self.routes
 
     @property
     def model_configured(self) -> bool:
-        """模型可用 = 有密钥 且 base_url/model 都填了。"""
+        """模型可用 = 有密钥 且 base_url/model 都填了（多源模式 = 链至少一跳）。"""
+        if self.routes:
+            return True
         return bool(self.api_key) and bool(self.base_url) and bool(self.model)
+
+    @property
+    def model_label(self) -> str:
+        """人读的「模型」：单源模式是模型名；多源模式是逐跳列出的链（``a/m1 → b/m2``）。"""
+        if self.routes:
+            return " → ".join(route.label for route in self.routes)
+        return self.model
 
     def public_dict(self) -> dict[str, Any]:
         """可打印 / 可进 API 响应的视图：不含密钥值，只说明它从哪来。"""
@@ -93,6 +118,8 @@ class Config:
             "api_key_origin": self.api_key_origin,
             "source_path": self.source_path,
             "unknown_keys": list(self.unknown_keys),
+            "routes": [route.public_dict() for route in self.routes],
+            "ordering": self.ordering,
         }
 
 
@@ -149,6 +176,31 @@ def _retry_section(
     return section, tuple(unknown), tuple(notes)
 
 
+def _route_file_candidates(env: dict[str, str]) -> list[Path]:
+    """按优先级给出「链文件」的候选路径（``AR_ROUTES_FILE`` 显式指定时**只认它**，不再回落项目根）。"""
+    explicit = (env.get("AR_ROUTES_FILE") or "").strip()
+    if explicit:
+        return [Path(explicit)]
+    # 单源模式**不隐含**回退链：仓库根出现 config.routes.yaml 不该悄悄改变别人的行为
+    # （只有 AR_ROUTES_FILE 或配置里的 routes 段才算「用户明确要了链」）
+    return []
+
+
+def _routes_of(raw: dict[str, Any], config_path: Path, env: dict[str, str]) -> tuple[Route, ...]:
+    """生效的回退链：``routes`` 段（内联）> ``AR_ROUTES_FILE`` 指的 YAML；都没有 = 单源模式。
+
+    两处都不给就是**单源模式**，行为与加链之前逐字一致——链是可选功能，不是默认。
+    ``ar routes import --default`` 生成的 ``config.routes.yaml`` 要靠 ``AR_ROUTES_FILE`` 指过去
+    （或者直接把片段贴进配置的 ``routes``），**不会**因为文件躺在项目根就自动生效。
+    """
+    if "routes" in raw:
+        return parse_routes(raw.get("routes"))
+    for candidate in _route_file_candidates(env):
+        if candidate.is_file():
+            return load_routes_file(candidate)
+    return ()
+
+
 def load_config(path: Path | str | None = None, *, env: dict[str, str] | None = None) -> Config:
     """读配置并解析密钥。``path=None`` 用 ``config.local.json``（不存在则用默认值）。"""
     env = os.environ if env is None else env
@@ -188,6 +240,11 @@ def load_config(path: Path | str | None = None, *, env: dict[str, str] | None = 
     else:
         api_key, origin = "", None
 
+    routes = _routes_of(raw, config_path, env)
+    ordering = str(raw.get("ordering", "auto")).strip().lower()
+    if ordering not in ORDERING_MODES:
+        raise InputError(f"配置项 ordering 只能是 {' / '.join(ORDERING_MODES)}，实际是 {raw.get('ordering')!r}")
+
     retry_section, retry_unknown, retry_notes = _retry_section(
         raw, 0 if max_retries is None else max_retries
     )
@@ -210,6 +267,8 @@ def load_config(path: Path | str | None = None, *, env: dict[str, str] | None = 
         unknown_keys=tuple(sorted(unknown_keys)),
         retry=retry_section,
         retry_notes=retry_notes,
+        routes=routes,
+        ordering=ordering,
     )
 
 

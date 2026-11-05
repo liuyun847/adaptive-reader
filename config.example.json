@@ -1,15 +1,25 @@
 {
+  "_base_url_note": "单源模式（没配 routes）用的那一跳；配了 routes 之后这三项（base_url/model/api_key）整组不生效。",
   "base_url": "https://api.commandcode.ai/provider/v1",
   "model": "deepseek/deepseek-v4.1-flash",
   "temperature": 0.6,
   "timeout_s": 90,
   "max_tokens": null,
   "api_key": "",
+  "_routes_note": [
+    "多源回退链（可选）：给了 routes 就不再走上面的 base_url/model/api_key，改按链逐跳试。",
+    "链也可以放在项目根的 config.routes.yaml，或由环境变量 AR_ROUTES_FILE 指向一份 YAML；",
+    "优先级：本文件的 routes > AR_ROUTES_FILE > config.routes.yaml > 都不给（单源模式）。",
+    "每一跳只写 api_key_env（环境变量名），密钥现读环境变量或 ~/.dsh/.credentials.yaml 的 refs；",
+    "链上任何一项都绝不写密钥值。uv run ar routes show 可查看当前链、各跳密钥来源与冷却状态。",
+    "默认片段（uv run ar routes import --default）抄的是本机 DSH dsh-llm-auto 插件当前生效的链。"
+  ],
   "retry": {
     "_note": [
       "retry 段可选：整段不写 = 用下面这份默认值（与 DSH 内置重试同一口径）。",
       "mode：normal = 有界重试；always（无上限）本项目不实现，写了直接报错退出（码 2）。",
       "maxRetries：默认 5，即最多 6 次尝试；0 = 只试一次（不重试）。",
+      "做一次业务调用时：先按回退链逐跳各试一次（换跳不吃这个额度），整条链都失败后才按本段决定要不要再来一轮。",
       "retryableCodes：白名单——只有列在这里的错误码才会重试。默认 5 个：EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT；AUTH / INVALID_REQUEST / QUOTA / NOT_CONFIGURED / UNKNOWN 默认不在白名单里，即默认永不重试（显式写进白名单才会重试）。",
       "backoff：首次 500ms、每次翻倍、封顶 10000ms、每次 ±10% 抖动（退避序列 500/1000/2000/4000/8000/10000）；上游 Retry-After 在封顶内优先用它，超界则放弃重试。",
       "下划线开头的键是注释，读配置时忽略，不进未知字段告警。",

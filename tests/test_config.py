@@ -106,7 +106,8 @@ def test_project_example_config_contains_no_secret() -> None:
     """交付文件里绝不能出现密钥：模板的 api_key 必须是空串，且没有令牌形态的串。"""
     example = json.loads((PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8"))
     assert example["api_key"] == ""
-    assert set(DEFAULT_CONFIG) | {"api_key"} >= set(example)
+    # 下划线开头的键是注释（与 retry 段同一约定）：模板允许写，读配置时忽略
+    assert set(DEFAULT_CONFIG) | {"api_key"} >= {key for key in example if not key.startswith("_")}
     raw = (PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8")
     assert "sk-" not in raw
     assert not re.search(r"[A-Za-z0-9_\-]{32,}", raw)

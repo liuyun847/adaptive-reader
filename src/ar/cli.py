@@ -5,6 +5,8 @@ uv run ar ingest  <文件路径> --id <source_id>
 uv run ar analyze <source_id> [--check-only]
 uv run ar rewrite <source_id> --reader local-default [--mode free]
                   [--only p012,p014 | --retry-failed | --from-signals]   # 局部重跑（三者互斥）
+                  [--per-paragraph [--conversation [--conversation-digest]]]   # 逐段 / 逐段对话（+上下文瘦身）
+                  [--plan-first]                                        # 两遍式：先打动作标、再改写
 uv run ar check   <source_id> [--reader local-default]     # 锚点稳定性 + 事实锚（数字/引文/书名+段缺失）
                                                             # 口径由读者画像偏好 pref_fact_anchor 决定
 uv run ar baseline <source_id> [--reader local-default]     # 一次性整篇改写基线（只写 _eval/）
@@ -36,19 +38,23 @@ uv run ar feedback <source_id> --reader local-default [--apply]   # 行为信号
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .analyze import check_inventory_file, run_analyze
 from .anchors import verify_source
+from .chain import default_routes_path, order_routes, resolve_api_key
 from .config import Config, load_config
 from .errors import (
     EXIT_MODEL,
     EXIT_MODEL_PARTIAL,
     EXIT_OK,
+    EXIT_USAGE,
     ArError,
     InputError,
     ModelPartiallyFailed,
@@ -284,6 +290,9 @@ def _cmd_rewrite(args: argparse.Namespace) -> int:
 
     if args.conversation and not args.per_paragraph:
         raise InputError("--conversation 必须与 --per-paragraph 一起用（同一上下文里逐段推进）")
+    if args.conversation_digest and not args.conversation:
+        # 摘要只改「逐段对话里塞回上下文的东西」：没有对话就没有 transcript 可瘦身（不静默忽略）
+        raise InputError("--conversation-digest 必须与 --per-paragraph --conversation 一起用（同一上下文里逐段推进）")
     # 对话本身有顺序：显式给了 !=1 的并发才提醒，缺省不算「用户要求并发」
     if args.conversation and args.concurrency not in (None, 1):
         _warn("--conversation 是串行的；--concurrency 已按 1 处理")
@@ -309,6 +318,8 @@ def _cmd_rewrite(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         validation_retries=args.validation_retries,
         conversation=args.conversation,
+        plan_first=args.plan_first,
+        conversation_digest=args.conversation_digest,
     )
 
     counts = outcome.action_counts()
@@ -326,6 +337,50 @@ def _cmd_rewrite(args: argparse.Namespace) -> int:
         _say(
             f"  调度：逐段（并发 {outcome.concurrency}；校验重试上限 {outcome.validation_retries} 次）"
         )
+    if outcome.plan_first:
+        # 两遍式的第一遍：几段、动作怎么分、花了多少次请求（计划本身也落产物 meta.plan）。
+        # 复用旧计划的重跑**一次打标请求都没发**，这行就必须写「0 次请求」——不许照抄旧产物的记账
+        # （2026-10-19 复核修复：原先一律打 plan_request_count，复用时会照样报「1 次请求」）。
+        plan_counts = {action: 0 for action in ACTIONS}
+        for entry in outcome.plan:
+            plan_counts[entry.action] = plan_counts.get(entry.action, 0) + 1
+        plan_breakdown = " / ".join(
+            f"{actions_label(action)} {plan_counts.get(action, 0)}"
+            for action in ACTIONS
+            if plan_counts.get(action, 0)
+        )
+        head = f"  第一遍打标：{len(outcome.plan)} 段（{plan_breakdown or '—'}）；"
+        _say(head + ("复用旧计划，0 次请求（未重新打标）" if outcome.plan_reused else f"{outcome.plan_request_count} 次请求"))
+        if outcome.plan_missing:
+            _warn(
+                "第一遍打标漏了这些段（第二遍照常逐段改写，不计入 unplanned、不改退出码）："
+                + "、".join(outcome.plan_missing)
+            )
+        if outcome.plan_usage:
+            # 第一遍的 token 账单独一行：``_usage_summary`` 汇总的是第二遍，混在一起就说不清
+            label = "（复用旧计划那次，非本次）" if outcome.plan_reused else ""
+            _say(
+                f"  第一遍打标账{label}："
+                f"prompt {outcome.plan_usage.get('prompt_tokens', 0)} / "
+                f"completion {outcome.plan_usage.get('completion_tokens', 0)} / "
+                f"合计 {outcome.plan_usage.get('total_tokens', 0)}"
+            )
+    elif outcome.plan_reused:
+        # 不带 --plan-first 的局部重跑：旧产物是按计划跑出来的，这一段照旧按那份计划改写
+        _say(
+            f"  计划：沿用既有产物里第一遍的计划照旧注入第二遍（{len(outcome.plan)} 段；"
+            "本次未重新打标，0 次打标请求）"
+        )
+    if outcome.plan_not_applied:
+        _warn(
+            "以下目标段没能注入既有计划（本次按单遍改写；产物 meta.plan_not_applied 有记录）："
+            + "、".join(outcome.plan_not_applied)
+        )
+    if outcome.conversation_digest:
+        _say(
+            "  上下文瘦身：上一轮只回填一行摘要（p001 keep / p002 expand：正文）；"
+            "why / confidence 等外壳不进上下文（原始 JSON 仍用于本轮校验）"
+        )
     _say(f"  产物：{outcome.decisions_path}")
     _say(f"       {outcome.rewritten_path}")
     _say(f"       {outcome.changes_path}")
@@ -337,7 +392,8 @@ def _cmd_rewrite(args: argparse.Namespace) -> int:
         detail = f"--only {','.join(requested.get('only') or [])}" if requested.get("only") else f"--{rerun.get('reason')}"
         targets_label = "、".join(outcome.rerun_targets) or "（无）"
         _say(f"  本次局部重跑：{detail}；目标段 {len(outcome.rerun_targets)} 段（{targets_label}）")
-        units = "段（逐段）" if outcome.planning_mode == "per-paragraph" else "批"
+        # 合并后 meta 里已有真实的调度方式（2026-10-19 复核第 9 条）：逐段对话也是「一段一次请求」
+        units = "段（逐段）" if outcome.planning_mode in ("per-paragraph", "conversation") else "批"
         _say(f"      本次发出 {outcome.batch_count} {units}；其余段落沿用既有产物（未重跑段逐字节不变）")
         _say("      fidelity 已重置为未校验（改写阶段的 checked 恒为 false）")
     # 动作计数与实现范围都从枚举现算（四个动作：展开 / 压缩 / 保持 / 配图）——不许再硬编码 expand/keep
@@ -621,7 +677,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------------- tools --
 def _cmd_tools(args: argparse.Namespace) -> int:
-    """列出五个模型工具的契约（**只读**：不读配置、不调模型、不发请求）。
+    """列出六个模型工具的契约（**只读**：不读配置、不调模型、不发请求）。
 
     ``--json`` 输出可被 ``json.loads`` 解析的数组；不带该选项时给人读的排版。
     """
@@ -640,6 +696,137 @@ def _cmd_tools(args: argparse.Namespace) -> int:
         _say(json.dumps(spec["parameters"], ensure_ascii=False, indent=2))
         _say("  出参（JSON Schema）：")
         _say(json.dumps(spec["output"], ensure_ascii=False, indent=2))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------- routes --
+def _cmd_routes_show(args: argparse.Namespace) -> int:
+    """``ar routes show``：打印当前生效的链——每跳的地址、密钥**来源**（从不给值）、以及有没有能力发请求。
+
+    冷却记录**落盘**（``~/.dsh/storages/adaptive_reader_cooldowns.json``，重启后接着冷），但本命令
+    不进链、不读盘，所以这里看不到它们；服务进程里的实时冷却看 ``/api/health`` 的 ``routes`` 字段。
+    """
+    config: Config = load_config(args.config)
+    client = ModelClient(config)
+    # 现查一次额度（``ar routes show`` 是显式命令，不受查询闸门约束；查不到就按「未知档」显示）
+    asyncio.run(client.refresh_quota(force=True))
+    rows = []
+    for route in config.routes:
+        _key, origin = resolve_api_key(route)
+        rows.append(
+            {
+                "provider": route.provider,
+                "model": route.model,
+                "base_url": route.base_url,
+                "api_key_env": route.api_key_env,
+                "api_key_origin": origin,
+                "usable": bool(origin),
+                "headers": dict(route.headers),
+            }
+        )
+    # 排序：auto（默认）/ manual。auto 下「配置顺序」与「生效顺序」不是一回事，两个都列出来
+    cooling = set(client.cooldowns.active()) if config.routes else set()
+    ordered = order_routes(config.routes, client.quota_report, cooling)
+    payload = {
+        "mode": "chain" if config.routes else "single",
+        "ordering": config.ordering,
+        "chain": [route.label for route in config.routes],
+        "effective": [
+            {
+                "label": item.route.label,
+                "reason": item.reason,
+                "cooling": item.cooling,
+                "monthly_reset_ms": item.reset_at_ms,
+            }
+            for item in ordered
+        ],
+        "quota": client.quota_report.public_list(),
+        "routes": rows,
+        "single_source": {"base_url": config.base_url, "model": config.model} if config.single_source else None,
+        "config_path": config.source_path,
+    }
+    if args.json:
+        _say(json.dumps(payload, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    if not config.routes:
+        _say(f"单源模式（没有配置 routes）：{config.model} @ {config.base_url}")
+        _say("  要看多源回退链：uv run ar routes import --default（生成 config.routes.yaml）")
+        return EXIT_OK
+    by_provider = {row["provider"]: row for row in rows}
+    if config.ordering == "auto":
+        _say(f"多源回退链（{len(config.routes)} 跳 · 自动排序：按月重置升序 → 额度查不到 → 按量垫底）：")
+        for index, item in enumerate(ordered, 1):
+            row = by_provider[item.route.provider]
+            origin = row["api_key_origin"] or "没有可用密钥（这一跳会被跳过）"
+            reset = ""
+            if item.reset_at_ms is not None:
+                reset = "，月度重置 " + datetime.fromtimestamp(item.reset_at_ms / 1000).strftime("%Y-%m-%d %H:%M")
+            _say(f"  {index}. {row['provider']}/{row['model']}  [{item.reason}{reset}]")
+            _say(f"     地址：{row['base_url']}")
+            _say(f"     密钥：{origin}")
+        _say("额度（现查，按月重置那几家的排序键就来自这里）：")
+        for source in client.quota_report.public_list():
+            if not source["status"] == "ok":
+                _say(f"  · {source['provider']}：查不到（{source['reason']}）—— {source['message']}")
+                continue
+            parts = []
+            if source["monthly_reset_ms"]:
+                parts.append(
+                    "月度重置 " + datetime.fromtimestamp(source["monthly_reset_ms"] / 1000).strftime("%Y-%m-%d %H:%M")
+                )
+            if source["plan_id"]:
+                parts.append("套餐 " + source["plan_id"])
+            parts.append("已耗尽：" + ("、".join(source["exhausted_windows"]) if source["exhausted_windows"] else "无"))
+            _say(f"  · {source['provider']}：" + "；".join(parts))
+    else:
+        _say(f"多源回退链（{len(config.routes)} 跳 · 手动排序：严格按下面的配置顺序，不跳过任何一家）：")
+        for index, row in enumerate(rows, 1):
+            origin = row["api_key_origin"] or "没有可用密钥（这一跳会被跳过）"
+            _say(f"  {index}. {row['provider']}/{row['model']}")
+            _say(f"     地址：{row['base_url']}")
+            _say(f"     密钥：{origin}")
+    _say(
+        "冷却按 provider 记账并落盘（额度类：5 分钟短闸门 → 补查确认 → 冷到该档重置；"
+        "没密钥 10 分钟；AUTH 不冷却）。"
+    )
+    _say("排序方式改配置里的 ordering（auto / manual）；/api/health 能看到当下的链与冷却。")
+    return EXIT_OK
+
+
+def _cmd_routes_import(args: argparse.Namespace) -> int:
+    """``ar routes import``：把 YAML 链片段写成 ``config.routes.yaml``（**只写这份文件，不碰 config.local.json**）。"""
+    from .chain import DEFAULT_ROUTES_YAML, load_routes_file, parse_routes
+
+    source_text = DEFAULT_ROUTES_YAML
+    if args.path and not args.default:
+        source_path = Path(args.path)
+        if not source_path.is_file():
+            print(f"错误：链文件不存在：{source_path}", file=sys.stderr, flush=True)
+            return EXIT_USAGE
+        routes = load_routes_file(source_path)
+        source_text = source_path.read_text(encoding="utf-8")
+    else:
+        import yaml
+
+        routes = parse_routes(yaml.safe_load(source_text))
+    if not routes:
+        print("错误：链文件里没有一跳可用的路由（每项都要 provider / model / base_url / api_key_env）",
+              file=sys.stderr, flush=True)
+        return EXIT_USAGE
+
+    target = Path(args.out) if args.out else default_routes_path()
+    if target.exists() and not args.force:
+        print(
+            f"错误：{target} 已存在（要覆盖请加 --force）。先 ``uv run ar routes show`` 看看现在生效的是哪条链。",
+            file=sys.stderr,
+            flush=True,
+        )
+        return EXIT_USAGE
+    target.write_text(source_text, encoding="utf-8")
+    _say(f"已写入 {target}（{len(routes)} 跳）：" + " → ".join(route.label for route in routes))
+    _say("  这份文件不会自己生效：要么设 AR_ROUTES_FILE=" + str(target) + "，")
+    _say("  要么把里面那几行抄进 config.local.json 的 routes 数组（配置里的 routes 优先级更高）。")
+    _say("  ar serve 只在启动时读配置，改完请重启服务。")
     return EXIT_OK
 
 
@@ -663,11 +850,17 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     _say(f"  数据目录：{Path(args.data_dir)}")
     _say(f"  画像目录：{Path(args.profiles_dir)}（读者 {args.reader}）")
     _say(f"  前端目录：{web_dir}（index.html {'存在' if index_exists else '不存在 —— / 会回写明原因的 404'}）")
-    _say(
-        "  模型："
-        + config.model
-        + ("（已配置）" if config.model_configured else "（未配置：/api/explain 会返回可见降级文案）")
-    )
+    if config.routes:
+        _say(f"  模型：多源回退链 {len(config.routes)} 跳 —— {config.model_label}")
+        for route in config.routes:
+            _key, origin = resolve_api_key(route)
+            _say(f"    · {route.label}：{'密钥 ' + origin if origin else '没有可用密钥（这一跳会被跳过）'}")
+    else:
+        _say(
+            "  模型："
+            + config.model
+            + ("（已配置）" if config.model_configured else "（未配置：/api/explain 会返回可见降级文案）")
+        )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return EXIT_OK
 
@@ -713,6 +906,12 @@ def build_parser() -> argparse.ArgumentParser:
         _add_common_options(sub, in_subcommand=True)
         return sub
 
+    def add_nested(name: str, group: argparse._SubParsersAction, help_text: str) -> argparse.ArgumentParser:
+        """二级子命令：同样挂全局选项（``ar routes show --config x`` 这样写才不报错）。"""
+        sub = group.add_parser(name, help=help_text)
+        _add_common_options(sub, in_subcommand=True)
+        return sub
+
     p_ingest = add_subcommand("ingest", "摄取本地 UTF-8 文本 → source.md + source.meta.json")
     p_ingest.add_argument("path", help="输入文件（Markdown / TXT，UTF-8）")
     p_ingest.add_argument("--id", required=True, help="source_id（同时是 data/<id>/ 目录名）")
@@ -752,6 +951,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--conversation",
         action="store_true",
         help="逐段对话：同一上下文里累积原文与已改内容（必须与 --per-paragraph 一起用，强制串行）",
+    )
+    # 两遍式（plan-v2）：第一遍只打动作标、不写正文；第二遍把计划当固定上下文
+    p_rewrite.add_argument(
+        "--plan-first",
+        dest="plan_first",
+        action="store_true",
+        help="两遍式：先一次调用给全篇每段打动作标（展开 / 压缩 / 保持 / 配图，不写正文），"
+        "再按原模式（分批 / 逐段）照这份计划改写；与 --only / --retry-failed / --from-signals 同用时，"
+        "旧产物里已有计划才复用（读者 / 背景指纹 / 事实锚口径都对得上，0 次打标请求），"
+        "否则重新全篇打标（多一次请求）",
+    )
+    # 逐段对话的上下文瘦身：只改「上一轮塞回 transcript 的东西」
+    p_rewrite.add_argument(
+        "--conversation-digest",
+        dest="conversation_digest",
+        action="store_true",
+        help="逐段对话的上下文瘦身：把上一轮的整段 JSON 换成一行摘要（形如 p001 keep / p002 expand：正文）；"
+        "必须与 --per-paragraph --conversation 一起用",
     )
     p_rewrite.add_argument(
         "--concurrency",
@@ -838,6 +1055,21 @@ def build_parser() -> argparse.ArgumentParser:
         "同时把本次看过的事件 id 写进 profiles/<reader>/feedback.json（幂等水位线）",
     )
     p_feedback.set_defaults(handler=_cmd_feedback)
+
+    p_routes = add_subcommand(
+        "routes",
+        "多源回退链：show 看当前链（各跳密钥来源 / 冷却状态）；import 从 YAML 生成 config.routes.yaml",
+    )
+    routes_sub = p_routes.add_subparsers(dest="routes_command", required=True)
+    p_routes_show = add_nested("show", routes_sub, "打印当前生效的链（密钥只给来源，不给值）")
+    p_routes_show.add_argument("--json", action="store_true", help="输出 JSON（可被 json.loads 解析）")
+    p_routes_show.set_defaults(handler=_cmd_routes_show)
+    p_routes_import = add_nested("import", routes_sub, "把一份 YAML 链片段写成 config.routes.yaml（覆盖前要求 --force）")
+    p_routes_import.add_argument("path", nargs="?", help="YAML 文件；省略 = 用内置默认片段（= 本机 llm-auto 链）")
+    p_routes_import.add_argument("--default", action="store_true", help="使用内置默认片段（与省略 path 等价）")
+    p_routes_import.add_argument("--out", help="输出路径（默认 <项目根>/config.routes.yaml）")
+    p_routes_import.add_argument("--force", action="store_true", help="目标已存在时覆盖")
+    p_routes_import.set_defaults(handler=_cmd_routes_import)
 
     return parser
 

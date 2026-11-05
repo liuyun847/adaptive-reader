@@ -14,6 +14,14 @@
   同一材料内，批间 / 段间共享前缀 = 通用块 + 材料块 + 全文（capital-v1-ch01 实测 9889 字符 / 5364 token），
   首个差异字符仍落在「本次给你第 N 段」的段号位。
   ``{feedback_block}`` 是逐段循环的校验回灌（空串 == 缺省 == 零字符插入），只影响尾巴。
+  ``{plan_section}``（``plan-v1``，两遍式的第一遍计划）紧跟全文块之后、本次段号之前，
+  同样是**空串零字符插入**（见 :func:`_plan_section`）——不带计划的调用方拿到的提示词逐字不变。
+- ``PLAN_USER_TEMPLATE``（``plan-v2``，2026-10-31）：两遍式的**第一遍**——一次调用给全篇每段打动作标，
+  **不写任何正文**。它由**同一段** ``REWRITE_USER_HEAD``（画像 / 背景 / 口径 / JSON 示例 / 规则 /
+  材料行 / 概念 / 配图 / 全文）**加一条打标尾巴**拼成，system 也直接用改写那份：于是两遍之间共享
+  9889 字符（5364 token）前缀，**第一遍建好的缓存能被第二遍第 1 批直接命中**（``plan-v1`` 时两遍的
+  公共前缀是 0 字符）。打标指令与固定判别标记「【动作打标·第一遍】」全部**后置**在尾巴里
+  ——第二遍那条尾巴是计划块 + 本次段，两份提示词的分岔点就在全文块之后。
 - 演进：``v3`` 插 ``{background_block}``；``v4`` 加 ``{illustration_block}`` 与四动作规则；
   ``v5`` 加 ``{fact_anchor_block}`` 与规则 10；``v6`` 加规则 11（``why.profile`` 语义）；
   ``v7`` 重排 + 全文 + 校验反馈槽。每次改提示词都升版本号，**别拿旧版逐字对账**。
@@ -38,6 +46,12 @@ __all__ = [
     "CONCEPTS_PROMPT_VERSION",
     "EXPLAIN_PROMPT_VERSION",
     "REWRITE_PROMPT_VERSION",
+    "PLAN_PROMPT_VERSION",
+    "PLAN_USER_TAIL",
+    "PLAN_USER_TEMPLATE",
+    "build_plan_messages",
+    "REWRITE_USER_HEAD",
+    "REWRITE_USER_TAIL",
     "SURVEY_PROMPT_VERSION",
     "COMPRESS_PROMPT_VERSION",
     "ONESHOT_PROMPT_VERSION",
@@ -99,6 +113,13 @@ EXPLAIN_PROMPT_VERSION = "explain-v2"
 # ④ 规则 1 / 2 / 5 的方位词改「下面」（材料块挪到规则之后），规则 11 去掉写在正文里的版本号。
 # 提示词内容变了，版本号必须跟着升。
 REWRITE_PROMPT_VERSION = "rewrite-v7"
+# plan-v1（2026-10-19）：两遍式改写（``--plan-first``）的**第一遍**——一次调用给全篇每段打动作标，
+# **不写任何正文**；第二遍仍走 ``rewrite-v7``，只是多一格 ``{plan_section}``（空串零字符插入）。
+# 于是 **``rewrite-v7`` 不用升版**：不带计划的提示词逐字未变（有测试钉住），版本变化记在这一格上。
+# plan-v2（2026-10-31）：**让两遍共享同一段前缀**（plan-v1 的公共前缀是 0 字符，打标那一遍拿不到缓存）——
+# 第一遍改成「``REWRITE_USER_HEAD`` + 打标尾巴」、system 与改写那一遍逐字相同，两遍的差异推到全文块之后。
+# 第二遍的提示词**一个字符都没动**（``rewrite-v7`` 因此仍不升版，有测试钉住）。
+PLAN_PROMPT_VERSION = "plan-v2"
 # survey-v1（2026-10-08）：读前背景问卷的「模型追问」提示词（3–5 个细节问题）。
 SURVEY_PROMPT_VERSION = "survey-v1"
 # compress-v1（2026-10-13）：单段压缩提示词（读中「太啰嗦」→ 当场压缩该段，见 PLAN §5）。
@@ -227,7 +248,10 @@ REWRITE_SYSTEM_PROMPT = (
 #: 通用固定块在前、**按材料变的块与本次段落在后**（``rewrite-v7``，前缀缓存）：
 #: 材料行 / 概念清单 / 配图候选 / 全文统一放在规则之后；本次段号、正文与校验反馈仍是最后一块。
 #: 同一材料内批间 / 段间只差最后一块；``{feedback_block}`` 空串时零字符插入。
-REWRITE_USER_TEMPLATE = """读者画像：
+#: **拆分**（``plan-v2``）：``REWRITE_USER_HEAD`` 是两遍式与改写共用的那一段（到全文块结束），
+#: ``REWRITE_USER_TAIL`` 是改写那一遍的尾巴（计划块 + 本次段）。两段相拼与拆分前**逐字相同**，
+#: 所以 ``rewrite-v7`` 一个字都没变（有测试钉住 sha256）——拆开只为让第一遍能复用同一个头做缓存。
+REWRITE_USER_HEAD = """读者画像：
 {profile_block}
 
 读者背景：
@@ -288,11 +312,18 @@ REWRITE_USER_TEMPLATE = """读者画像：
 材料：《{source_id}》，共 {total} 段。
 
 概念清单：
-{concept_block}{illustration_block}{full_text_section}
+{concept_block}{illustration_block}{full_text_section}"""
+
+#: 改写那一遍的尾巴：计划块（``{plan_section}``，空串零字符插入）+ 本次段号 + 本批正文 + 校验反馈。
+#: **两遍式的第一遍不从这一段开始**——它的尾巴是 :data:`PLAN_USER_TAIL`（同一段头的另一种续写）。
+REWRITE_USER_TAIL = """{plan_section}
 
 本次给你第 {start}–{end} 段（下面再给一遍，便于你逐段处理）：
 
 {paragraph_block}{feedback_block}"""
+
+#: 两段相拼 == 拆分前的模板（逐字相同：``rewrite-v7`` 的提示词一个字符都没变，有测试钉住）。
+REWRITE_USER_TEMPLATE = REWRITE_USER_HEAD + REWRITE_USER_TAIL
 
 
 def format_paragraph_block(paragraphs: list[dict[str, Any]]) -> str:
@@ -325,6 +356,23 @@ def _feedback_section(feedback: str) -> str:
     return "\n\n" + text
 
 
+def _plan_section(plan_block: str) -> str:
+    """第一遍的计划块 → 模板里 ``{plan_section}`` 那一格的内容（``plan-v2``，两遍式）。
+
+    **空串（缺省）时零字符插入**：不带计划的调用方（``--plan-first`` 未开）拿到的提示词
+    **逐字不变**（``rewrite-v7`` 因此不用升版，有测试钉住）。非空时返回「一个空行 + 一行标题 + 计划」，
+    位置紧跟全文块、在本次段号之前——同一材料的所有批 / 所有段共享这一块，首个差异字符仍落在段号位。
+    计划块本身由 ``ar.rewrite._plan_block`` 生成（逐字稳定：同一份计划永远得到同一段文本）。
+    """
+    text = (plan_block or "").strip("\n")
+    if not text.strip():
+        return ""
+    return (
+        "\n\n第一遍的动作计划（每行「段 id 动作：一句话依据」；照这份计划执行——"
+        "与计划不一致时，就在该段的 why.note 里写明为什么改主意）：\n" + text
+    )
+
+
 def _illustration_section(illustration_block: str) -> str:
     """配图候选块 → 模板里 ``{illustration_block}`` 那一格的内容。
 
@@ -353,6 +401,7 @@ def build_rewrite_messages(
     fact_anchor_policy: str = DEFAULT_FACT_ANCHOR_POLICY,
     full_text_block: str = "",
     feedback: str = "",
+    plan_block: str = "",
 ) -> list[dict[str, str]]:
     """一段提示词吃一批段落（默认 25 段切成 6 批；逐段循环时每段一批）。
 
@@ -368,6 +417,9 @@ def build_rewrite_messages(
     它排在「按材料变」的那一段里，同一材料的所有批 / 所有段共享；缺省（老调用方）时零字符插入。
     ``feedback``（``rewrite-v7``）是逐段循环的校验回灌：**只追加在最后**，空串零字符插入，
     因此不会破坏前缀缓存。
+    ``plan_block``（``plan-v2``，两遍式的第一遍计划，``ar.rewrite._plan_block`` 的产物）:
+    它排在全文块之后、本次段号之前（同一材料的所有批共享），**空串（缺省）时零字符插入**——
+    于是 ``--plan-first`` 未开时的提示词与加这一格之前**逐字相同**（``rewrite-v7`` 不用升版）。
     **本次段号与本批正文排在 user 消息末尾**；通用块 / 材料块 / 全文都在它们之前，
     改布局前先读模块文档的「前缀缓存纪律」。
     """
@@ -382,6 +434,7 @@ def build_rewrite_messages(
                 concept_block=concept_block,
                 illustration_block=_illustration_section(illustration_block),
                 full_text_section=_full_text_section(full_text_block),
+                plan_section=_plan_section(plan_block),
                 source_id=source_id,
                 total=total,
                 start=start,
@@ -390,6 +443,91 @@ def build_rewrite_messages(
                 feedback_block=_feedback_section(feedback),
             ),
         },
+    ]
+
+
+# ------------------------------------------------- 两遍式改写的第一遍（plan-v2） --
+# 「先打标、再改写」：第一遍**只要动作**（一段一条，不写正文），第二遍把这计划放进固定上下文
+# 照它改写——不写正文时没有「别把原文改坏」的压力，动作决定因此更敢下手（``--plan-first``）。
+#
+# ``plan-v2``（2026-10-31）：``plan-v1`` 的两遍之间**一个字符的公共前缀都没有**（system 不同、user 首字符
+# 就分岔），打标那一遍的 prompt token 拿不到第二遍的缓存折扣。现在改成「**同一个头 + 各自的尾巴**」：
+#   第一遍 = ``REWRITE_USER_HEAD`` + ``PLAN_USER_TAIL``（打标指令 / 示例 / 5 条规则，全部后置）
+#   第二遍 = ``REWRITE_USER_HEAD`` + ``REWRITE_USER_TAIL``（计划块 + 本次段）
+# system 两遍都用 :data:`REWRITE_SYSTEM_PROMPT`。于是两遍共享 9889 字符（5364 token）前缀，
+# **第一遍建好的缓存能被第二遍第 1 批直接命中**（本机网关门槛约 2048 token，见 README §8 第 14 条）。
+# 代价：第一遍要多背 rewrite 的 JSON 示例与 11 条规则——那正是它要共用的那段前缀，仍只全价买一次。
+#
+# ⚠ 头里那 11 条规则与 JSON 示例是**改写**那一遍的口径（要求正文、申报、why.profile）。打标尾巴必须
+# 明确声明「规则 3／10／11 这一轮不适用、输出形状以本节为准」，否则模型会照着示例吐 decisions。
+
+#: 打标那一遍的尾巴（``plan-v2``）：**固定判别标记** + 打标指令 + plan 的 JSON 示例 + 5 条规则。
+#: 全部**后置**在共享头之后——「会变的排最后」是前缀缓存的前提，两遍的差异就在全文块之后这一截。
+PLAN_USER_TAIL = """
+
+【动作打标·第一遍】这一遍只判断动作，**一个字正文都不要写**：上面那份「请输出这样的 JSON」与
+规则 3／10／11（正文、事实锚申报、why.profile）**这一轮都不适用**；本轮的输出形状以本节为准。
+
+请输出这样的 JSON：
+{{"plan":[{{"paragraph":"p001","action":"keep","note":"这一段读者没有生词"}},{{"paragraph":"p002","action":"expand","note":"读者没有 c03 的自评，前置概念要补"}}]}}
+
+规则：
+1. plan 必须**逐段一条**，段 id 与顺序和原文完全一致；不许新增段、合并段、拆分段、遗漏段。
+2. action 只能取 expand / compress / keep / illustrate 四个值之一，判据与改写时相同：
+   - expand：读者对这一段涉及的概念生疏（unknown / partial）或前置概念未掌握，要补一两句讲解；
+   - compress：这一段没有新信息、只是把同一件事翻来覆去说时，删掉冗余、说得更短；
+   - keep：其余情况一律保住原文（**拿不准就 keep**）；
+   - illustrate：只有「图比文字省力」（流程 / 结构 / 对比 / 数量）时才用。
+3. **这一遍不写正文**：不要给 rewrite、不要给 figure、不要复述或照抄原文的长句——段落原文只用来判断。
+4. note 是一句话依据（说清是读者画像、读者背景还是概念清单里的哪一点），不许留空。
+5. 只输出这个 JSON 对象，不要写「说明」「依据汇总」之类的额外内容。"""
+
+#: 第一遍的 user 消息 = **改写那份的公共头** + 打标尾巴（``plan-v2``）。
+#: ⚠ 「【动作打标·第一遍】」是**固定判别标记**：假客户端 / 用例靠它把两种提示词分流
+#: （它在尾巴里，不在开头——开头必须与第二遍逐字相同）。
+PLAN_USER_TEMPLATE = REWRITE_USER_HEAD + PLAN_USER_TAIL
+
+
+def build_plan_messages(
+    source_id: str,
+    paragraphs: list[dict[str, Any]],
+    *,
+    profile_block: str,
+    concept_block: str,
+    background_block: str | None = None,
+    illustration_block: str = "",
+    total: int | None = None,
+    fact_anchor_policy: str = DEFAULT_FACT_ANCHOR_POLICY,
+    full_text_block: str | None = None,
+) -> list[dict[str, str]]:
+    """两遍式的第一遍（``plan-v2``）：一次调用给全篇每段打动作标，**不要正文**。
+
+    提示词 = 改写那份 user 消息的**公共头**（``REWRITE_USER_HEAD``：画像 / 背景 / 事实锚口径 /
+    JSON 示例 / 规则 / 材料行 / 概念清单 / 配图候选 / 全文）+ ``PLAN_USER_TAIL``（打标指令与规则）；
+    system 也用 :data:`REWRITE_SYSTEM_PROMPT`。**两遍共享前缀是这套排版的全部意义**：
+    第一遍建立的缓存能被第二遍第 1 批命中（``plan-v1`` 时公共前缀 0 字符，打标的钱全价）。
+    与 :func:`build_rewrite_messages` 的差别只有一处：第二遍在头之后接的是计划块 + 本次段。
+
+    ``full_text_block`` 为 ``None``（老调用方）时按 ``paragraphs`` 自己拼（与改写那边给的逐字相同）；
+    显式给空串表示「这一份就是没有全文」（那一格零字符插入），与改写那一遍同一口径。
+    其余入参与改写一致：``background_block`` 缺省写「未提供」、``illustration_block`` 空块零字符插入、
+    ``fact_anchor_policy`` 不认识就按严口径写 —— 同一读者、同一份材料的两次打标必得**逐字相同**的提示词。
+    """
+    count = len(paragraphs) if total is None else int(total)
+    text = format_paragraph_block(paragraphs) if full_text_block is None else full_text_block
+    head = REWRITE_USER_HEAD.format(
+        profile_block=profile_block,
+        background_block=background_block or EMPTY_BACKGROUND_SKETCH,
+        fact_anchor_block=fact_anchor_block(fact_anchor_policy),
+        concept_block=concept_block,
+        illustration_block=_illustration_section(illustration_block),
+        full_text_section=_full_text_section(text),
+        source_id=source_id,
+        total=count,
+    )
+    return [
+        {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+        {"role": "user", "content": head + PLAN_USER_TAIL},
     ]
 
 

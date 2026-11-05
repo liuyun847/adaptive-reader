@@ -32,7 +32,7 @@ from ar.errors import EXIT_MODEL_PARTIAL, EXIT_NOT_IMPLEMENTED, EXIT_OK, EXIT_US
 from ar.fidelity import extract_books, extract_numbers, extract_quotes, split_rewritten_blocks
 from ar.ingest import ingest
 from ar.llm import LlmFailure, LlmRequest, LlmResult, RetryPolicy
-from ar.prompts import build_rewrite_messages
+from ar.prompts import PLAN_PROMPT_VERSION, build_rewrite_messages
 from ar.rewrite import (
     ACTIONS,
     DEFAULT_MODE,
@@ -42,7 +42,10 @@ from ar.rewrite import (
     Decision,
     MergeBase,
     ParagraphUpdate,
+    PlanEntry,
     RerunTargets,
+    _plan_block,
+    _reuse_plan,
     check_fidelity,
     fidelity_problems,
     load_merge_base,
@@ -1971,6 +1974,42 @@ def test_rerun_appends_one_history_entry_per_run(dirs: SimpleNamespace, fake_cha
     assert [item["paragraphs"] for item in meta["rerun_history"]] == [["p002"], ["p003"]]
     assert meta["rerun"]["paragraphs"] == ["p003"], "meta.rerun 记的是最近一次"
 
+def test_rerun_keeps_the_scheduling_fields_in_the_merged_meta(
+    dirs: SimpleNamespace, fake_chat_client
+) -> None:
+    """``planning_mode`` / ``concurrency`` / ``validation_retries`` 不许被局部重跑抹掉（复核第 9 条）。
+
+    这三格原先在合并器重建 meta 时整体消失，实验产物因此判读不出「这一篇是逐段跑出来的」。
+    """
+    doc = write_fake_doc(dirs)
+    run_rewrite(
+        "fake-doc",
+        dirs.data,
+        dirs.profiles,
+        "local-default",
+        fake_chat_client(handler=fake_handler_for(doc)),
+        per_paragraph=True,
+        concurrency=1,
+        validation_retries=2,
+    )
+    targets = resolve_rerun_targets("fake-doc", dirs.data, dirs.profiles, "local-default", only="p002")
+    run_rewrite(
+        "fake-doc",
+        dirs.data,
+        dirs.profiles,
+        "local-default",
+        fake_chat_client(handler=fake_handler_for(doc)),
+        targets=targets,
+        per_paragraph=True,
+        concurrency=1,
+        validation_retries=2,
+    )
+    for name in ("decisions.json", "changes.json"):
+        meta = _read_payload(dirs, name)["meta"]
+        assert meta["planning_mode"] == "per-paragraph", name
+        assert meta["concurrency"] == 1, name
+        assert meta["validation_retries"] == 2, name
+
 
 def test_merge_artifacts_replaces_one_paragraph_in_place(
     dirs: SimpleNamespace, fake_chat_client
@@ -2516,3 +2555,658 @@ def test_conversation_retry_keeps_the_bad_answer_and_feedback_in_context(fake_ch
     assert second[-1]["role"] == "user" and "【校验反馈" in second[-1]["content"]
     assert decisions[0].action == "expand" and "1696" in decisions[0].rewrite
     assert meta["retry_account"]["requests"] == 2
+
+# ------------------------------------------ 两遍式（--plan-first，plan-v1） --
+#: 第一遍打标的**固定判别标记**（``ar.prompts.PLAN_USER_TAIL`` 的首行，plan-v2 起它**在尾巴里**）：
+#: 第一遍的提示词没有 rewrite 的「本次给你第 N–M 段」分隔线，所以假客户端只能靠它分流——
+#: 不分流的话，第一遍全文块里的 25 个 id 会被误当成「本批要处理的段」。
+PLAN_MARK = "【动作打标·第一遍】"
+#: 计划块插进第二遍提示词的**整段**（含它自己的空行与标题）——逐字写死在用例里，
+#: 改提示词布局必须同步改这里（照 ``ILLUSTRATION_SECTION`` 的先例）。
+PLAN_SECTION = (
+    "\n\n第一遍的动作计划（每行「段 id 动作：一句话依据」；照这份计划执行——"
+    "与计划不一致时，就在该段的 why.note 里写明为什么改主意）：\np001 keep"
+)
+
+
+def is_plan_prompt(prompt: str) -> bool:
+    """这份提示词是第一遍打标吗（靠固定判别标记分流）。"""
+    return PLAN_MARK in prompt
+
+
+def plan_prompt_ids(prompt: str) -> list[str]:
+    """第一遍提示词里的段 id（它一次吃全篇，全文块就是唯一来源）。"""
+    return PROMPT_PARAGRAPH_RE.findall(prompt)
+
+
+def plan_handler(
+    actions: dict[str, str] | None = None,
+    *,
+    missing: tuple[str, ...] = (),
+    note: str = "假计划依据",
+):
+    """第一遍的假模型：全篇每段一条动作；``missing`` 里的段**故意不给**（考 plan_missing）。"""
+
+    def handler(prompt: str) -> str:
+        table = dict(actions or {})
+        skipped = set(missing)
+        plan = [
+            {"paragraph": pid, "action": table.get(pid, "keep"), "note": f"{pid} {note}"}
+            for pid in plan_prompt_ids(prompt)
+            if pid not in skipped
+        ]
+        return json.dumps({"plan": plan}, ensure_ascii=False)
+
+    return handler
+
+
+def two_pass_handler(plan, rewrite_handler):
+    """按判别标记分流：第一遍拿 prompt，第二遍拿 messages（两种提示词各自的老写法都不变）。"""
+
+    def handler(messages: list[dict[str, str]]) -> str:
+        prompt = messages[-1]["content"]
+        if is_plan_prompt(prompt):
+            return plan(prompt)
+        return rewrite_handler(messages)
+
+    return handler
+
+
+def test_plan_first_labels_every_paragraph_without_writing_any_prose(
+    fake_chat_client, dirs: SimpleNamespace
+) -> None:
+    """第一遍：**一次调用**、每段一条动作、**不写任何正文**；``meta.plan_first`` 为 true。
+
+    ``plan_action`` 只在计划动作与最终动作**不同**时出现在 ``changes[i]`` 上（为真才出现）。
+    """
+    write_fake_doc(dirs)
+    doc = build_doc(FAKE_SOURCE)
+    plan_prompts: list[str] = []
+
+    def plan(prompt: str) -> str:
+        plan_prompts.append(prompt)
+        return plan_handler()(prompt)
+
+    client = fake_chat_client(handler=two_pass_handler(plan, fake_handler_for(doc)))
+    outcome = run_rewrite(
+        "fake-doc", dirs.data, dirs.profiles, "local-default", client, plan_first=True
+    )
+
+    # ① 第一遍只发一次，吃的是全篇；它的输出里只有动作（没有任何正文）
+    assert len(plan_prompts) == 1, "第一遍只该发一次请求"
+    assert plan_prompt_ids(plan_prompts[0]) == [p["id"] for p in doc["paragraphs"]]
+    payload = json.loads(outcome.decisions_path.read_text(encoding="utf-8"))
+    meta = payload["meta"]
+    assert meta["plan_first"] is True
+    assert [item["paragraph"] for item in meta["plan"]] == [p["id"] for p in doc["paragraphs"]]
+    assert all(set(item) == {"paragraph", "action", "note"} for item in meta["plan"]), "计划里不许有正文"
+    assert meta["plan_prompt_version"] == PLAN_PROMPT_VERSION == "plan-v2"
+    assert meta["plan_request_count"] == 1
+    assert meta["plan_missing"] == []
+    assert meta["unplanned_paragraphs"] == []
+    assert outcome.plan_first is True and len(outcome.plan) == len(doc["paragraphs"])
+
+    # ② 计划进了第二遍的固定上下文（同一份计划文本，逐字稳定）
+    second_pass = [call for call in client.calls if not is_plan_prompt(call[-1]["content"])]
+    assert second_pass, "第二遍的请求没有发出去"
+    assert "第一遍的动作计划" in second_pass[0][-1]["content"]
+
+    # ③ 计划与执行不一致的段才写 plan_action：p005 计划 keep、执行 expand
+    changes = json.loads(outcome.changes_path.read_text(encoding="utf-8"))["changes"]
+    by_id = {item["paragraph"]: item for item in changes}
+    assert by_id["p005"]["action"] == "expand" and by_id["p005"]["plan_action"] == "keep"
+    assert "plan_action" not in by_id["p001"], "计划与执行一致时不该多出这个键"
+
+
+def test_plan_block_sits_in_the_shared_prefix_and_the_first_diff_stays_at_the_batch_header() -> None:
+    """计划块落在第二批共享前缀里；两批的**首个差异字符仍然在段号位**（前缀缓存的前提）。"""
+    doc = build_doc(FAKE_SOURCE)
+    paragraphs = doc["paragraphs"]
+    blocks = {
+        "profile_block": "读者 tester 自报概念状态：c01=unknown",
+        "concept_block": "c01 假概念（难度 3）",
+        "full_text_block": REALISTIC_FULL_TEXT,
+    }
+    plan_block = "p001 keep：读者熟悉\np002 expand：补前置概念"
+    user_a = _rewrite_user_contents(paragraphs, paragraphs[:3], 1, 3, plan_block=plan_block, **blocks)[1]
+    user_b = _rewrite_user_contents(
+        paragraphs, paragraphs[3:], 4, len(paragraphs), plan_block=plan_block, **blocks
+    )[1]
+
+    # 顺序：规则 < 全文 < 计划 < 本次段号（计划是共享前缀的一部分，不是变化块）
+    assert user_a.count("第一遍的动作计划") == 1
+    assert plan_block in user_a
+    assert user_a.index("规则：") < user_a.index("原文（全文")
+    assert user_a.index("原文（全文") < user_a.index("第一遍的动作计划") < user_a.index("本次给你第 1–3 段")
+
+    first_diff = next(index for index, (left, right) in enumerate(zip(user_a, user_b)) if left != right)
+    assert user_a[first_diff] == "1" and user_b[first_diff] == "4"
+    assert user_a[first_diff - len("本次给你第 "):first_diff] == "本次给你第 "
+    assert first_diff > user_a.index(plan_block), "计划块也该落在共享前缀里"
+
+
+def test_empty_plan_block_adds_no_characters_and_keeps_the_prompt_verbatim() -> None:
+    """``plan_block`` 为空（或缺省）时提示词**逐字不变**：``rewrite-v7`` 因此不用升版。
+
+    照「空块零字符插入」的先例：空串 == 缺省；有块与无块的差异**只在那一格**。
+    """
+    base = _rewrite_user(full_text_block="[p001] 甲")
+    assert _rewrite_user(full_text_block="[p001] 甲", plan_block="") == base, "空块与不传形参必须逐字相同"
+    assert "第一遍的动作计划" not in base
+
+    with_plan = _rewrite_user(full_text_block="[p001] 甲", plan_block="p001 keep")
+    assert with_plan.count(PLAN_SECTION) == 1
+    assert with_plan.replace(PLAN_SECTION, "") == base, "计划块不是「只在那一格插入」——别处也被改了"
+    # 逐字稳定：同参数两次渲染完全相同，且不含时间戳 / 随机量
+    assert _rewrite_user(full_text_block="[p001] 甲", plan_block="p001 keep") == with_plan
+    assert "generated_at" not in with_plan
+
+def test_plan_block_flattens_each_note_onto_one_line() -> None:
+    """计划块的格式契约：**一行一段**「段 id 动作：依据」——note 里的换行不许把这个块劈开。
+
+    否则第二遍的模型会把多行依据的后半截当成另一段的计划（复核第 8 条）。
+    """
+    entries = [
+        PlanEntry("p001", "expand", "第一行\n第二行"),
+        PlanEntry("p002", "keep", "  多个   空格\t制表  "),
+        PlanEntry("p003", "compress", ""),
+    ]
+    block = _plan_block(entries)
+    assert block == "p001 expand：第一行 第二行\np002 keep：多个 空格 制表\np003 compress"
+    assert len(block.splitlines()) == 3, "一段一行，换行 / 连续空白都被压平"
+
+
+def test_illegal_plan_action_falls_back_to_keep_and_says_so(
+    fake_chat_client, dirs: SimpleNamespace
+) -> None:
+    """计划里的越界动作（``frobnicate``）按 keep 处理，并留下**可见降级**；条目一个不丢。"""
+    write_fake_doc(dirs)
+    doc = build_doc(FAKE_SOURCE)
+
+    def plan(prompt: str) -> str:
+        return json.dumps(
+            {
+                "plan": [
+                    {
+                        "paragraph": pid,
+                        "action": "frobnicate" if pid == "p001" else "keep",
+                        "note": f"{pid} 假依据",
+                    }
+                    for pid in plan_prompt_ids(prompt)
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    client = fake_chat_client(handler=two_pass_handler(plan, fake_handler_for(doc)))
+    outcome = run_rewrite(
+        "fake-doc", dirs.data, dirs.profiles, "local-default", client, plan_first=True
+    )
+
+    meta = json.loads(outcome.decisions_path.read_text(encoding="utf-8"))["meta"]
+    by_id = {item["paragraph"]: item for item in meta["plan"]}
+    assert by_id["p001"]["action"] == "keep", "越界动作必须回落 keep"
+    assert len(meta["plan"]) == len(doc["paragraphs"]), "降级只改动作，条目不许丢"
+    assert any("p001" in note and "frobnicate" in note for note in meta["degraded"]), meta["degraded"]
+    # 计划里记的是 keep ⇒ 与最终动作一致时不写 plan_action（越界取值不会漏进产物）
+    changes = json.loads(outcome.changes_path.read_text(encoding="utf-8"))["changes"]
+    assert "plan_action" not in changes[0]
+
+
+def test_plan_missing_is_not_unplanned_and_keeps_the_exit_code(
+    run_cli, rewrite_env: SimpleNamespace, fake_chat_client, sample_fake_handler
+) -> None:
+    """第一遍漏段只进 ``meta.plan_missing``：**不算 unplanned、不改退出码**（CLI 仍 0）。"""
+    plan_prompts: list[str] = []
+
+    def plan(prompt: str) -> str:
+        plan_prompts.append(prompt)
+        ids = plan_prompt_ids(prompt)
+        assert ids, "第一遍的提示词里应该有全篇段 id"
+        return plan_handler(missing=(ids[-1],))(prompt)
+
+    client = fake_chat_client(handler=two_pass_handler(plan, sample_fake_handler))
+    code, output = run_cli_with_fake(
+        run_cli, rewrite_env, client, "rewrite", "sample", "--reader", "local-default", "--plan-first"
+    )
+
+    assert code == EXIT_OK, output
+    assert len(plan_prompts) == 1
+    meta = json.loads((rewrite_env.target / "decisions.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["plan_missing"], "漏掉的那一段要看得见"
+    missing = meta["plan_missing"][0]
+    assert missing not in meta["unplanned_paragraphs"], "plan_missing 不是 unplanned（否则会误报退出码 6）"
+    assert meta["rewrite_incomplete"] is False
+    assert meta["plan_first"] is True
+    # 命令行：正常「改写完成」+ 一条点名漏段的告警，不是「改写不完整」
+    assert "改写不完整" not in output
+    assert "第一遍打标：" in output, output
+    assert missing in output
+
+
+def test_plan_first_rerun_with_only_reuses_the_stored_plan(
+    run_cli, rewrite_env: SimpleNamespace, fake_chat_client, sample_fake_handler
+) -> None:
+    """``--plan-first --only`` 重跑**复用旧产物里的计划**：不新增第一遍调用，计划原样保留。"""
+    plan_prompts: list[str] = []
+
+    def plan(prompt: str) -> str:
+        plan_prompts.append(prompt)
+        return plan_handler()(prompt)
+
+    client = fake_chat_client(handler=two_pass_handler(plan, sample_fake_handler))
+    code, output = run_cli_with_fake(
+        run_cli, rewrite_env, client, "rewrite", "sample", "--reader", "local-default", "--plan-first"
+    )
+    assert code == EXIT_OK, output
+    assert len(plan_prompts) == 1
+    # 命令行摘要的形状：「第一遍打标：N 段（展开 x / 压缩 y / 保持 z）；1 次请求」
+    assert re.search(r"第一遍打标：\d+ 段（[^）]*）；1 次请求", output), output
+    target = rewrite_env.target
+    first_meta = json.loads((target / "decisions.json").read_text(encoding="utf-8"))["meta"]
+    assert first_meta["plan"], "第一遍的计划应该落进产物"
+    first_plan = first_meta["plan"]
+
+    code, output = run_cli_with_fake(
+        run_cli,
+        rewrite_env,
+        client,
+        "rewrite",
+        "sample",
+        "--reader",
+        "local-default",
+        "--plan-first",
+        "--only",
+        "p002",
+    )
+    assert code == EXIT_OK, output
+    assert len(plan_prompts) == 1, "局部重跑不许重新打标（复用旧产物里的计划）"
+    meta = json.loads((target / "decisions.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["plan"] == first_plan, "复用之后计划必须原样保留"
+    assert meta["plan_first"] is True
+    assert any("复用既有产物里第一遍的计划" in note for note in meta["degraded"]), meta["degraded"]
+
+def test_plan_first_rerun_without_the_flag_still_injects_the_stored_plan(
+    dirs: SimpleNamespace, fake_chat_client
+) -> None:
+    """不带 ``--plan-first`` 的局部重跑：**旧产物有计划就照旧注入**，绝不静默降级成单遍。
+
+    现场（2026-10-19 复核第 1 条）：先 ``--plan-first`` 整篇跑，再不带该 flag 跑 ``--only``，
+    目标段会被单遍改写（``changes`` 里连 ``plan_action`` 都不出现），而 ``meta.plan_first`` /
+    ``meta.plan`` 原样保留 ⇒ 产物看起来「按计划跑且计划与执行一致」，降级里一个字都没有。
+    口径是**一致性优先**：同一份产物始终按同一份计划执行。
+    """
+    doc = write_fake_doc(dirs)
+    plan_prompts: list[str] = []
+
+    def plan(prompt: str) -> str:
+        plan_prompts.append(prompt)
+        return plan_handler()(prompt)
+
+    first = fake_chat_client(handler=two_pass_handler(plan, fake_handler_for(doc)))
+    run_rewrite("fake-doc", dirs.data, dirs.profiles, "local-default", first, plan_first=True)
+    stored = _read_payload(dirs, "decisions.json")["meta"]["plan"]
+    assert len(plan_prompts) == 1
+
+    client = fake_chat_client(handler=fake_handler_for(doc))
+    targets = resolve_rerun_targets("fake-doc", dirs.data, dirs.profiles, "local-default", only="p002")
+    outcome = run_rewrite("fake-doc", dirs.data, dirs.profiles, "local-default", client, targets=targets)
+
+    # ① 一次打标请求都不发；目标段那一批照旧带着旧计划（p002 的计划行逐字在提示词里）
+    assert len(plan_prompts) == 1, "不带 flag 的局部重跑也不许重新打标"
+    assert len(client.calls) == 1
+    prompt = client.calls[0][-1]["content"]
+    assert "第一遍的动作计划" in prompt
+    assert "p002 keep：p002 假计划依据" in prompt, prompt
+
+    # ② 产物里那份计划没变，并且**说得清**这一轮复用了它（plan_reused = true、没有降级痕迹）
+    meta = _read_payload(dirs, "decisions.json")["meta"]
+    assert meta["plan"] == stored
+    assert meta["plan_first"] is True and meta["plan_reused"] is True
+    assert "plan_not_applied" not in meta
+    assert outcome.plan_reused is True and outcome.plan_not_applied == []
+    assert any("沿用既有产物里第一遍的计划" in note for note in meta["degraded"]), meta["degraded"]
+
+
+def test_plan_not_applied_is_named_in_meta_and_on_the_command_line(
+    run_cli, rewrite_env: SimpleNamespace, fake_chat_client, sample_fake_handler
+) -> None:
+    """旧计划里没有「这次重跑的那一段」时**不静默**：``meta.plan_not_applied`` + 命令行点名。
+
+    同时钉住记账口径（复核第 4 条）：复用旧计划的重跑要写「0 次请求」，不许照抄旧产物那次。
+    """
+    plan_prompts: list[str] = []
+
+    def plan(prompt: str) -> str:
+        plan_prompts.append(prompt)
+        return plan_handler(missing=("p002",))(prompt)
+
+    client = fake_chat_client(handler=two_pass_handler(plan, sample_fake_handler))
+    code, output = run_cli_with_fake(
+        run_cli, rewrite_env, client, "rewrite", "sample", "--reader", "local-default", "--plan-first"
+    )
+    assert code == EXIT_OK, output
+    assert len(plan_prompts) == 1
+    first_meta = json.loads((rewrite_env.target / "decisions.json").read_text(encoding="utf-8"))["meta"]
+    assert first_meta["plan_missing"] == ["p002"], "这一段本来就没有计划条目（考的是无法注入那一档）"
+
+    code, output = run_cli_with_fake(
+        run_cli,
+        rewrite_env,
+        client,
+        "rewrite",
+        "sample",
+        "--reader",
+        "local-default",
+        "--plan-first",
+        "--only",
+        "p002",
+    )
+    assert code == EXIT_OK, output
+    assert len(plan_prompts) == 1, "复用旧计划的重跑不许重新打标"
+    # 记账按**实际请求数**打：0 次打标请求
+    assert "复用旧计划，0 次请求" in output, output
+    meta = json.loads((rewrite_env.target / "decisions.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["plan_not_applied"] == ["p002"], meta.get("plan_not_applied")
+    assert meta["plan_reused"] is True
+    assert any("没有可注入的计划" in note for note in meta["degraded"]), meta["degraded"]
+    assert "没能注入既有计划" in output, output
+
+    # 再跑一段，这次**不带** --plan-first：旧计划里有 p001 ⇒ 照旧注入，命令行也说得清；
+    # 上一轮「p002 注入不了」的点名必须被清掉（不许留成假账）
+    code, output = run_cli_with_fake(
+        run_cli, rewrite_env, client, "rewrite", "sample", "--reader", "local-default", "--only", "p001"
+    )
+    assert code == EXIT_OK, output
+    assert "沿用既有产物里第一遍的计划照旧注入第二遍" in output, output
+    meta = json.loads((rewrite_env.target / "decisions.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["plan_reused"] is True
+    assert "plan_not_applied" not in meta, "这一轮的目标段在旧计划里有条目 ⇒ 上一轮的点名要清掉"
+
+
+def test_reuse_plan_refuses_when_the_reader_background_or_policy_differs(
+    dirs: SimpleNamespace,
+) -> None:
+    """读者 / 背景指纹 / 事实锚口径任一对不上：**不复用**旧计划（复核第 2 条）。
+
+    否则产物会写成「B 读者的 reader + A 读者的 plan」——错的东西看起来是对的，比多打一次标贵得多。
+    """
+    base = MergeBase(
+        source_paragraphs=[{"id": "p001", "text": "甲"}],
+        decisions_payload={
+            "decisions": [],
+            "meta": {
+                "plan_first": True,
+                "reader": "reader-a",
+                "background_fingerprint": "aaaa1111",
+                "fact_anchor_policy": "keep_all",
+                "plan": [{"paragraph": "p001", "action": "expand", "note": "A 的依据"}],
+                "plan_missing": [],
+            },
+        },
+        changes_payload={"changes": []},
+        blocks=["甲"],
+        target=dirs.data / "fake-doc",
+    )
+    same = _reuse_plan(
+        base, reader="reader-a", background_fingerprint="aaaa1111", fact_anchor_policy="keep_all"
+    )
+    assert same is not None and same.ok, "三项都对得上时才复用"
+    assert [entry.paragraph for entry in same.entries] == ["p001"]
+
+    for label, kwargs in (
+        ("读者", {"reader": "reader-b"}),
+        ("背景", {"background_fingerprint": "bbbb2222"}),
+        ("事实锚", {"fact_anchor_policy": "allow_declared_drops"}),
+    ):
+        params = {"reader": "reader-a", "background_fingerprint": "aaaa1111", "fact_anchor_policy": "keep_all"}
+        params.update(kwargs)
+        reuse = _reuse_plan(base, **params)
+        assert reuse is not None and not reuse.ok, label
+        assert label in reuse.reason, reuse.reason
+
+
+def test_switch_reader_rerun_retags_instead_of_reusing_the_old_plan(
+    dirs: SimpleNamespace, fake_chat_client
+) -> None:
+    """换读者后 ``--plan-first --only`` **重新全篇打标**，并把 ``plan_reused=False`` 写进产物。"""
+    doc = write_fake_doc(dirs)
+    plan_prompts: list[str] = []
+
+    def plan(prompt: str) -> str:
+        plan_prompts.append(prompt)
+        return plan_handler()(prompt)
+
+    first = fake_chat_client(handler=two_pass_handler(plan, fake_handler_for(doc)))
+    run_rewrite("fake-doc", dirs.data, dirs.profiles, "local-default", first, plan_first=True)
+    assert len(plan_prompts) == 1
+
+    # 两次都得用「按判别标记分流」的假客户端——否则打标请求也会被当成改写请求，计数失真
+    client = fake_chat_client(handler=two_pass_handler(plan, fake_handler_for(doc)))
+    targets = resolve_rerun_targets("fake-doc", dirs.data, dirs.profiles, "reader-b", only="p002")
+    run_rewrite(
+        "fake-doc",
+        dirs.data,
+        dirs.profiles,
+        "reader-b",
+        client,
+        targets=targets,
+        plan_first=True,
+    )
+
+    assert len(plan_prompts) == 2, "读者换了就不能沿用旧计划——必须重新全篇打标（多一次请求）"
+    meta = _read_payload(dirs, "decisions.json")["meta"]
+    assert meta["reader"] == "reader-b"
+    assert meta["plan_reused"] is False
+    assert any(
+        "不复用" in note and "读者" in note for note in meta["degraded"]
+    ), meta["degraded"]
+
+
+def test_reuse_plan_degrades_out_of_range_actions_visibly(dirs: SimpleNamespace) -> None:
+    """复用路径的越界动作同样**可见降级**（不许静默改成 keep；与 ``_parse_plan`` 同口径）。"""
+    base = MergeBase(
+        source_paragraphs=[{"id": "p001", "text": "甲"}],
+        decisions_payload={
+            "decisions": [],
+            "meta": {
+                "plan_first": True,
+                "reader": "local-default",
+                "background_fingerprint": "",
+                "fact_anchor_policy": "keep_all",
+                "plan": [{"paragraph": "p001", "action": "frobnicate", "note": "旧依据"}],
+                "plan_missing": [],
+            },
+        },
+        changes_payload={"changes": []},
+        blocks=["甲"],
+        target=dirs.data / "fake-doc",
+    )
+    reuse = _reuse_plan(
+        base, reader="local-default", background_fingerprint="", fact_anchor_policy="keep_all"
+    )
+    assert reuse is not None and reuse.ok
+    assert reuse.entries[0].action == "keep", "越界动作仍按 keep 处理"
+    assert any("frobnicate" in note and "p001" in note for note in reuse.notes), reuse.notes
+
+
+def test_default_run_adds_no_plan_or_digest_keys_and_no_extra_request(
+    fake_chat_client, dirs: SimpleNamespace
+) -> None:
+    """默认路径（不带新开关）：**不新增请求**、产物不多出任何一个键（``plan_action`` 也不出现）。"""
+    write_fake_doc(dirs)
+    doc = build_doc(FAKE_SOURCE)
+    client = fake_chat_client(handler=fake_handler_for(doc))
+    outcome = run_rewrite("fake-doc", dirs.data, dirs.profiles, "local-default", client)
+
+    new_keys = (
+        "plan_first",
+        "plan",
+        "plan_missing",
+        "plan_usage",
+        "plan_request_count",
+        "plan_attempts",
+        "plan_retry_account",
+        "plan_prompt_version",
+        "conversation_digest",
+    )
+    decisions_payload = json.loads(outcome.decisions_path.read_text(encoding="utf-8"))
+    changes_payload = json.loads(outcome.changes_path.read_text(encoding="utf-8"))
+    for key in new_keys:
+        assert key not in decisions_payload["meta"], key
+        assert key not in changes_payload["meta"], key
+    assert all("plan_action" not in item for item in changes_payload["changes"])
+    assert all(not is_plan_prompt(call[-1]["content"]) for call in client.calls), "默认路径不许发第一遍的请求"
+    assert outcome.plan_first is False and outcome.conversation_digest is False
+
+
+# ------------------------------------- 逐段对话的上下文瘦身（--conversation-digest） --
+def test_conversation_digest_keeps_the_shell_out_of_the_transcript(fake_chat_client) -> None:
+    """开：上下文里只有一行摘要（没有 why / confidence 外壳）；关：与现状逐字一致。"""
+    doc = build_doc(FAKE_SOURCE)
+    calls: dict[str, list[list[dict[str, str]]]] = {"on": [], "off": []}
+
+    def handler_factory(key: str):
+        def handler(messages: list[dict[str, str]]) -> str:
+            calls[key].append([dict(message) for message in messages])
+            pid = prompt_ids(messages[-1]["content"])[0]
+            action = "expand" if pid == "p002" else "keep"
+            return json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "paragraph": pid,
+                            "action": action,
+                            "why": {"profile": ["c01:unknown"], "note": "对话假依据"},
+                            "confidence": 0.8,
+                            "rewrite": "第二段补一句解释。" if action == "expand" else "",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+
+        return handler
+
+    _d, _g, meta_on = planDecisions(
+        doc,
+        None,
+        {"reader": "tester"},
+        fake_chat_client(handler=handler_factory("on")),
+        source_id="fake-doc",
+        per_paragraph=True,
+        conversation=True,
+        concurrency=1,
+        validation_retries=0,
+        conversation_digest=True,
+    )
+    assert meta_on["conversation_digest"] is True
+    # 第 2 轮：system + 初始 user + 上一轮 assistant（摘要）+ 本轮 user
+    first_turn = calls["on"][1][2]
+    assert first_turn["role"] == "assistant"
+    assert first_turn["content"] == "p001 keep", "外壳（why / confidence）不许进上下文"
+    assert "why" not in first_turn["content"] and "confidence" not in first_turn["content"]
+    # 展开段带上改写后的正文（一行，仍是摘要形态）
+    assert calls["on"][2][4]["content"] == "p002 expand：第二段补一句解释。"
+
+    _d2, _g2, meta_off = planDecisions(
+        doc,
+        None,
+        {"reader": "tester"},
+        fake_chat_client(handler=handler_factory("off")),
+        source_id="fake-doc",
+        per_paragraph=True,
+        conversation=True,
+        concurrency=1,
+        validation_retries=0,
+    )
+    assert "conversation_digest" not in meta_off, "关着时产物不许多个键"
+    raw_turn = calls["off"][1][2]["content"]
+    assert raw_turn.startswith("{") and '"why"' in raw_turn and '"confidence"' in raw_turn, (
+        "关着时必须仍把上一轮的原始 JSON 塞回去（行为与现状逐字一致）"
+    )
+
+
+def test_cli_conversation_digest_requires_the_conversation_mode(run_cli, rewrite_env: SimpleNamespace) -> None:
+    """``--conversation-digest`` 缺了 ``--conversation`` 是用法错误（不静默忽略这个开关）。"""
+    code, output = run_cli(
+        "--data-dir",
+        str(rewrite_env.dirs.data),
+        "--config",
+        str(rewrite_env.config),
+        "rewrite",
+        "sample",
+        "--conversation-digest",
+    )
+    assert code == EXIT_USAGE, output
+    assert "--conversation-digest" in output and "--conversation" in output
+
+def test_conversation_digest_is_rejected_before_any_request(
+    dirs: SimpleNamespace, fake_chat_client
+) -> None:
+    """``--conversation-digest`` 的组合校验必须**早于任何请求**（复核第 3 条）。
+
+    现场：这条校验原先只在 ``planDecisions`` 里，``--plan-first --conversation-digest``（缺
+    ``--conversation``）会先把**第一遍打标的钱花掉**，再以退出码 2 收场。库层要自己拦住。
+    """
+    doc = write_fake_doc(dirs)
+    client = fake_chat_client(handler=fake_handler_for(doc))
+    with pytest.raises(InputError) as excinfo:
+        run_rewrite(
+            "fake-doc",
+            dirs.data,
+            dirs.profiles,
+            "local-default",
+            client,
+            per_paragraph=True,
+            plan_first=True,
+            conversation_digest=True,
+        )
+    assert "conversation_digest" in str(excinfo.value)
+    assert client.calls == [], "校验不过时一个请求都不许发（第一遍打标也不行）"
+
+    # 连 --per-paragraph 都没有的那一档同样要在发请求之前拦住
+    client = fake_chat_client(handler=fake_handler_for(doc))
+    with pytest.raises(InputError):
+        run_rewrite(
+            "fake-doc",
+            dirs.data,
+            dirs.profiles,
+            "local-default",
+            client,
+            plan_first=True,
+            conversation_digest=True,
+        )
+    assert client.calls == []
+
+
+def test_plan_first_and_conversation_digest_can_be_combined(
+    fake_chat_client, dirs: SimpleNamespace
+) -> None:
+    """两个开关互不冲突：``--plan-first`` + ``--conversation`` + ``--conversation-digest`` 一起跑。"""
+    write_fake_doc(dirs)
+    doc = build_doc(FAKE_SOURCE)
+
+    def plan(prompt: str) -> str:
+        return plan_handler()(prompt)
+
+    client = fake_chat_client(handler=two_pass_handler(plan, fake_handler_for(doc)))
+    outcome = run_rewrite(
+        "fake-doc",
+        dirs.data,
+        dirs.profiles,
+        "local-default",
+        client,
+        plan_first=True,
+        per_paragraph=True,
+        conversation=True,
+        concurrency=1,
+        conversation_digest=True,
+        validation_retries=0,
+    )
+
+    meta = json.loads(outcome.decisions_path.read_text(encoding="utf-8"))["meta"]
+    assert meta["planning_mode"] == "conversation"
+    assert meta["plan_first"] is True and meta["conversation_digest"] is True
+    assert len(meta["plan"]) == len(doc["paragraphs"])
+    assert outcome.plan_first is True and outcome.conversation_digest is True

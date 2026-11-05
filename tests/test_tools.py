@@ -1,4 +1,4 @@
-"""工具层（``ar.tools``）的用例：注册表、入参契约、五个工具的出参与提示词复用。
+"""工具层（``ar.tools``）的用例：注册表、入参契约、六个工具的出参与提示词复用。
 
 全部用假模型客户端：**不发任何真实网络请求**，也不真的等待（假客户端的策略是「不重试」）。
 """
@@ -19,11 +19,13 @@ from ar.prompts import (
     COMPRESS_PROMPT_VERSION,
     CONCEPTS_PROMPT_VERSION,
     EXPLAIN_PROMPT_VERSION,
+    PLAN_PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
     SURVEY_PROMPT_VERSION,
     build_compress_messages,
     build_concepts_messages,
     build_explain_messages,
+    build_plan_messages,
     build_rewrite_messages,
     build_survey_messages,
 )
@@ -99,6 +101,17 @@ COMPRESS_JSON = json.dumps(
     ensure_ascii=False,
 )
 
+#: 第六个工具（``plan_actions``，两遍式的第一遍）的假模型回复：只有动作与一句依据，**没有任何正文**
+PLAN_JSON = json.dumps(
+    {
+        "plan": [
+            {"paragraph": "p001", "action": "expand", "note": "读者没有这一段涉及概念的自评"},
+            {"paragraph": "p002", "action": "keep", "note": "读者已熟悉"},
+        ]
+    },
+    ensure_ascii=False,
+)
+
 
 @dataclass
 class ModelStub:
@@ -143,6 +156,12 @@ MINIMAL_PARAMS: dict[str, dict[str, Any]] = {
     },
     "survey_followups": {"sketch": "读者背景：未提供", "answers": {"education": "undergraduate"}},
     "compress_paragraph": {"paragraph": "p001", "text": "这一段太啰嗦：同一个意思说了三遍，说了三遍。"},
+    "plan_actions": {
+        "paragraphs": PARAGRAPHS,
+        "profile_block": "读者画像：空",
+        "concept_block": "概念清单：无",
+        "background_sketch": "未提供",
+    },
 }
 
 TOOL_TEXTS = {
@@ -151,25 +170,28 @@ TOOL_TEXTS = {
     "explain_paragraph": "这一段在讲商品的两重性。",
     "survey_followups": SURVEY_JSON,
     "compress_paragraph": COMPRESS_JSON,
+    "plan_actions": PLAN_JSON,
 }
 
 
 # ------------------------------------------------------------------ 注册表 --
-def test_registry_holds_exactly_the_five_named_tools() -> None:
+def test_registry_holds_exactly_the_six_named_tools() -> None:
+    #: 第六个是两遍式的第一遍 ``plan_actions``（``plan-v2``，只打动作标、不写正文）
     names = [spec.name for spec in tools.all_tools()]
     assert names == [
         "analyze_concepts",
         "rewrite_batch",
+        "plan_actions",
         "explain_paragraph",
         "survey_followups",
         "compress_paragraph",
     ]
-    assert len(set(names)) == 5
+    assert len(set(names)) == 6
 
 
 def test_schemas_are_json_serializable_and_complete() -> None:
     payload = tools.schemas()
-    assert isinstance(payload, list) and len(payload) == 5
+    assert isinstance(payload, list) and len(payload) == 6
     assert json.loads(json.dumps(payload, ensure_ascii=False)) == payload, "必须可被 json.dumps / json.loads 往返"
     for spec in payload:
         assert set(spec) == {"name", "description", "parameters", "output", "prompt_version"}
@@ -184,6 +206,7 @@ def test_prompt_versions_match_the_frozen_prompts() -> None:
     assert tools.get("explain_paragraph").prompt_version == EXPLAIN_PROMPT_VERSION
     assert tools.get("survey_followups").prompt_version == SURVEY_PROMPT_VERSION
     assert tools.get("compress_paragraph").prompt_version == COMPRESS_PROMPT_VERSION == "compress-v3"
+    assert tools.get("plan_actions").prompt_version == PLAN_PROMPT_VERSION == "plan-v2"
 
 
 def test_get_unknown_tool_is_an_error() -> None:
@@ -196,11 +219,11 @@ def test_register_refuses_duplicates_and_non_specs() -> None:
         tools.register(tools.ANALYZE_CONCEPTS_SPEC)
     with pytest.raises(InputError, match="ToolSpec"):
         tools.register({"name": "x"})  # type: ignore[arg-type]
-    assert len(tools.all_tools()) == 5, "失败的注册不许污染注册表"
+    assert len(tools.all_tools()) == 6, "失败的注册不许污染注册表"
 
 
-def test_ar_tools_cli_lists_the_five_contracts(run_cli) -> None:
-    """``ar tools --json`` 的输出随之从四个工具变五个（含 ``compress_paragraph``）。
+def test_ar_tools_cli_lists_the_six_contracts(run_cli) -> None:
+    """``ar tools --json`` 的输出随之从五个工具变六个（多 ``plan_actions``）。
 
     ⚠ ``tests/test_cli.py`` 里那几条「恰好四个工具 / rewrite-v3」的断言归 E2 那一路
     （契约 §10 的独占写范围），本批不动它；这里在**自己负责的文件**里守住同一个事实。
@@ -211,6 +234,7 @@ def test_ar_tools_cli_lists_the_five_contracts(run_cli) -> None:
     assert [item["name"] for item in payload] == [
         "analyze_concepts",
         "rewrite_batch",
+        "plan_actions",
         "explain_paragraph",
         "survey_followups",
         "compress_paragraph",
@@ -219,6 +243,7 @@ def test_ar_tools_cli_lists_the_five_contracts(run_cli) -> None:
     assert versions["rewrite_batch"] == "rewrite-v7"
     assert versions["compress_paragraph"] == "compress-v3"
     assert versions["analyze_concepts"] == "concepts-v2"
+    assert versions["plan_actions"] == "plan-v2"
 
 
 # ------------------------------------------------------------------ 入参契约 --
@@ -287,7 +312,7 @@ def test_schema_problems_flags_nested_violations() -> None:
     assert any("illustration_candidates 类型应为 array" in item for item in problems)
 
 
-# ------------------------------------------------------------------ 五个工具 --
+# ------------------------------------------------------------------ 六个工具 --
 @pytest.mark.parametrize("name", sorted(MINIMAL_PARAMS))
 def test_each_tool_returns_a_schema_conforming_envelope(name: str) -> None:
     stub = ModelStub(text=TOOL_TEXTS[name], usage={"prompt_tokens": 7, "completion_tokens": 3})
@@ -690,6 +715,127 @@ def test_failure_message_carries_the_attempt_count_and_the_last_code() -> None:
     assert "HTTP 503" in text
     # 命令行的报错也要看得见重试：analyze / rewrite / explain / survey 用的都是这一句
     assert "已试 2 次" in text
+
+# --------------------------------------- 两遍式的第一遍：``plan_actions``（plan-v1） --
+def test_plan_actions_returns_only_actions_and_never_prose() -> None:
+    """第一遍**只出动作**：出参里没有 ``rewrite`` / ``figure``；模型多给的正文键被丢掉并**记降级**。
+
+    这条钉的是「动作决策与正文生成不是同一次调用」：第二遍（``rewrite_batch``）才产出正文。
+    """
+    payload = json.dumps(
+        {
+            "plan": [
+                {"paragraph": "p001", "action": "expand", "note": "读者没有 c01 的自评", "rewrite": "模型偷写的正文"},
+                {
+                    "paragraph": "p002",
+                    "action": "keep",
+                    "note": "读者已熟悉",
+                    "figure": {"kind": "mermaid", "source": "flowchart TD"},
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+    stub = ModelStub(text=payload)
+    envelope = tools.get("plan_actions").execute(MINIMAL_PARAMS["plan_actions"], client=stub)
+
+    assert envelope["ok"] is True
+    plan = envelope["data"]["plan"]
+    assert all(set(item) == {"paragraph", "action", "note"} for item in plan), "第一遍的条目只有这三格"
+    assert [item["action"] for item in plan] == ["expand", "keep"]
+    assert all(not item["note"].startswith("模型偷写") for item in plan)
+    # 不静默：多给的 rewrite / figure 逐条记进降级说明（可见面上能看出模型越界了）
+    assert any("rewrite" in note or "figure" in note for note in envelope["degraded"]), envelope["degraded"]
+    assert tools.schema_problems(tools.PLAN_ACTIONS_OUTPUT, envelope["data"]) == []
+
+
+def test_plan_actions_reuses_the_plan_prompt_verbatim() -> None:
+    """第六个工具也逐字复用 ``ar.prompts`` 的模板，且提示词里带着固定判别标记。"""
+    stub = ModelStub(text=PLAN_JSON)
+    params = {**MINIMAL_PARAMS["plan_actions"], "source_id": "fake-doc", "total": 2}
+    tools.get("plan_actions").execute(params, client=stub)
+
+    expected = build_plan_messages(
+        "fake-doc",
+        PARAGRAPHS,
+        profile_block="读者画像：空",
+        concept_block="概念清单：无",
+        background_block="未提供",
+        total=2,
+    )
+    assert stub.requests[0].messages == tuple(expected)
+    assert stub.requests[0].tool == "plan_actions"
+    assert stub.requests[0].prompt_version == PLAN_PROMPT_VERSION
+    user = stub.requests[0].messages[1]["content"]
+    # 固定判别标记：假客户端 / 用例靠它把第一遍的提示词与第二遍分流（第二遍里没有它）
+    assert "【动作打标·第一遍】" in user
+    # plan-v2：判别标记与打标指令**在尾巴里**——开头必须是两遍共用的前缀，缓存才成立
+    assert not user.startswith("【动作打标·第一遍】")
+    assert user.rstrip().endswith("不要写「说明」「依据汇总」之类的额外内容。")
+    # 全篇原文仍在（在共享头里）：第一遍照样一次看全篇
+    assert "[p002] 第二段" in user
+
+
+def test_plan_prompt_shares_the_rewrite_prefix_so_the_cache_can_hit() -> None:
+    """plan-v2：两遍的提示词**共享同一段前缀**（system + 共享头，一直到全文块结束）。
+
+    本机网关按「从头逐字相同的 token 前缀」给缓存折扣（门槛约 2048 token，README §8 第 14 条）——
+    plan-v1 时两遍的公共前缀是 **0 字符**（system 不同、user 首字符就分岔），打标那一遍的钱全价付。
+    plan-v2 把第一遍改成「改写那份的公共头 + 打标尾巴」，于是第一遍建立的缓存能被第二遍第 1 批
+    直接命中。这条用例钉的就是那个结构：**分岔点必须落在共享头的末尾**。
+    """
+    full_text = "[p001] 第一段\n\n[p002] 第二段"
+    shared = {
+        "profile_block": "读者 local-default 没有提供任何概念自评",
+        "concept_block": "c01 商品（难度 1；出现于 p001）",
+        "background_block": "未提供",
+        "illustration_block": "",
+        "full_text_block": full_text,
+        "total": 2,
+    }
+    plan_messages = build_plan_messages("fake-doc", PARAGRAPHS, **shared)
+    rewrite_messages = build_rewrite_messages(
+        "fake-doc", PARAGRAPHS, start=1, end=2, **shared
+    )
+
+    # ① system 必须逐字相同：差一个字符，缓存就从第 1 个 token 起不命中
+    assert plan_messages[0] == rewrite_messages[0]
+
+    plan_user = plan_messages[1]["content"]
+    rewrite_user = rewrite_messages[1]["content"]
+    common = 0
+    for left, right in zip(plan_user, rewrite_user):
+        if left != right:
+            break
+        common += 1
+
+    # ② 公共前缀必须存在，且**不能为空**（plan-v1 就是这么退化的）
+    assert common > 0
+    # ③ 分岔点正好在共享头末尾（那两行空行仍是共享的）：第一遍接打标尾巴，第二遍接本次段
+    assert plan_user[common:].startswith("【动作打标·第一遍】")
+    assert rewrite_user[common:].startswith("本次给你第 1–2 段")
+    # ④ 共享前缀里已经包含全文：第一遍看得见全篇，第二遍的缓存也覆盖全文
+    assert full_text in plan_user[:common]
+    assert full_text in rewrite_user[:common]
+    # ⑤ 两遍各自的口径都在共享前缀里（事实锚口径 / 规则 / JSON 示例），不靠尾巴补
+    assert "事实锚口径" in plan_user[:common]
+    assert "规则：" in plan_user[:common]
+
+
+def test_rewrite_batch_passes_plan_block_through_and_it_stays_optional() -> None:
+    """``plan_block`` 是**可选**入参：传了就进全文块之后，不传那一格零字符插入。"""
+    spec = tools.get("rewrite_batch")
+    assert "plan_block" in spec.parameters["properties"]
+    assert "plan_block" not in spec.parameters["required"]
+
+    stub = ModelStub(text=REWRITE_JSON)
+    spec.execute(
+        {**MINIMAL_PARAMS["rewrite_batch"], "plan_block": "p001 keep\np002 expand：补一句"}, client=stub
+    )
+    content = stub.requests[0].messages[1]["content"]
+    assert "第一遍的动作计划" in content
+    assert content.index("第一遍的动作计划") < content.index("本次给你第")
+
 
 def test_rewrite_batch_passes_full_text_and_feedback_through_and_they_stay_optional() -> None:
     """rewrite-v7 的两个可选入参: 全文进材料段、反馈只压在 user 末尾。"""

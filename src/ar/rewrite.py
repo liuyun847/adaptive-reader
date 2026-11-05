@@ -90,6 +90,30 @@
    次数用尽仍不过 ⇒ 这一段**不写模型稿**、按保持原文 + ``unplanned``（退出码 6）。
    并发 ``concurrency<=1`` 串行、否则并发上限；产物结构与分批模式一致
    （``batch_usage`` 每段一条、``meta.planning_mode`` 标明调度方式）。
+14. **两遍式改写**（``--plan-first``，``plan-v2``，opt-in）：**第一遍一次调用只打动作标**
+    （每段一个 expand / compress / keep / illustrate，**不写任何正文**），这份计划作为**固定上下文**
+    的一部分（``{plan_section}``，排在全文块之后、本次段号之前）进第二遍，第二遍仍按原模式
+    （分批 / 逐段 / 逐段对话）改写。不写正文时模型没有「别把原文改坏」的压力，动作决定更敢下手。
+    产物 ``meta`` **追加** ``plan_first` / ``plan` / ``plan_missing` / ``plan_usage` /
+    ``plan_request_count` / ``plan_attempts` / ``plan_retry_account` / ``plan_prompt_version`；
+    某段的计划动作与最终动作不同时，``changes[i].plan_action`（**为真才出现**）留下计划里那一个。
+    **退出码语义不变**：``plan_missing``（第一遍漏了哪几段）**不算** ``unplanned_paragraphs``，
+    计划与执行不一致同样不触发退出码 6——它们是「计划不完整 / 改主意了」的可见记录，不是「没改写」。
+    ``plan-v2``（2026-10-31）把第一遍的提示词改成「改写那份的公共头 + 打标尾巴」，两遍共享
+    9889 字符（5364 token）前缀：第一遍建好的缓存被第二遍第 1 批直接命中（v1 时公共前缀 0 字符）。
+    第二遍的提示词与 ``rewrite-v7`` **一个字都没变**。
+    越界动作（例如 ``frobnicate``）按 ``keep`` 处理并记一条可见降级（不静默）。
+    ``--only`` / ``--retry-failed`` / ``--from-signals`` 与 ``--plan-first`` 同时给时，**旧产物里已有
+    计划**（且读者 / 背景指纹 / 事实锚口径对得上）就复用它、不重新打标（``meta.plan_reused``）；
+    旧产物没有计划或口径对不上 ⇒ 重新全篇打标（多一次请求）。**不带** ``--plan-first`` 的局部重跑
+    也按旧计划执行那几段（一致性优先）；旧计划里没有某段的条目 / 口径对不上时代码会把它记进
+    ``meta.plan_not_applied`` 并在命令行点名——**不许静默降级成单遍改写**。
+15. **逐段对话的上下文瘦身**（``--conversation-digest``，opt-in）：逐段对话本来把上一轮的**整段
+    JSON** 原样塞回 transcript（模型容易照着上一轮的外壳抄、也白烧 prompt token）；开了这个开关就
+    改塞一条紧凑摘要——每行形如 ``p001 keep`` / ``p002 expand：<改写后正文>``，``why`` /
+    ``confidence`` 这些外壳一个字符都不进上下文。**原始 JSON 仍用于本轮校验解析**（摘要只是
+    「给模型看的上下文」，不参与判定）。开关缺省关，关时 transcript 与现状**逐字一致**；
+    开了才在 ``meta`` 追加 ``conversation_digest: true``（**只在开时为 true**）。
 """
 
 from __future__ import annotations
@@ -123,6 +147,7 @@ from .model import cached_tokens_of
 from .paths import doc_dir
 from .prompts import (
     COMPRESS_PROMPT_VERSION,
+    PLAN_PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
     build_rewrite_messages,
     format_paragraph_block,
@@ -146,6 +171,7 @@ __all__ = [
     "COMPRESS_NO_ANCHOR_NOTE",
     "DEFAULT_COMPRESS_REASON",
     "Decision",
+    "PlanEntry",
     "PlanItem",
     "RewriteOutcome",
     "BatchPlan",
@@ -159,6 +185,7 @@ __all__ = [
     "resolve_rerun_targets",
     "merge_artifacts",
     "planDecisions",
+    "plan_actions",
     "rewrite",
     "run_rewrite",
     "acompress_paragraph",
@@ -301,6 +328,10 @@ class Decision:
     #: （``changes[i].profile_refs_filled``），**不进** ``decisions.json``。
     #: 它是页面那枚「兜底补齐」徽标的**唯一判据**——前端不许拿正则去猜 ``why.note`` 的文案。
     profile_refs_filled: bool = False
+    #: 第一遍（``--plan-first``，``plan-v2``）给这一段打的**计划动作**；与最终动作不同时落
+    #: ``changes[i].plan_action``（**为真才出现**，照 ``fact_declarations`` 的先例）。
+    #: ``None`` = 没有计划，或计划与执行一致（一致时不必多写一个键）。
+    plan_action: str | None = None
 
     @property
     def deferred(self) -> bool:
@@ -321,6 +352,24 @@ class Decision:
             "why": {"profile": list(self.why.get("profile") or []), "note": str(self.why.get("note") or "")},
             "confidence": self.confidence,
         }
+
+
+@dataclass
+class PlanEntry:
+    """第一遍（``--plan-first``）给一段打的动作标（``plan-v2``）。
+
+    ``action`` 已经过 :func:`_parse_plan` 归内：枚举内的四个动作原样保留，**枚举外的按 ``keep``**
+    并记了一条可见降级（原始取值不再传播，降级文案里会写清模型原本给的是什么）。
+    ``note`` 是模型给的一句话依据（第一遍提示词要求留空即降级）。
+    """
+
+    paragraph: str
+    action: str
+    note: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        """落 ``meta.plan`` 的形态（``{paragraph, action, note}``；缺段 / 越界另有 meta 字段说明）。"""
+        return {"paragraph": self.paragraph, "action": self.action, "note": self.note}
 
 
 @dataclass
@@ -372,6 +421,25 @@ class RewriteOutcome:
     profile_refs_filled: list[str] = field(default_factory=list)
     #: 合并后的 ``meta.rerun_history``（每次一条，含该次 ``usage`` / ``retry_account``）
     rerun_history: list[dict[str, Any]] = field(default_factory=list)
+    #: 这次是不是走了两遍式（``--plan-first``）。``False`` 时下面几栏**一个都不写进产物**
+    plan_first: bool = False
+    #: 第一遍的计划（按全篇段序）；CLI 据此打「第一遍打标：N 段（展开 x / 压缩 y / 保持 z）」那一行
+    plan: list[PlanEntry] = field(default_factory=list)
+    #: 第一遍漏了哪几段（``meta.plan_missing``）：**不算 unplanned、不改退出码**
+    plan_missing: list[str] = field(default_factory=list)
+    plan_usage: dict[str, Any] = field(default_factory=dict)
+    plan_request_count: int = 0
+    plan_attempts: list[dict[str, Any]] = field(default_factory=list)
+    plan_retry_account: dict[str, Any] = field(default_factory=dict)
+    plan_prompt_version: str = ""
+    #: 这一轮**有没有沿用**旧产物里第一遍的计划（局部重跑 + 旧产物有计划时才可能为真）：
+    #: 为真 ⇒ 0 次打标请求，CLI 那行账写「复用旧计划，0 次请求」
+    plan_reused: bool = False
+    #: 目标段里**没能注入旧计划**的那几段（旧计划没有它的条目 / 口径对不上）：
+    #: 非空时 CLI 点名打一行、产物 ``meta.plan_not_applied`` 也记着（不许静默降级成单遍改写）
+    plan_not_applied: list[str] = field(default_factory=list)
+    #: 逐段对话是否用了「上下文瘦身」（``--conversation-digest``）：**只在开时为 true**
+    conversation_digest: bool = False
 
     def action_counts(self) -> dict[str, int]:
         counts = {action: 0 for action in ACTIONS}
@@ -383,6 +451,35 @@ class RewriteOutcome:
     def incomplete(self) -> bool:
         """是否有段落因模型问题**没被改写**（不是模型主动选择「保持」）。"""
         return bool(self.model_errors or self.unplanned_paragraphs)
+
+
+def _apply_plan_fields(
+    outcome: RewriteOutcome,
+    *,
+    plan_first: bool,
+    entries: list[PlanEntry],
+    missing: list[str],
+    extra: dict[str, Any],
+    conversation_digest: bool,
+) -> None:
+    """把两遍式 / 对话瘦身的**可见字段**挂到 outcome 上（CLI 据此打第一遍那一行摘要）。
+
+    只在开关真的打开时挂：默认路径的 outcome 与改动前**一个字段都不多**（``plan_first=False``、
+    其余默认空）。产物里的同名键由 ``meta`` 的拼装负责（见 ``run_rewrite` / ``merge_artifacts``）。
+    """
+    if plan_first:
+        outcome.plan_first = True
+        outcome.plan = list(entries)
+        outcome.plan_missing = list(missing)
+        outcome.plan_usage = dict(extra.get("plan_usage") or {})
+        outcome.plan_request_count = int(extra.get("plan_request_count") or 0)
+        outcome.plan_attempts = [
+            dict(item) for item in (extra.get("plan_attempts") or []) if isinstance(item, dict)
+        ]
+        outcome.plan_retry_account = dict(extra.get("plan_retry_account") or {})
+        outcome.plan_prompt_version = str(extra.get("plan_prompt_version") or PLAN_PROMPT_VERSION)
+    if conversation_digest:
+        outcome.conversation_digest = True
 
 
 @dataclass
@@ -1056,6 +1153,8 @@ def _plan_one_batch(
         "fact_anchor_policy": normalize_fact_anchor_policy(context.get("fact_anchor_policy")),
         # 全文（rewrite-v7）：同一材料的所有批 / 所有段共享，进「按材料变」的那一段
         "full_text_block": context.get("full_text_block") or "",
+        # 第一遍的计划块（plan-v2）：同一材料的所有批共享；没开 --plan-first 时是空串（零字符插入）
+        "plan_block": context.get("plan_block") or "",
         # 提示词里「材料：《{source_id}》，共 {total} 段」那一行：不传会退化成空材料名，逐字不等价
         "source_id": str(context.get("source_id") or ""),
         "total": int(context.get("total") or end),
@@ -1145,6 +1244,301 @@ def _plan_batches_warmup(
     if not rest:
         return [first]
     return [first, *_plan_batches_parallel(client, rest, paragraphs, context)]
+
+
+# ----------------------------------------------- 两遍式改写的第一遍（plan-v2） --
+def _one_line(text: Any) -> str:
+    """自由文本 → 单行（换行 / 连续空白折叠成一个空格，首尾空白去掉）。
+
+    :func:`_plan_block` 的格式契约靠它兜底：计划块**每行一段**「段 id 动作：依据」，
+    note 里带换行会把一行劈成两行，第二遍的模型就会把后半截当成另一段的计划。
+    """
+    return " ".join(str(text or "").split())
+
+
+def _plan_block(entries: list[PlanEntry]) -> str:
+    """计划 → 第二遍提示词里的固定计划块（**逐字稳定**：同一份计划永远得到同一段文本）。
+
+    每行形如 ``p001 keep`` / ``p002 expand：<一句话依据>``，段序按传入顺序（调用方已按全篇段序
+    排好）。**格式契约：一行一段**——note 里的换行 / 连续空白由 :func:`_one_line` 压平成单行
+    （模型给了多行依据也劈不开这个块，2026-10-19 复核修复）。空计划返回空串：第二遍那一格
+    **零字符插入**，于是「第一遍失败 / 没有计划」时第二遍拿到的提示词与不开 ``--plan-first`` 时
+    **逐字相同**。
+    """
+    lines: list[str] = []
+    for entry in entries:
+        note = _one_line(entry.note)
+        lines.append(f"{entry.paragraph} {entry.action}" + (f"：{note}" if note else ""))
+    return "\n".join(lines)
+
+
+@dataclass
+class PlanReuse:
+    """旧产物里第一遍计划的**复用判定**（局部重跑那一路；见 :func:`_reuse_plan`）。
+
+    ``ok=True`` = 这份计划可以照旧注入第二遍（口径也对得上）；``ok=False`` = 旧计划还在，但
+    **不许沿用**，``reason`` 说明是哪一项对不上（读者 / 背景指纹 / 事实锚口径），调用方据此
+    重新打标或把目标段记进 ``plan_not_applied``——两种情况都不许静默。
+    """
+
+    entries: list[PlanEntry] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
+    ok: bool = False
+    reason: str = ""
+    #: 复用过程中产生的可见降级（越界动作按 keep 处理之类；调用方原样并进 ``degraded``）
+    notes: list[str] = field(default_factory=list)
+
+
+def _reuse_plan(
+    base: MergeBase | None,
+    *,
+    reader: str = "",
+    background_fingerprint: str = "",
+    fact_anchor_policy: str = DEFAULT_FACT_ANCHOR_POLICY,
+) -> PlanReuse | None:
+    """既有产物里的第一遍计划（局部重跑**优先照原样复用**，不重新打标）。
+
+    ``--plan-first`` 与 ``--only`` / ``--retry-failed`` / ``--from-signals`` 同时给时走这条：
+    局部重跑的口径是「只重跑这几段」，第一遍的计划本来就还在 ``decisions.json`` 的 ``meta`` 里
+    （``MergeBase`` 带着整份 ``decisions_payload``）。旧产物没开过 ``--plan-first`` 时返回 ``None``，
+    这次照常打标——不假装「有旧计划」。
+
+    返回 ``ok=False`` 只有一种情况：**口径对不上**。旧计划是按「另一个读者 / 另一版背景 / 另一档
+    事实锚口径」打的标，照旧注入就会产出「B 读者的产物 + A 读者的计划」这种自相矛盾的现场
+    （2026-10-19 复核修复）。缺键按默认口径算：旧产物早于这几格时，读者必须相同、指纹两侧都为空、
+    口径两侧都归一成默认，否则不复用。
+
+    越界动作（旧产物被手改过 / 旧版本写的）按 ``keep`` 处理，但**留一条可见降级**——与
+    :func:`_parse_plan` 同一条口径，不静默改写历史。
+    """
+    if base is None:
+        return None
+    meta = base.decisions_payload.get("meta")
+    if not isinstance(meta, dict) or not meta.get("plan_first"):
+        return None
+    raw = meta.get("plan")
+    if not isinstance(raw, list):
+        return None
+    entries: list[PlanEntry] = []
+    notes: list[str] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pid = item.get("paragraph")
+        if not isinstance(pid, str) or not pid.strip():
+            continue
+        action = str(item.get("action") or "")
+        if action not in ACTIONS:
+            # 与 _parse_plan 同口径：越界动作按 keep 处理，但降级必须看得见（不许静默改历史）
+            label = f"「{action}」" if action else "（空）"
+            notes.append(
+                f"{pid.strip()}：旧计划里的动作 {label} 不在 {' / '.join(ACTIONS)} 之内，"
+                "已按「保持」处理（复用计划时记 keep）"
+            )
+        entries.append(
+            PlanEntry(
+                paragraph=pid.strip(),
+                action=action if action in ACTIONS else "keep",
+                note=str(item.get("note") or ""),
+            )
+        )
+    if not entries:
+        return None
+    missing = [str(pid) for pid in (meta.get("plan_missing") or []) if str(pid).strip()]
+    extra: dict[str, Any] = {
+        "plan_first": True,
+        "plan_prompt_version": str(meta.get("plan_prompt_version") or PLAN_PROMPT_VERSION),
+        "plan_usage": dict(meta.get("plan_usage") or {}),
+        "plan_request_count": int(meta.get("plan_request_count") or 0),
+        "plan_attempts": [
+            dict(item) for item in (meta.get("plan_attempts") or []) if isinstance(item, dict)
+        ],
+        "plan_retry_account": dict(meta.get("plan_retry_account") or {}),
+    }
+    reuse = PlanReuse(entries=entries, missing=missing, extra=extra, notes=notes)
+    # 口径复核对齐（2026-10-19 复核修复）：换读者后把 A 读者的计划注入 B 读者的提示词，
+    # 产物会是「B 的 reader + A 的 plan」，比重新打标一次贵得多（错的东西看起来是对的）。
+    mismatched: list[str] = []
+    old_reader = str(meta.get("reader") or "")
+    if old_reader != str(reader or ""):
+        mismatched.append(f"读者 {old_reader or '（空）'} → {reader or '（空）'}")
+    old_fingerprint = str(meta.get("background_fingerprint") or "")
+    if old_fingerprint != str(background_fingerprint or ""):
+        mismatched.append(
+            f"读者背景指纹 {old_fingerprint or '（空）'} → {background_fingerprint or '（空）'}"
+        )
+    old_policy = normalize_fact_anchor_policy(meta.get("fact_anchor_policy"))
+    new_policy = normalize_fact_anchor_policy(fact_anchor_policy)
+    if old_policy != new_policy:
+        mismatched.append(f"事实锚口径 {old_policy} → {new_policy}")
+    if mismatched:
+        reuse.ok = False
+        reuse.reason = "、".join(mismatched)
+        return reuse
+    reuse.ok = True
+    return reuse
+
+
+def _parse_plan(
+    raw: str, paragraphs: list[dict[str, Any]]
+) -> tuple[list[PlanEntry], list[str], list[str]]:
+    """第一遍的模型输出 → ``(按全篇段序排好的计划, 缺段 id, 降级说明)``。
+
+    - **枚举外的动作**（模型给 ``frobnicate``，或压根没给 action）按 ``keep`` 处理并**记降级**；
+    - 不属于这份材料的段 id / 重复条目一律点名忽略（不静默丢）；
+    - **缺段不阻断**：缺的那几段进 ``plan_missing``，第二遍照样逐段改写，只是它们没有计划
+      ——所以 ``plan_missing`` **不算 unplanned、不改退出码**。
+    """
+    from .analyze import extract_json_object  # noqa: PLC0415 - 与 _parse_batch 的解析口径同源
+
+    wanted = [str(paragraph.get("id")) for paragraph in paragraphs]
+    degraded: list[str] = []
+    try:
+        data = extract_json_object(raw or "")
+    except InputError as exc:
+        return [], list(wanted), [f"第一遍打标：{exc}；第二遍不带计划照常改写"]
+    raw_plan = data.get("plan")
+    if not isinstance(raw_plan, list):
+        return [], list(wanted), ["第一遍打标：模型输出里没有 plan 数组；第二遍不带计划照常改写"]
+
+    known = set(wanted)
+    by_id: dict[str, dict[str, Any]] = {}
+    unknown: list[str] = []
+    for item in raw_plan:
+        if not isinstance(item, dict):
+            degraded.append("第一遍打标：plan 里有不是对象的条目，已忽略")
+            continue
+        pid = item.get("paragraph")
+        if not isinstance(pid, str) or not pid.strip():
+            degraded.append("第一遍打标：plan 里有缺 paragraph 的条目，已忽略")
+            continue
+        pid = pid.strip()
+        if pid not in known:
+            if pid not in unknown:
+                unknown.append(pid)
+            continue
+        if pid in by_id:
+            degraded.append(f"{pid}：第一遍的计划里重复出现，只取第一条")
+            continue
+        by_id[pid] = item
+    if unknown:
+        shown = "、".join(unknown[:6]) + ("…" if len(unknown) > 6 else "")
+        degraded.append(
+            f"第一遍打标：模型给了不属于这份材料的段 id {shown}（共 {len(unknown)} 个），已忽略"
+        )
+
+    entries: list[PlanEntry] = []
+    missing: list[str] = []
+    for pid in wanted:
+        item = by_id.get(pid)
+        if item is None:
+            missing.append(pid)
+            continue
+        requested = str(item.get("action") or "").strip()
+        action = requested if requested in ACTIONS else "keep"
+        if action != requested:
+            label = f"「{requested}」" if requested else "（空）"
+            degraded.append(
+                f"{pid}：第一遍给的动作 {label} 不在 expand / compress / keep / illustrate 四类之内，"
+                "已按「保持」处理（计划里记 keep）"
+            )
+        note = str(item.get("note") or "").strip()
+        if not note:
+            degraded.append(f"{pid}：第一遍没有写依据（note 为空），计划里只留动作")
+        entries.append(PlanEntry(paragraph=pid, action=action, note=note))
+    if missing:
+        shown = "、".join(missing[:8]) + ("…" if len(missing) > 8 else "")
+        degraded.append(
+            f"第一遍打标漏了 {len(missing)} 段（{shown}）：第二遍照常逐段改写，只是这几段没有计划；"
+            "**不计入 unplanned_paragraphs、不改退出码**"
+        )
+    return entries, missing, degraded
+
+
+def plan_actions(
+    source_doc: dict[str, Any],
+    inventory: dict[str, Any] | None,
+    profile: dict[str, Any],
+    client: ChatClient,
+    *,
+    source_id: str = "",
+    reader: str = "",
+    background_block: str = "",
+    fact_anchor_policy: str = DEFAULT_FACT_ANCHOR_POLICY,
+) -> tuple[list[PlanEntry], list[str], dict[str, Any]]:
+    """两遍式的**第一遍**（``--plan-first``，``plan-v2``）：一次调用给全篇每段打动作标。
+
+    返回 ``(计划, 降级说明, meta)``；``meta`` 里的键就是产物 ``meta`` 追加的那几格
+    （``plan_first` / ``plan` / ``plan_missing` / ``plan_usage` / ``plan_request_count` /
+    ``plan_attempts` / ``plan_retry_account` / ``plan_prompt_version`）。
+
+    **失败不阻断**：调用失败 / 输出读不通时返回空计划 + 全部段进 ``plan_missing`` + 一条可见降级，
+    第二遍照样按原模式跑（那一格的计划块是空串 ⇒ 提示词与不开这个开关时逐字相同）。
+    **两遍共享同一段前缀**（``plan-v2``，2026-10-31）：第一遍的提示词是「改写那份的公共头
+    （画像 / 背景 / 事实锚口径 / JSON 示例 / 规则 / 材料行 / 概念 / 配图 / 全文）+ 打标尾巴」，
+    system 也直接用 ``REWRITE_SYSTEM_PROMPT`` ⇒ 两遍的公共前缀 = 9889 字符（5364 token），
+    第一遍建好的缓存能被第二遍第 1 批直接命中。``plan-v1`` 时两遍的公共前缀是 **0 字符**
+    （system 不同、user 首字符就分岔），打标的钱全价——这条 2026-10-19 的复核结论是按 v1 说的，
+    已按 v2 作废。第二遍自己的批之间照旧命中（前缀里还有「计划」块）。
+    """
+    paragraphs = [p for p in (source_doc.get("paragraphs") or []) if isinstance(p, dict) and p.get("id")]
+    if not paragraphs:
+        raise InputError("source.meta.json 里没有任何段落，无法给全篇打动作标")
+    sid = source_id or str(source_doc.get("source_id") or "")
+    reader_id = reader or str(profile.get("reader") or "")
+    params = {
+        "paragraphs": [{"id": str(p.get("id")), "text": str(p.get("text") or "")} for p in paragraphs],
+        "source_id": sid,
+        "total": len(paragraphs),
+        "profile_block": _format_profile_block(reader_id, profile, list(profile.get("overrides") or [])),
+        "concept_block": _format_concept_block(sid, inventory),
+        "background_sketch": background_block or "",
+        # 配图候选（与 rewrite 同一个块）：没有候选时是空串，模板那一格一个字符都不出现
+        "illustration_block": format_illustration_block(inventory),
+        # 全文与事实锚口径（plan-v2）：这两格在**两遍共用的前缀**里，第一遍建好的缓存才能被
+        # 第二遍第 1 批命中——拼法与 rewrite 那条路径**逐字同一套**（format_paragraph_block +
+        # normalize_fact_anchor_policy），否则前缀就从这里分岔、缓存一个 token 都吃不到
+        "full_text_block": format_paragraph_block(paragraphs),
+        "fact_anchor_policy": normalize_fact_anchor_policy(fact_anchor_policy),
+    }
+    empty_account = {"tool": tools.PLAN_ACTIONS_SPEC.name, "requests": 0, "retries": 0, "codes": []}
+    meta: dict[str, Any] = {
+        "plan_first": True,
+        "plan_prompt_version": PLAN_PROMPT_VERSION,
+        "plan_request_count": 0,
+        "plan_usage": {},
+        "plan_attempts": [],
+        "plan_retry_account": empty_account,
+        "plan_missing": [],
+        "plan": [],
+    }
+    all_ids = [str(p.get("id")) for p in paragraphs]
+    degraded: list[str] = []
+    try:
+        run = tools.run_tool(tools.PLAN_ACTIONS_SPEC.name, params, client=client)
+    except Exception as exc:  # noqa: BLE001 - 与逐批改写同一条降级路径：不能让整篇崩掉
+        degraded.append(
+            f"第一遍打标调用失败（{type(exc).__name__}）：{exc}；第二遍不带计划照常改写"
+        )
+        meta["plan_missing"] = all_ids
+        return [], degraded, meta
+
+    meta["plan_request_count"] = 1
+    meta["plan_usage"] = dict(run.usage or {})
+    meta["plan_attempts"] = [dict(item) for item in run.attempt_records]
+    meta["plan_retry_account"] = run.account()
+    if not run.ok:
+        degraded.append(f"第一遍打标失败：{run.failure_message()}；第二遍不带计划照常改写")
+        meta["plan_missing"] = all_ids
+        return [], degraded, meta
+
+    degraded.extend(run.degraded)
+    entries, missing, notes = _parse_plan(run.raw_text, paragraphs)
+    degraded.extend(notes)
+    meta["plan"] = [entry.to_record() for entry in entries]
+    meta["plan_missing"] = missing
+    return entries, degraded, meta
 
 
 # ------------------------------------------------------------------ 逐段循环 --
@@ -1249,6 +1643,8 @@ def _plan_one_paragraph(
             "illustration_block": context.get("illustration_block") or "",
             "fact_anchor_policy": normalize_fact_anchor_policy(context.get("fact_anchor_policy")),
             "full_text_block": context.get("full_text_block") or "",
+            # 第一遍的计划块（plan-v2）：逐段模式同样共享；没开 --plan-first 时零字符插入
+            "plan_block": context.get("plan_block") or "",
             "source_id": str(context.get("source_id") or ""),
             "total": int(context.get("total") or end),
             "feedback": feedback,
@@ -1334,6 +1730,27 @@ def _plan_one_paragraph(
     return plan  # pragma: no cover
 
 
+def _digest_turn(item: dict[str, Any] | None, *, pid: str = "") -> str:
+    """一轮决策 → 逐段对话里的**紧凑摘要**（``--conversation-digest``）。
+
+    形状（一行一段）：``p001 keep`` / ``p002 expand：<改写后的正文>``。
+    ``why`` / ``confidence` 这些外壳**一个字符都不进上下文**——它们本来就不影响下一段的判断，
+    却会让模型照着上一轮的 JSON 外壳抄、还白烧 prompt token。**原始 JSON 仍用于本轮校验解析**，
+    摘要只是「给模型看的上下文」，不参与判定。
+    读不通（没给决策 / 形状不对）时给一句可读说明，不静默塞空行。
+    """
+    if not isinstance(item, dict):
+        if pid:
+            return f"{pid} 没有给出这一段的决策（按保持原文处理，继续下一段）"
+        return "（这一段没有给出决策）"
+    paragraph = str(item.get("paragraph") or pid or "")
+    action = str(item.get("action") or "")
+    text = _clean_rewrite(item.get("rewrite"))
+    if action in TEXT_ACTIONS and text:
+        return f"{paragraph} {action}：{text}"
+    return f"{paragraph} {action or 'keep'}"
+
+
 def _conversation_turn_text(index: int, paragraphs: list[dict[str, Any]]) -> str:
     """逐段对话里「下一段」的 user 消息（短，只带当前段与输出约束）。"""
     paragraph = paragraphs[index]
@@ -1353,6 +1770,7 @@ def _plan_conversation(
     *,
     policy: str,
     validation_retries: int,
+    digest: bool = False,
 ) -> list[BatchPlan]:
     """逐段对话（2026-10-18）：**同一条对话**里累积原文与已改内容，每轮只处理当前段。
 
@@ -1363,6 +1781,9 @@ def _plan_conversation(
 
     代价：每轮 prompt 都比上一轮长（线性累积），绝对 prompt token 比独立逐段高；缓存命中后
     新增部分才按全价计。串行是硬约束（对话本身有顺序），由调用方保证。
+
+    ``digest=True``（``--conversation-digest``）只改「上一轮的 assistant 消息塞什么」：
+    不再塞整段 JSON，改塞 :func:`_digest_turn` 的紧凑摘要。缺省（关）时 transcript 与现状逐字一致。
     """
     from .analyze import extract_json_object  # noqa: PLC0415 - 与 _plan_one_batch 的解析口径同源
 
@@ -1384,6 +1805,8 @@ def _plan_conversation(
         illustration_block=context.get("illustration_block") or "",
         fact_anchor_policy=normalize_fact_anchor_policy(context.get("fact_anchor_policy")),
         full_text_block=context.get("full_text_block") or "",
+        # 第一遍的计划块（plan-v2）：对话模式同样在固定上下文里（没开 --plan-first 时零字符插入）
+        plan_block=context.get("plan_block") or "",
         feedback=CONVERSATION_START_NOTE,
     )
     transcript: list[dict[str, str]] = [dict(message) for message in initial]
@@ -1442,12 +1865,19 @@ def _plan_conversation(
                 break
 
             raw_text = result.text or ""
-            transcript.append({"role": "assistant", "content": raw_text})
             kept, issues = _parse_batch(
                 raw_text, [paragraph], start, end, extract_json_object=extract_json_object
             )
             plan.degraded.extend(issues)
             raw_item = kept[0] if kept else None
+            # 塞回上下文的是「模型原文」（现状，逐字不变）还是「紧凑摘要」（--conversation-digest）：
+            # 解析仍用原文（上面那次 _parse_batch），摘要只影响模型下一轮看到什么。
+            transcript.append(
+                {
+                    "role": "assistant",
+                    "content": _digest_turn(raw_item, pid=pid) if digest else raw_text,
+                }
+            )
             problems = _paragraph_problems(paragraph, raw_item, policy=policy)
             if not problems:
                 plan.items = [_finalize_items(paragraph, raw_item, degraded=plan.degraded)]
@@ -1546,6 +1976,8 @@ def planDecisions(
     concurrency: int = DEFAULT_CONCURRENCY,
     validation_retries: int = DEFAULT_VALIDATION_RETRIES,
     conversation: bool = False,
+    plan_block: str = "",
+    conversation_digest: bool = False,
 ) -> tuple[list[Decision], list[str], dict[str, Any]]:
     """逐段决策：``(decisions, degraded, meta)``。
 
@@ -1572,6 +2004,13 @@ def planDecisions(
     原文与已改内容——第一轮的 user 消息与分批模式逐字相同（v7 全文 / 规则），之后每轮把上一轮的
     assistant 决策与当前段指令追加进 ``messages``；校验差异也追加成新的 user 消息。
     始终串行（``concurrency`` 被强制为 1）。产物结构不变，``meta.planning_mode`` 记为 ``conversation``。
+    ``conversation_digest=True``（只与 ``conversation`` 同用）把「上一轮的 assistant 消息」从整段 JSON
+    换成一行紧凑摘要（见 :func:`_digest_turn`）；关着时 transcript 与现状**逐字一致**，
+    开了才在 ``meta`` 追加 ``conversation_digest: true``。
+
+    ``plan_block``（``plan-v2``，两遍式的第一遍计划）进**三条路径共用的固定上下文**：
+    三条路径的提示词里它都排在全文块之后、本次段号之前，空串时零字符插入
+    ——所以没开 ``--plan-first`` 时提示词逐字不变。
 
     ``usage`` 的 3 个旧字段（``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``）口径不变，
     追加 ``cached_tokens``（前缀缓存命中的 prompt token 合计，网关没上报时为 ``null``）；
@@ -1600,6 +2039,8 @@ def planDecisions(
         "fact_anchor_policy": normalize_fact_anchor_policy(fact_anchor_policy),
         # 全文（rewrite-v7）：同一材料的所有批共享；拼法与批内段落同一套（[pNNN] 正文）
         "full_text_block": format_paragraph_block(paragraphs),
+        # 第一遍的计划块（plan-v2）：三条调度路径共用；没开 --plan-first 时是空串（零字符插入）
+        "plan_block": plan_block or "",
     }
     ranges = _batch_ranges(paragraphs, max(1, int(max_chars_per_batch)))
     if targets is not None:
@@ -1613,6 +2054,9 @@ def planDecisions(
         ranges = [batch for batch in ranges if batch]
     if conversation and not per_paragraph:
         raise InputError("逐段对话（conversation）只能与逐段模式（per_paragraph）一起用")
+    if conversation_digest and not conversation:
+        # 摘要只改「逐段对话里塞回上下文的东西」：没有对话就没有 transcript 可瘦身（不静默忽略）
+        raise InputError("对话上下文瘦身（conversation_digest）只能与逐段对话（conversation）一起用")
     if conversation:
         # 逐段对话：同一条 messages 里累积原文与已改内容，必须串行；整个循环放工作线程
         # （llm.call 是 asyncio.run，不能在已有事件循环的线程里就地调用）
@@ -1627,6 +2071,7 @@ def planDecisions(
                 context,
                 policy=policy_name,
                 validation_retries=max(0, int(validation_retries)),
+                digest=bool(conversation_digest),
             ).result()
     elif per_paragraph:
         # 逐段循环：批次下标展开成「一段一批」，并发度由调用方定（1 = 串行）
@@ -1718,6 +2163,9 @@ def planDecisions(
         ),
         "concurrency": 1 if conversation else (max(1, int(concurrency)) if per_paragraph else 4),
         "validation_retries": max(0, int(validation_retries)) if per_paragraph else 0,
+        # 逐段对话的上下文瘦身（--conversation-digest）：**只在开时为 true**——关着时这个键不出现，
+        # 默认路径的产物一个键都不多（有测试钉住）
+        **({"conversation_digest": True} if conversation_digest and conversation else {}),
         # 批数 / 请求数按**实际发出的计划**数（逐段模式 = 段数；分批模式与 ranges 相同）
         "request_count": len(plans),
         "batch_count": len(plans),
@@ -1798,6 +2246,10 @@ def rewrite(
         # 「为真才出现」先例）；它同时是 ar check 按口径放行的依据，也是页面 / CLI 的可见面。
         if decision.fact_declarations:
             change["fact_declarations"] = dict(decision.fact_declarations)
+        # 两遍式（``plan-v2``）：第一遍的计划动作与最终动作**不同**时留下计划里那一个
+        # （为真才出现；一致时不写，免得每段都多一个永远相同的键）。
+        if decision.plan_action and decision.plan_action != decision.action:
+            change["plan_action"] = decision.plan_action
         # 兜底补齐（2026-10-14 复核修复）：这一段 why.profile 是骨架照读者自评补的 ⇒ 记一个
         # **结构化**标记（同样「为真才出现」），页面据此挂可见徽标 —— 不许靠正则去猜 why.note 的文案。
         if decision.profile_refs_filled:
@@ -2295,6 +2747,56 @@ def merge_artifacts(
         # 事实锚口径（§14.1）：**改写时**生效的那一档；放行条目（fidelity.waived）由 ar check 写
         "fact_anchor_policy": policy,
     }
+    # 调度方式与并发（rewrite-v7）：合并器重建 meta 时**不许丢**（既有缺陷，2026-10-19 复核补）——
+    # 丢掉之后任何一次局部重跑都让产物看不出「这一篇是逐段 / 逐段对话跑出来的」，实验产物没法判读。
+    # 本次给了就写本次的（run_meta 里恒有这三格），没给（在线压缩那一路）沿用旧产物。
+    schedule_meta = run_meta if run_meta.get("planning_mode") else old_meta
+    schedule_fields: dict[str, Any] = {
+        "planning_mode": str(schedule_meta.get("planning_mode") or "batch"),
+        "concurrency": int(schedule_meta.get("concurrency") or DEFAULT_CONCURRENCY),
+        "validation_retries": int(schedule_meta.get("validation_retries") or 0),
+    }
+    # 两个开关的可见面（两遍式 plan-v2 / 对话瘦身），全是**追加字段**：
+    # 本次给了就写本次的；没给（例如不带 --plan-first 的局部重跑）就**沿用旧产物里那一份**
+    # ——否则一次局部重跑就把「这一篇是按计划跑出来的」连同计划整体丢掉（合并器只重算它认识的键）。
+    mode_fields: dict[str, Any] = {}
+    if bool(run_meta.get("plan_first")) or bool(old_meta.get("plan_first")):
+        source = run_meta if bool(run_meta.get("plan_first")) else old_meta
+        mode_fields = {
+            "plan_first": True,
+            "plan": [dict(item) for item in (source.get("plan") or []) if isinstance(item, dict)],
+            "plan_missing": [str(pid) for pid in (source.get("plan_missing") or []) if str(pid).strip()],
+            "plan_usage": dict(source.get("plan_usage") or {}),
+            "plan_request_count": int(source.get("plan_request_count") or 0),
+            "plan_attempts": [
+                dict(item) for item in (source.get("plan_attempts") or []) if isinstance(item, dict)
+            ],
+            "plan_retry_account": dict(source.get("plan_retry_account") or {}),
+            "plan_prompt_version": str(source.get("plan_prompt_version") or PLAN_PROMPT_VERSION),
+        }
+        # 这一轮的计划复用账（不带 --plan-first 的局部重跑同样要留痕，2026-10-19 复核修复）：
+        # plan_reused 恒写 true / false（问过这个问题就要答）；plan_not_applied 只在有点名时落产物
+        # ——但 run_meta 里**恒有键**（空列表也算），靠「键在不在」区分「这一轮查过、是干净的」与
+        # 「这一轮没查」（在线压缩那一路），后者才沿用旧痕迹：旧值不许被无声抹掉。
+        if "plan_reused" in run_meta:
+            mode_fields["plan_reused"] = bool(run_meta.get("plan_reused"))
+        elif old_meta.get("plan_reused") is True:
+            mode_fields["plan_reused"] = True
+        if "plan_not_applied" in run_meta:
+            not_applied = [
+                str(pid) for pid in (run_meta.get("plan_not_applied") or []) if str(pid).strip()
+            ]
+            if not_applied:
+                mode_fields["plan_not_applied"] = not_applied
+        else:
+            old_not_applied = [
+                str(pid) for pid in (old_meta.get("plan_not_applied") or []) if str(pid).strip()
+            ]
+            if old_not_applied:
+                mode_fields["plan_not_applied"] = old_not_applied
+    # 对话瘦身：**只在开时为 true**（关着时这个键不出现——默认路径的产物一个键都不多）
+    if bool(run_meta.get("conversation_digest") or old_meta.get("conversation_digest")):
+        mode_fields["conversation_digest"] = True
     accounting: dict[str, Any] = {
         "request_count": int(run_meta.get("request_count") or 0),
         "usage": usage,
@@ -2314,6 +2816,8 @@ def merge_artifacts(
         "deferred_count": deferred_count,
         **profile_fields,
         **accounting,
+        **schedule_fields,
+        **mode_fields,
     }
     changes_meta: dict[str, Any] = {
         **head,
@@ -2324,6 +2828,8 @@ def merge_artifacts(
         "facts_note": "facts 只含数字与引号引文（与前端夹具同口径）；书名号《》由 `ar check` 另行比对",
         **profile_fields,
         **accounting,
+        **schedule_fields,
+        **mode_fields,
     }
     if rerun_block is not None:
         decisions_meta["rerun"] = rerun_block
@@ -2696,6 +3202,8 @@ def run_rewrite(
     concurrency: int = DEFAULT_CONCURRENCY,
     validation_retries: int = DEFAULT_VALIDATION_RETRIES,
     conversation: bool = False,
+    plan_first: bool = False,
+    conversation_digest: bool = False,
 ) -> RewriteOutcome:
     """``ar rewrite`` 的实现：决策 → 改写 → 写三份产物，并把降级全部记下来。
 
@@ -2703,11 +3211,31 @@ def run_rewrite(
     就走局部重跑（§6.2）：批次按全篇下标空间切、每批与目标段取交集（空交集不调模型），
     结果由 :func:`merge_artifacts` 逐段合进既有三份产物（前置校验不过 → ``InputError``，
     **在发任何模型请求之前**就报错）。
+
+    ``plan_first=True``（``--plan-first``，两遍式）：先跑一遍 :func:`plan_actions` 给全篇每段打动作标，
+    再把它作为固定上下文（``{plan_section}``）进第二遍的原有模式。与 ``targets`` 同时给时
+    **旧产物里已有计划就复用**（:func:`_reuse_plan`，0 次打标请求）：读者 / 背景指纹 / 事实锚口径
+    任一对不上则**不复用**，重新全篇打标（多一次请求），并把 ``meta.plan_reused`` 记成 ``false``。
+    ``plan_first=False`` 但给了 ``targets`` 时：旧产物里**有计划就照旧注入**那一段（同一份产物始终
+    按同一份计划执行）；旧计划里没有这一段的条目 / 口径对不上 ⇒ 目标段进 ``meta.plan_not_applied``
+    并在命令行点名——不许静默降级成单遍改写。
+    ``conversation_digest=True``（``--conversation-digest``，只与 ``conversation`` 同用）把逐段对话里
+    塞回上下文的「上一轮整段 JSON」换成一行紧凑摘要。
+    两个开关**互不冲突**（可以同时开），也都可以与分批 / 逐段 / 逐段对话任意组合；
+    都关着时这一次调用的请求数、提示词与产物键集与改动前**逐字相同**。
     """
     if mode not in MODES:
         raise InputError(f"mode 非法：{mode!r}（只能是 {' / '.join(MODES)}）")
     if mode == "strict":
         raise NotImplementedYet(STRICT_NOT_IMPLEMENTED)
+    # 参数合法性必须**早于任何模型请求**（含两遍式的第一遍）：先花钱再报退出码 2 是最贵的错误。
+    # 这条校验原先只在 planDecisions 里，``--plan-first --conversation-digest``（缺 conversation）时
+    # 第一遍打标的钱已经花掉了才报错（2026-10-19 复核修复）。
+    if conversation_digest and not (per_paragraph and conversation):
+        raise InputError(
+            "对话上下文瘦身（conversation_digest）必须与逐段对话同用（per_paragraph=True 且 "
+            "conversation=True）：没有逐段对话就没有 transcript 可瘦身；本次一个请求都没发"
+        )
 
     from .profile import load_profile, resolve_fact_anchor_policy
 
@@ -2782,6 +3310,106 @@ def run_rewrite(
             f"先运行 `ar analyze {source_id}`（需要模型）"
         )
 
+    # 两遍式的**第一遍**（--plan-first）：一次调用给全篇每段打动作标，**不写正文**。
+    # 两遍**共用同一段前缀**（plan-v2）：第一遍 = 改写那份的公共头（REWRITE_USER_HEAD）+ 打标尾巴，
+    # system 也直接用 REWRITE_SYSTEM_PROMPT ⇒ 两遍公共前缀 9889 字符 / 5364 token，
+    # 第一遍建好的缓存被第二遍第 1 批直接命中。（plan-v1 时这里写的是「公共前缀 0 字符」——
+    # 那是 v1 的事实：system 不同 + user 首字符就分岔；2026-10-19 的复核结论按 v1 记，v2 起作废。）
+    # 第一遍失败不阻断：计划为空 ⇒ 那一格零字符插入。
+    plan_first_enabled = bool(plan_first)
+    plan_entries: list[PlanEntry] = []
+    plan_block = ""
+    plan_missing: list[str] = []
+    plan_extra: dict[str, Any] = {}
+    # 旧产物里的计划这一轮到底复用了没有 / 哪几段没能注入（「一致性优先」，两种都要可见）：
+    # plan_reused 只在「局部重跑 + 旧产物里确实有计划」时才有意义；plan_not_applied 是
+    # 「目标段在旧计划里找不到条目」的点名清单（不许静默降级成单遍改写）。
+    plan_reused = False
+    plan_not_applied: list[str] = []
+    reuse = (
+        _reuse_plan(
+            base,
+            reader=reader,
+            background_fingerprint=background_fingerprint,
+            fact_anchor_policy=policy.policy,
+        )
+        if targets is not None
+        else None
+    )
+    if plan_first_enabled:
+        # 局部重跑复用既有产物里的计划：--only / --retry-failed / --from-signals 的语义是
+        # 「只重跑这几段」，第一遍的计划本来就还在 decisions.json 的 meta 里，不必重新打标
+        if reuse is not None and reuse.ok:
+            plan_entries = list(reuse.entries)
+            plan_missing = list(reuse.missing)
+            plan_extra = dict(reuse.extra)
+            plan_reused = True
+            planned_ids = {entry.paragraph for entry in plan_entries}
+            plan_not_applied = [pid for pid in targets.paragraphs if pid not in planned_ids]
+            degraded.append(
+                "两遍式（--plan-first）：复用既有产物里第一遍的计划，不重新打标"
+                f"（0 次请求；{len(plan_entries)} 段；局部重跑只对目标段发请求）"
+            )
+            degraded.extend(reuse.notes)
+            if plan_not_applied:
+                degraded.append(
+                    "⚠ 以下目标段没有可注入的计划（旧产物里没有这几段的计划条目）："
+                    + "、".join(plan_not_applied)
+                    + "；这几段本次按单遍改写，产物 meta.plan_not_applied 记着这一笔"
+                )
+        else:
+            if reuse is not None:
+                # 旧计划还在，但口径对不上（换读者 / 换背景 / 换事实锚口径）：不许沿用，重新打标
+                degraded.append(
+                    "两遍式（--plan-first）：旧产物里有计划，但**不复用**（"
+                    f"{reuse.reason}）——本次重新全篇打标（多一次请求）"
+                )
+            plan_entries, plan_degraded, plan_extra = plan_actions(
+                meta,
+                inventory,
+                profile,
+                client,
+                source_id=source_id,
+                reader=reader,
+                background_block=background_block,
+                # 口径要进**两遍共用的前缀**（plan-v2）：第二遍按同一档口径拼那一段，
+                # 两遍的提示词才逐字同前 9889 字符；否则第一遍建的缓存白建
+                fact_anchor_policy=policy.policy,
+            )
+            degraded.extend(plan_degraded)
+            # 第一遍漏了哪几段（plan_missing）：只是「计划不完整」的可见记录，
+            # **不进 unplanned、不影响退出码**——第二遍照常逐段改写
+            plan_missing = [
+                str(pid) for pid in (plan_extra.get("plan_missing") or []) if str(pid).strip()
+            ]
+        plan_block = _plan_block(plan_entries)
+    elif reuse is not None:
+        # **不带 --plan-first 的局部重跑**（2026-10-19 复核修复）：旧产物是按计划跑出来的，
+        # 这一段就照旧计划改写——同一份产物始终按同一份计划执行，不因为一次局部重跑就偷偷换成
+        # 单遍（否则产物看起来「按计划跑且计划与执行一致」，实际根本不是）。
+        if reuse.ok:
+            plan_entries = list(reuse.entries)
+            plan_missing = list(reuse.missing)
+            plan_reused = True
+            plan_block = _plan_block(plan_entries)
+            planned_ids = {entry.paragraph for entry in plan_entries}
+            plan_not_applied = [pid for pid in targets.paragraphs if pid not in planned_ids]
+            degraded.append(
+                "两遍式（本次没带 --plan-first）：沿用既有产物里第一遍的计划，照旧注入第二遍"
+                f"（0 次打标请求；{len(plan_entries)} 段；本次只对目标段发请求）"
+            )
+            degraded.extend(reuse.notes)
+        else:
+            # 口径对不上就不能注入：那几段只能单遍改写，但**不静默**——meta 与命令行都点名
+            plan_not_applied = list(targets.paragraphs)
+        if plan_not_applied:
+            why = reuse.reason if not reuse.ok else "旧产物里没有这几段的计划条目"
+            degraded.append(
+                f"⚠ 以下目标段没有可注入的计划（{why}）："
+                + "、".join(plan_not_applied)
+                + "；这几段本次按单遍改写，产物 meta.plan_not_applied 记着这一笔"
+            )
+
     decisions, plan_degraded, plan_meta = planDecisions(
         meta,
         inventory,
@@ -2797,8 +3425,41 @@ def run_rewrite(
         concurrency=concurrency,
         validation_retries=validation_retries,
         conversation=conversation,
+        plan_block=plan_block,
+        conversation_digest=conversation_digest,
     )
     degraded.extend(plan_degraded)
+
+    # 两遍式：第一遍的计划动作挂到每段决策上——**只在它与最终动作不同时**才落 changes[i].plan_action
+    # （照 fact_declarations 的「为真才出现」先例；计划与执行一致时产物不多一个永远相同的键）。
+    if plan_entries:
+        planned_by_id = {entry.paragraph: entry.action for entry in plan_entries}
+        for decision in decisions:
+            planned = planned_by_id.get(decision.paragraph)
+            if planned and planned != decision.action:
+                decision.plan_action = planned
+
+    # 产物 meta 里那几格（只在开了 --plan-first 时非空 ⇒ 默认路径的产物键集一个都不多）
+    plan_meta_block: dict[str, Any] = {}
+    if plan_first_enabled:
+        plan_meta_block = {
+            "plan_first": True,
+            "plan": [entry.to_record() for entry in plan_entries],
+            "plan_missing": list(plan_missing),
+            "plan_usage": dict(plan_extra.get("plan_usage") or {}),
+            "plan_request_count": int(plan_extra.get("plan_request_count") or 0),
+            "plan_attempts": [
+                dict(item) for item in (plan_extra.get("plan_attempts") or []) if isinstance(item, dict)
+            ],
+            "plan_retry_account": dict(plan_extra.get("plan_retry_account") or {}),
+            "plan_prompt_version": str(plan_extra.get("plan_prompt_version") or PLAN_PROMPT_VERSION),
+        }
+    if reuse is not None:
+        # 「旧计划这一轮复用了没有」必须落进产物：只有「局部重跑 + 旧产物里确实有计划」时才问这个问题。
+        # 问过就**恒写**（plan_reused 的 true / false、plan_not_applied 的空列表都要写进 run_meta）：
+        # 合并器靠「键在不在」区分「这一轮查过、是干净的」与「这一轮没查」——否则上一轮的点名会留成假账。
+        plan_meta_block["plan_reused"] = plan_reused
+        plan_meta_block["plan_not_applied"] = list(plan_not_applied)
 
     # 空画像：why.profile 必须看得见地说明「依据来自哪里」。
     # 有画像（含「只有背景」——契约 §6.4 拍板：背景非空即算有画像）时**逐条保留模型给的引用**
@@ -2853,7 +3514,8 @@ def run_rewrite(
 
     if targets is not None:
         # 局部重跑（§6.2）：本次只拿到目标段的结果，其余段落由合并器沿用既有产物。
-        return _rerun_outcome(
+        # 计划那几格并进 run_meta：合并器要按它们**重算**产物 meta（否则局部重跑后整体丢失）。
+        outcome = _rerun_outcome(
             source_id=source_id,
             reader=reader,
             mode=mode,
@@ -2864,7 +3526,7 @@ def run_rewrite(
             doc=doc,
             changes=changes,
             by_decision=by_decision,
-            plan_meta=plan_meta,
+            plan_meta={**plan_meta, **plan_meta_block},
             profile_used=profile_used,
             profile_note=profile_note,
             background_used=background_used,
@@ -2875,6 +3537,21 @@ def run_rewrite(
             at=at,
             profile_refs_filled=profile_refs_filled,
         )
+        _apply_plan_fields(
+            outcome,
+            plan_first=plan_first_enabled,
+            entries=plan_entries,
+            missing=plan_missing,
+            extra=plan_extra,
+            conversation_digest=conversation_digest,
+        )
+        # 计划复用的账：**不带 --plan-first 的那次重跑也要看得见**（此时 plan_first 仍是 False）
+        outcome.plan_reused = plan_reused
+        outcome.plan_not_applied = list(plan_not_applied)
+        # 「这一轮照的是哪份计划」带不带 flag 都写进 outcome（CLI 的计划那行靠它说清段数与动作分布）
+        outcome.plan = list(plan_entries)
+        outcome.plan_missing = list(plan_missing)
+        return outcome
 
     # 段数 / 段序与源一致；**保持**的段落必须与原文逐字节一致（原文由摄取时算的 text_hash 背书）。
     # 事实锚的逐段比对由 `ar check` 负责，并把结果写回 `changes.json` 的 `fidelity.*`：
@@ -2931,6 +3608,16 @@ def run_rewrite(
         deferred_count=deferred_count,
         profile_refs_filled=profile_refs_filled,
     )
+    _apply_plan_fields(
+        outcome,
+        plan_first=plan_first_enabled,
+        entries=plan_entries,
+        missing=plan_missing,
+        extra=plan_extra,
+        conversation_digest=conversation_digest,
+    )
+    outcome.plan_reused = plan_reused
+    outcome.plan_not_applied = list(plan_not_applied)
 
     generated_at = at or now_iso()
     decisions_payload: dict[str, Any] = {
@@ -2966,6 +3653,10 @@ def run_rewrite(
             "degraded": list(degraded),
             "attempts": attempts,
             "retry_account": retry_account_summary,
+            # 逐段对话的上下文瘦身：**只在开时为 true**（默认路径一个键都不多）
+            **({"conversation_digest": True} if plan_meta.get("conversation_digest") else {}),
+            # 两遍式（plan-v2）：只在开了 --plan-first 时有这几格（默认路径一个键都不多）
+            **plan_meta_block,
         },
     }
     changes_payload: dict[str, Any] = {
@@ -3001,6 +3692,9 @@ def run_rewrite(
             "degraded": list(degraded),
             "attempts": attempts,
             "retry_account": retry_account_summary,
+            # 与 decisions.json 的 meta 对齐：对话瘦身 + 两遍式那几格（默认路径一个键都不多）
+            **({"conversation_digest": True} if plan_meta.get("conversation_digest") else {}),
+            **plan_meta_block,
         },
     }
     outcome.decisions_path = write_json(target / "decisions.json", decisions_payload)
@@ -3118,6 +3812,10 @@ def _rerun_outcome(
         model_errors=merged.model_errors,
         unplanned_paragraphs=merged.unplanned,
         model=merged.decisions_meta.get("model"),
+        # 调度方式与并发（rewrite-v7）：合并后的 meta 里现在有了，CLI 的「调度」/ 单位那几行才说得对
+        planning_mode=str(merged.decisions_meta.get("planning_mode") or "batch"),
+        concurrency=int(merged.decisions_meta.get("concurrency") or DEFAULT_CONCURRENCY),
+        validation_retries=int(merged.decisions_meta.get("validation_retries") or 0),
         usage=usage,
         request_count=int(merged.decisions_meta.get("request_count") or 0),
         batch_count=int(plan_meta.get("batch_count") or 0),

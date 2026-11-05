@@ -228,8 +228,12 @@ def nokey_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """
     path = tmp_path / "config.nokey.json"
     path.write_text(json.dumps({"api_key": ""}), encoding="utf-8")
-    # 延迟导入：sys.path 注入（src 布局）在本文件开头的模块级语句里，这里跟着 run_cli 的口径写
+    #
+    # 3. ``AR_ROUTES_FILE`` 指到一份**不存在的路径**：配置文件里没写 ``routes`` 时 ``load_config()``
+    #    会回落读项目根的 ``config.routes.yaml``（开发机用 ``ar routes import`` 生成过就有），
+    #    链模式**无视密钥直接发请求**——不挡住，这些用例在开发机上必红（2026-10-26 实测）。
     from ar.config import API_KEY_ENV
 
     monkeypatch.delenv(API_KEY_ENV, raising=False)
+    monkeypatch.setenv("AR_ROUTES_FILE", str(tmp_path / "no-such-routes.yaml"))
     return path

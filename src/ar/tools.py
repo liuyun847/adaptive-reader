@@ -1,9 +1,9 @@
-"""模型工具层（PLAN-llm-tools §3.3 + PLAN-actions-feedback §8）：五个具名工具的注册表与执行。
+"""模型工具层（PLAN-llm-tools §3.3 + PLAN-actions-feedback §8）：六个具名工具的注册表与执行。
 
 工具把「拼 messages → 调模型（含重试与记账） → 解析成结构」收成一步；
 **校验与落盘仍留在原业务模块**（``validate_inventory`` / ``decisions.json`` 之类一概不搬）。
 
-- 提示词**逐字复用** ``ar.prompts`` 的五份模板与五个版本号（一个字都不改），
+- 提示词**逐字复用** ``ar.prompts`` 的六份模板与六个版本号（一个字都不改），
   工具只负责把参数拼成 messages；
 - 工具的入参 / 出参是 JSON Schema，``ar tools``（CLI）直接列举它们；
 - 统一信封（所有 ``execute`` 的返回）::
@@ -62,12 +62,14 @@ from .prompts import (
     DEFAULT_SELECTION_FROM,
     EXPLAIN_KINDS,
     EXPLAIN_PROMPT_VERSION,
+    PLAN_PROMPT_VERSION,
     REWRITE_PROMPT_VERSION,
     SELECTION_SOURCES,
     SURVEY_PROMPT_VERSION,
     build_compress_messages,
     build_concepts_messages,
     build_explain_messages,
+    build_plan_messages,
     build_rewrite_messages,
     build_survey_messages,
 )
@@ -79,6 +81,7 @@ __all__ = [
     "ToolRun",
     "ANALYZE_CONCEPTS_SPEC",
     "REWRITE_BATCH_SPEC",
+    "PLAN_ACTIONS_SPEC",
     "EXPLAIN_PARAGRAPH_SPEC",
     "SURVEY_FOLLOWUPS_SPEC",
     "COMPRESS_PARAGRAPH_SPEC",
@@ -268,6 +271,10 @@ REWRITE_BATCH_PARAMETERS: dict[str, Any] = {
         "full_text_block": {"type": "string"},
         # 追加的可选入参（rewrite-v7）：逐段循环的校验回灌，只追加在 user 末尾（空串零字符插入）。
         "feedback": {"type": "string"},
+        # 追加的可选入参（plan-v2，两遍式的第二遍）：第一遍打好的计划块
+        # （``ar.rewrite._plan_block`` 的产物），进全文块之后。**必须可选**：不传时零字符插入
+        # （不带 ``--plan-first`` 的调用方拿到的提示词与加这一格之前逐字相同）。
+        "plan_block": {"type": "string"},
     },
 }
 REWRITE_BATCH_OUTPUT: dict[str, Any] = {
@@ -275,6 +282,52 @@ REWRITE_BATCH_OUTPUT: dict[str, Any] = {
     "additionalProperties": False,
     "required": ["decisions"],
     "properties": {"decisions": {"type": "array", "items": _DECISION}},
+}
+
+#: 第六个工具：两遍式的**第一遍**（提示词版本 ``plan-v2``）。一次吃全篇、每段只回动作，
+#: **不写正文**；入参比 ``rewrite_batch`` 少 ``start`` / ``end``（它不分批）。
+PLAN_ACTIONS_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["paragraphs", "profile_block", "concept_block", "background_sketch"],
+    "properties": {
+        "paragraphs": _PARAGRAPH_LIST,
+        "profile_block": {"type": "string"},
+        "concept_block": {"type": "string"},
+        "background_sketch": {"type": "string"},
+        # 可选入参：材料行（提示词里「材料：《{source_id}》，共 {total} 段」）与配图候选素描，
+        # 与 ``rewrite_batch`` 同一口径——不传就退化成空材料名 / 零字符插入。
+        "source_id": {"type": "string"},
+        "total": {"type": "integer", "minimum": 1},
+        "illustration_block": {"type": "string"},
+        # 追加的可选入参（plan-v2）：事实锚口径与全文。两遍**共用同一段前缀**，这两块都在前缀里，
+        # 所以第一遍建立的缓存才能被第二遍命中——不传时按严口径写 / 由 paragraphs 自己拼
+        # （与 ``rewrite_batch` 的「不传就零字符插入」有意不同：第一遍看不见正文就没法打标）。
+        "fact_anchor_policy": {"type": "string"},
+        "full_text_block": {"type": "string"},
+    },
+}
+PLAN_ACTIONS_OUTPUT: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["plan"],
+    "properties": {
+        "plan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["paragraph", "action", "note"],
+                "properties": {
+                    # 动作**不做 enum 约束**：枚举外的取值不是「解析失败」，而是**可见降级**
+                    # （``ar.rewrite._parse_plan`` 把它按 keep 处理并记一条降级说明）。
+                    "paragraph": {"type": "string"},
+                    "action": {"type": "string"},
+                    "note": {"type": "string"},
+                },
+            },
+        }
+    },
 }
 
 EXPLAIN_PARAGRAPH_PARAMETERS: dict[str, Any] = {
@@ -617,7 +670,7 @@ def _tool_executor(name: str, parameters: dict, runner: Callable[..., dict]) -> 
     return execute
 
 
-# ------------------------------------------------------------------ 五个工具 --
+# ------------------------------------------------------------------ 六个工具 --
 def _run_analyze_concepts(params: dict, *, client: Any = None, policy: RetryPolicy | None = None) -> dict:
     """概念清单抽取：拼 ``concepts-v2`` 提示词 → 调模型 → 抠出 JSON 对象。"""
     from .analyze import extract_json_object  # 延迟导入：避免 api 层与业务模块的导入顺序耦合
@@ -669,6 +722,8 @@ def _run_rewrite_batch(params: dict, *, client: Any = None, policy: RetryPolicy 
         full_text_block=str(params.get("full_text_block") or ""),
         # 可选入参（rewrite-v7）：逐段循环的校验回灌，只追加在 user 末尾
         feedback=str(params.get("feedback") or ""),
+        # 可选入参（plan-v2）：第一遍的计划块；不传时零字符插入（提示词逐字不变）
+        plan_block=str(params.get("plan_block") or ""),
         start=start,
         end=end,
         total=total,
@@ -685,6 +740,76 @@ def _run_rewrite_batch(params: dict, *, client: Any = None, policy: RetryPolicy 
     items, issues = _parse_batch(raw_text, paragraphs, start, end, extract_json_object=extract_json_object)
     # issues（多余段 id / 重复段 id）是可见降级，不是失败：原模块把它记进 meta.degraded
     return _envelope(tool, result, ok=True, data={"decisions": items}, raw_text=raw_text, degraded=issues)
+
+
+def _run_plan_actions(params: dict, *, client: Any = None, policy: RetryPolicy | None = None) -> dict:
+    """两遍式的第一遍：拼 ``plan-v2`` 提示词 → 调模型 → 抠出「每段一个动作」的计划。
+
+    **只出动作、不出正文**：模型多给的 ``rewrite` / ``figure` 键在这里就丢掉（出参 schema 不许有），
+    并在 ``degraded`` 里留一条可见说明——不是静默忽略。
+    段 id 读不通 / 重复的条目同样进 ``degraded``；**缺段不在这里判**（越界动作与缺段由
+    ``ar.rewrite._parse_plan`` 按「能不能用」归一，那边才知道全篇该有哪几段）。
+    """
+    from .analyze import extract_json_object
+
+    tool = "plan_actions"
+    paragraphs = params["paragraphs"]
+    total = params.get("total")
+    if not isinstance(total, int) or isinstance(total, bool):
+        total = len(paragraphs)
+    # plan-v2：这两格进的是**两遍共用的前缀**（第二遍由 ``rewrite_batch`` 拿到同一份），
+    # 于是打标那一遍建好的缓存能被第二遍第 1 批命中。``full_text_block`` 不传（None）时由 paragraphs 自己拼。
+    raw_full_text = params.get("full_text_block")
+    messages = build_plan_messages(
+        str(params.get("source_id") or ""),
+        paragraphs,
+        profile_block=params["profile_block"],
+        background_block=params["background_sketch"],
+        concept_block=params["concept_block"],
+        illustration_block=str(params.get("illustration_block") or ""),
+        total=total,
+        fact_anchor_policy=str(params.get("fact_anchor_policy") or DEFAULT_FACT_ANCHOR_POLICY),
+        full_text_block=raw_full_text if isinstance(raw_full_text, str) else None,
+    )
+    result = _ask(tool, messages, PLAN_PROMPT_VERSION, client=client, policy=policy)
+    if not result.ok:
+        return _failure_envelope(tool, result)
+
+    raw_text = result.text or ""
+    try:
+        data = extract_json_object(raw_text)
+    except InputError as exc:
+        return _parse_envelope(tool, result, exc, raw_text)
+
+    raw_plan = data.get("plan")
+    if not isinstance(raw_plan, list):
+        return _parse_envelope(tool, result, InputError("模型输出里没有 plan 数组"), raw_text)
+    entries: list[dict[str, Any]] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for item in raw_plan:
+        if not isinstance(item, dict):
+            notes.append("模型给的 plan 里有不是对象的条目，已忽略")
+            continue
+        pid = item.get("paragraph")
+        if not isinstance(pid, str) or not pid.strip():
+            notes.append("模型给的 plan 里有缺 paragraph 的条目，已忽略")
+            continue
+        pid = pid.strip()
+        if pid in seen:
+            notes.append(f"{pid}：模型在 plan 里重复返回了这一段的动作，只取第一条")
+            continue
+        seen.add(pid)
+        if item.get("rewrite") or item.get("figure"):
+            notes.append(f"{pid}：第一遍只要动作，模型多给了 rewrite / figure，已忽略（正文只由第二遍产出）")
+        entries.append(
+            {
+                "paragraph": pid,
+                "action": str(item.get("action") or ""),
+                "note": str(item.get("note") or ""),
+            }
+        )
+    return _envelope(tool, result, ok=True, data={"plan": entries}, raw_text=raw_text, degraded=notes)
 
 
 def _run_explain_paragraph(params: dict, *, client: Any = None, policy: RetryPolicy | None = None) -> dict:
@@ -788,7 +913,7 @@ def _run_compress_paragraph(params: dict, *, client: Any = None, policy: RetryPo
     return _envelope(tool, result, ok=True, data=payload, raw_text=raw_text, degraded=notes)
 
 
-#: 五个工具的契约（名称 / 描述 / 入参出参 schema / 提示词版本，§3.3 的表逐条对得上）
+#: 六个工具的契约（名称 / 描述 / 入参出参 schema / 提示词版本，§3.3 的表逐条对得上）
 ANALYZE_CONCEPTS_SPEC = ToolSpec(
     name="analyze_concepts",
     description="Extract the concept inventory of a whole document.",
@@ -805,6 +930,16 @@ REWRITE_BATCH_SPEC = ToolSpec(
     output=REWRITE_BATCH_OUTPUT,
     prompt_version=REWRITE_PROMPT_VERSION,
     execute=_tool_executor("rewrite_batch", REWRITE_BATCH_PARAMETERS, _run_rewrite_batch),
+)
+
+#: 两遍式的第一遍（``plan-v2``，2026-10-31 起与第二遍共享同一段前缀）：一次调用给全篇每段打动作标，**不写正文**。
+PLAN_ACTIONS_SPEC = ToolSpec(
+    name="plan_actions",
+    description="Label one action (expand / compress / keep / illustrate) per paragraph, no prose.",
+    parameters=PLAN_ACTIONS_PARAMETERS,
+    output=PLAN_ACTIONS_OUTPUT,
+    prompt_version=PLAN_PROMPT_VERSION,
+    execute=_tool_executor("plan_actions", PLAN_ACTIONS_PARAMETERS, _run_plan_actions),
 )
 
 EXPLAIN_PARAGRAPH_SPEC = ToolSpec(
@@ -837,6 +972,7 @@ COMPRESS_PARAGRAPH_SPEC = ToolSpec(
 for _spec in (
     ANALYZE_CONCEPTS_SPEC,
     REWRITE_BATCH_SPEC,
+    PLAN_ACTIONS_SPEC,
     EXPLAIN_PARAGRAPH_SPEC,
     SURVEY_FOLLOWUPS_SPEC,
     COMPRESS_PARAGRAPH_SPEC,

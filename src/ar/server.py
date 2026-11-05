@@ -133,6 +133,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .cache import ExplainCache
+from .chain import resolve_api_key
 from .config import Config
 from .errors import InputError, WriteError
 from .events import append_events, dedup, read_events, validate_event
@@ -495,10 +496,23 @@ def build_app(
     samples_root = Path(samples_dir) if samples_dir is not None else None
     cache = explain_cache if explain_cache is not None else ExplainCache()
 
+    # 进程内唯一的真实客户端：回退链的冷却表挂在它身上，两个请求之间才记得住"这家刚打满"
+    shared_client: Any = None
+
     def make_client() -> Any:
+        nonlocal shared_client
         if client_factory is not None:
             return client_factory()
-        return ModelClient(config)
+        if shared_client is None:
+            shared_client = ModelClient(config)
+        return shared_client
+
+    def health_client() -> Any:
+        """``/api/health`` 用它读冷却状态（测试注入假客户端时退回无冷却的空表语义）。"""
+        nonlocal shared_client
+        if shared_client is None:
+            shared_client = ModelClient(config)
+        return shared_client
 
     # ------------------------------------------------------------------ 静态 --
     async def index(request: Request) -> Response:
@@ -546,15 +560,38 @@ def build_app(
 
     # -------------------------------------------------------------------- API --
     async def health(request: Request) -> Response:
-        return _json(
-            {
-                "ok": True,
-                "model_configured": bool(config.model_configured),
-                "model": config.model,
-                "api_key_origin": config.api_key_origin,
-                "web_static": (web_root / "index.html").is_file(),
+        payload: dict[str, Any] = {
+            "ok": True,
+            "model_configured": bool(config.model_configured),
+            "model": config.model_label,
+            "api_key_origin": config.api_key_origin,
+            "web_static": (web_root / "index.html").is_file(),
+        }
+        # 多源回退链：单源模式下没有这个键（旧形状逐字不变）；链模式多给一跳一行，
+        # 密钥只给来源、不给值（与 public_dict 同一纪律）
+        if config.routes:
+            chain_client = health_client()
+            cooling = chain_client.cooldowns.active()
+            cooldown_of = {
+                provider: max(0, int(entry.until_ms - chain_client.now_ms())) for provider, entry in cooling.items()
             }
-        )
+            payload["routes"] = [
+                {
+                    "provider": route.provider,
+                    "model": route.model,
+                    "base_url": route.base_url,
+                    "api_key_env": route.api_key_env,
+                    "api_key_origin": resolve_api_key(route)[1],
+                    "cooldown_ms": cooldown_of.get(route.provider, 0),
+                    "cooldown_reason": None if route.provider not in cooling else cooling[route.provider].reason,
+                }
+                for route in config.routes
+            ]
+            # 冷却落盘最近一次失败的原因（``None`` = 正常）：读不出来也照样按链走，这里只是让它可见
+            payload["cooldowns_persist"] = (
+                "ok" if chain_client.cooldown_persist_error is None else chain_client.cooldown_persist_error
+            )
+        return _json(payload)
 
     async def get_sources(request: Request) -> Response:
         """``GET /api/sources``：材料清单（**只读**，一个字节都不写盘）。
